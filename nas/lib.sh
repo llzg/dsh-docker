@@ -1,8 +1,9 @@
 #!/bin/sh
 # dsh-deploy 共享函数库（rollback.sh / watchdog.sh / resume-auto-update.sh 共用）
 
-DIR=/volume1/docker/deepseek-harness
-# watchdog 容器内通过 DSH_DEPLOY_STATE 覆盖 state 目录（脚本只读挂载、state 可写挂载）
+# watchdog 容器内通过 DSH_DEPLOY_DIR / DSH_DEPLOY_STATE 覆盖路径
+#（脚本目录只读挂载为 /dsh-deploy，compose 目录挂载为 /dsh-app，state 挂载为 /dsh-state）
+DIR="${DSH_DEPLOY_DIR:-/volume1/docker/deepseek-harness}"
 STATE="${DSH_DEPLOY_STATE:-/volume1/docker/dsh-deploy/state}"
 IMG=ghcr.io/llzg/dsh-docker
 LOG="$STATE/rollback.log"
@@ -52,11 +53,12 @@ pin_version() {
   local v="$1"
   docker pull "$IMG:$v"
   printf 'DSH_IMAGE=%s:%s\n' "$IMG" "$v" > "$DIR/.env"
-  (cd "$DIR" && docker compose up -d --force-recreate)
+  docker compose -f "$DIR/docker-compose.yml" up -d --force-recreate
 }
 
 # 解除钉住，恢复跟随 latest 自动更新
 unpin() {
   rm -f "$DIR/.env"
-  (cd "$DIR" && docker compose pull && docker compose up -d --force-recreate)
+  docker compose -f "$DIR/docker-compose.yml" pull
+  docker compose -f "$DIR/docker-compose.yml" up -d --force-recreate
 }

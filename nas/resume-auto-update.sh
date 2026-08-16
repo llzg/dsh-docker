@@ -1,7 +1,7 @@
 #!/bin/sh
 # 恢复自动更新：移除回滚钉住（.env 中的 DSH_IMAGE），拉取 latest 并重建容器。
 set -eu
-. /volume1/docker/dsh-deploy/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 log "resume auto-update (unpin -> latest)"
 unpin

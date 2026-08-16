@@ -5,7 +5,7 @@
 #     自动回滚到上一个已发布版本并暂停自动更新（避免误处理长期存在的问题）。
 #   日志: /volume1/docker/dsh-deploy/state/watchdog.log
 set -eu
-. /volume1/docker/dsh-deploy/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 C=deepseek-harness
 CNT="$STATE/unhealthy_count"

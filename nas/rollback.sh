@@ -4,7 +4,7 @@
 #       rollback.sh 0.1.0-rc.5 # 回滚到指定版本
 # 回滚后自动更新会暂停（compose 钉住旧版本）；恢复运行 resume-auto-update.sh
 set -eu
-. /volume1/docker/dsh-deploy/lib.sh
+. "$(dirname "$0")/lib.sh"
 
 CUR=$(current_version)
 VERSION="${1:-}"

@@ -12,9 +12,11 @@ docker run -d --name dsh-watchdog --restart unless-stopped \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /volume1/docker/dsh-deploy:/dsh-deploy:ro \
   -v /volume1/docker/dsh-deploy/state:/dsh-state \
+  -v /volume1/docker/deepseek-harness:/dsh-app \
   -v /home/lzg/.docker/config.json:/root/.docker/config.json:ro \
   -e TZ=Asia/Shanghai \
   -e DSH_DEPLOY_STATE=/dsh-state \
+  -e DSH_DEPLOY_DIR=/dsh-app \
   -e HTTP_PROXY="$PROXY" -e HTTPS_PROXY="$PROXY" \
   -e NO_PROXY=localhost,127.0.0.1 \
   --entrypoint /bin/sh alpine:3.20 -c '
