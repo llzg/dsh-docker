@@ -20,20 +20,18 @@ current_version() {
   fi
 }
 
-# 列出 GHCR 上已发布的版本标签（不含 latest）。优先用 docker 配置里的
-# GHCR 凭据（与 docker pull 一致），无凭据则匿名。
+# 列出 GHCR 上已发布的版本标签（不含 latest）。
+# 包为 public：优先匿名 token；失败再试 docker 配置里的 GHCR 凭据。
 ghcr_tags() {
-  local cfg="/home/lzg/.docker/config.json" auth="" hdr="" tok=""
-  if [ -f "$cfg" ]; then
+  local hdr="" tok="" cfg="/home/lzg/.docker/config.json" auth=""
+  tok=$(curl -sf "https://ghcr.io/token?scope=repository:llzg/dsh-docker:pull&service=ghcr.io" | jq -r '.token // empty' 2>/dev/null || true)
+  if [ -n "$tok" ]; then
+    hdr="Authorization: Bearer $tok"
+  elif [ -f "$cfg" ]; then
     auth=$(jq -r '.auths["ghcr.io"].auth // empty' "$cfg" 2>/dev/null || true)
+    [ -n "$auth" ] && hdr="Authorization: Basic $auth"
   fi
-  if [ -n "$auth" ]; then
-    hdr="Authorization: Basic $auth"
-  else
-    tok=$(curl -sf "https://ghcr.io/token?scope=repository:llzg/dsh-docker:pull" | jq -r '.token // empty' 2>/dev/null || true)
-    [ -n "$tok" ] && hdr="Authorization: Bearer $tok"
-  fi
-  [ -z "$hdr" ] && { echo "ERROR: no GHCR credentials (check /home/lzg/.docker/config.json)" >&2; return 1; }
+  [ -z "$hdr" ] && { echo "ERROR: no GHCR credentials (anonymous failed, check /home/lzg/.docker/config.json)" >&2; return 1; }
   curl -sf -H "$hdr" "https://ghcr.io/v2/llzg/dsh-docker/tags/list" 2>/dev/null \
     | jq -r '.tags[]' 2>/dev/null | grep -v '^latest$' | sort -V
 }
