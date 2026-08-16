@@ -2,10 +2,11 @@
 # dsh-deploy 共享函数库（rollback.sh / watchdog.sh / resume-auto-update.sh 共用）
 
 DIR=/volume1/docker/deepseek-harness
-STATE=/volume1/docker/dsh-deploy/state
+# watchdog 容器内通过 DSH_DEPLOY_STATE 覆盖 state 目录（脚本只读挂载、state 可写挂载）
+STATE="${DSH_DEPLOY_STATE:-/volume1/docker/dsh-deploy/state}"
 IMG=ghcr.io/llzg/dsh-docker
 LOG="$STATE/rollback.log"
-mkdir -p "$STATE"
+mkdir -p "$STATE" 2>/dev/null || true
 
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 
