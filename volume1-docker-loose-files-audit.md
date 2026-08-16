@@ -1,6 +1,9 @@
 # /volume1/docker 落单文件审计报告
 
-> **更新（2026-08-16 清理执行）**：第①组 13 个文件已删除（invoice-agent-code-*.tar.gz × 10、invoice-build-147/148.log、invoice-agent.override.yml，约 58 MB）。删除前已确认无容器挂载、无 compose/脚本引用；代码本体在 `/volume1/docker/invoice-agent/`（git）与 GitHub `llzg/invoice-agent-ui`，镜像在本地 `invoice-agent-invoice-app:*-zipfix*` 与 GHCR，均可重建，无损失。
+> **更新（2026-08-16 清理执行）**：
+> 1. 第①组 13 个文件已删除（invoice-agent-code-*.tar.gz × 10、invoice-build-147/148.log、invoice-agent.override.yml，约 58 MB）。删除前已确认无容器挂载、无 compose/脚本引用；代码本体在 `/volume1/docker/invoice-agent/`（git）与 GitHub `llzg/invoice-agent-ui`，镜像在本地 `invoice-agent-invoice-app:*-zipfix*` 与 GHCR，均可重建，无损失。
+> 2. 剩余落单文件已全部清理：homelab-dashboard-compose.yml（草稿）、lidagang-homelab-nas.zip（源码包）、telegram_channel.py（旧版副本）、nas_*.sh × 4 + NAS_TASK_SCHEDULER_README.txt（运维脚本，检查确认系统 crontab/systemd 无引用、logs/ 自 8/14 后无运行记录，判定计划任务未生效/已停用）、脚本自建的 logs/ 目录。共 8 文件 + 1 目录。
+> 3. **保留**：`homelab-dashboard.tar`（运行中容器 homelab-dashboard 的绑定挂载依赖，compose 卷路径 `../homelab-dashboard.tar` 决定其必须位于根目录）。
 
 审计时间：2026-08-16（NAS 时区 +0800）
 审计方式：SSH 登录 NAS（lzg 用户）读取 `/volume1/docker`；结合文件 stat（birth/mtime/ctime）、内容、Git 提交时间线、Docker 容器挂载、harness 历史会话记录交叉取证。

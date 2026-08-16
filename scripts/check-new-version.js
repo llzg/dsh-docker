@@ -18,13 +18,19 @@
 const fs = require('fs');
 const https = require('https');
 
-function getJson(url, auth, extraHeaders) {
+function getJson(url, auth, extraHeaders, redirects) {
+  redirects = redirects || 0;
   return new Promise((resolve, reject) => {
     const headers = { 'User-Agent': 'dsh-docker-ci' };
     if (auth) headers.Authorization = auth;
     Object.assign(headers, extraHeaders || {});
     https
       .get(url, { headers }, (res) => {
+        // GHCR may 307-redirect manifest/blob fetches to a regional registry
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects < 4) {
+          res.resume();
+          return resolve(getJson(res.headers.location, auth, extraHeaders, redirects + 1));
+        }
         let data = '';
         res.on('data', (c) => (data += c));
         res.on('end', () => {
@@ -66,7 +72,8 @@ async function ghcrLastVersion() {
     if (!manifest.config || !manifest.config.digest) return '';
     const cfg = await getJson(`https://ghcr.io/v2/${repo}/blobs/${manifest.config.digest}`, `Bearer ${tok}`, { Accept: accept });
     return (cfg.config && cfg.config.Labels && cfg.config.Labels['org.opencontainers.image.version']) || '';
-  } catch (_) {
+  } catch (e) {
+    console.error(`ghcrLastVersion: ${e.message}`);
     return '';
   }
 }
