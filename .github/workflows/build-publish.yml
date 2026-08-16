@@ -26,7 +26,7 @@ on:
       - scripts/**
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 concurrency:
@@ -46,10 +46,13 @@ jobs:
         env:
           VERSION_OVERRIDE: ${{ github.event.inputs.version }}
           FORCE: ${{ github.event_name == 'push' && '1' || '' }}
+          GHCR_REPO: ${{ github.repository_owner }}/dsh-docker
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: No new version to build
         if: steps.version.outputs.version == ''
-        run: echo "::notice::no new dsh version (npm=${{ steps.version.outputs.npm_version }}, built=${{ steps.version.outputs.current }})"
+        run: echo "::notice::no new dsh version (npm=${{ steps.version.outputs.npm_version }}, last=${{ steps.version.outputs.last_published }})"
 
       - name: Login to GHCR
         if: steps.version.outputs.version != ''
@@ -88,13 +91,3 @@ jobs:
         run: |
           docker push ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}
           docker push ghcr.io/${{ github.repository_owner }}/dsh-docker:latest
-
-      - name: Record version
-        if: steps.version.outputs.version != ''
-        run: |
-          echo "${{ steps.version.outputs.version }}" > CURRENT_VERSION
-          git config user.name "dsh-docker bot"
-          git config user.email "actions@github.com"
-          git add CURRENT_VERSION
-          git commit -m "build: publish dsh ${{ steps.version.outputs.version }} (npm latest=${{ steps.version.outputs.npm_version }})" || echo "nothing to commit"
-          git push
