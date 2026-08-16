@@ -51,6 +51,12 @@ CMD ["dsh", "--profile", "web", "--trusted-host", "192.168.5.16"]
 COPY patch-dsh.sh /opt/patch-dsh.sh
 RUN chmod +x /opt/patch-dsh.sh && STRICT=1 /opt/patch-dsh.sh
 
+# landlock-run 同时链接到 /usr/local/bin，方便 `which`/排障查看。
+# 说明：harness 实际通过 node_modules 的 require.resolve 定位该二进制，
+# 此链接仅提升 PATH 可见性，不是功能依赖。
+RUN ln -sf /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/node-addon-landlock-run-linux-x64/bin/landlock-run /usr/local/bin/landlock-run && \
+    ls -la /usr/local/bin/landlock-run
+
 # Healthcheck used both by the NAS watchdog (auto-rollback) and docker itself.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD node -e "fetch('http://127.0.0.1:3080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
