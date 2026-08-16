@@ -24,12 +24,17 @@ LABEL org.opencontainers.image.licenses="MIT"
 
 # Build toolchain for native modules (e.g. node-pty) if prebuilds are unavailable.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates \
+    && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Official DeepSeek Harness CLI (npm registry, published by DeepSeek).
 # Version is parametric: the CI workflow resolves it from the npm dist-tag.
 RUN npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs "@deepseek-ai/dsh@${DSH_VERSION}"
+
+# uv（Python 包管理器）——随镜像持久安装到 /usr/local/bin。
+# 此前装在容器可写层，容器重建即丢失；烤进镜像后每次重建都在。
+RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv --version
 
 ENV DSH_HOME=/data/dsh
 ENV DSH_TELEMETRY_DISABLED=1
