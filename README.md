@@ -38,7 +38,7 @@ NAS watchtower（已有）──5min 轮询──► 拉取并重建 deepseek-ha
     ├── switch.sh              # 切换容器到 GHCR 镜像（重启一次）
     ├── rollback.sh            # 一键回滚（默认上一版本，可指定版本）
     ├── resume-auto-update.sh  # 恢复自动更新
-    ├── watchdog.sh            # 健康检查自动回滚守护（cron 每 5 分钟）
+    ├── watchdog.sh            # 健康检查自动回滚守护（watchdog 容器内 cron 每 5 分钟）
     └── lib.sh                 # 共享函数库
 ```
 
@@ -55,7 +55,7 @@ NAS watchtower（已有）──5min 轮询──► 拉取并重建 deepseek-ha
 
 ### 回滚（三层保护）
 1. **构建期**：`patch-dsh.sh` 以 `STRICT=1` 运行，LAN 补丁不变量不满足 → 构建失败，坏镜像进不了 GHCR。
-2. **部署期自动**：镜像内置 HEALTHCHECK；NAS cron（每 5 分钟）检测到连续 3 次（约 15 分钟）不健康、且镜像是刚更新（构建 ≤3h）→ 自动拉取上一版本、钉住并重建。回滚后自动更新暂停（防 watchtower 拉回坏版本）。
+2. **部署期自动**：镜像内置 HEALTHCHECK；NAS watchdog 守护容器（每 5 分钟）检测到连续 3 次（约 15 分钟）不健康、且镜像是刚更新（构建 ≤3h）→ 自动拉取上一版本、钉住并重建。回滚后自动更新暂停（防 watchtower 拉回坏版本）。
 3. **手动**：`rollback.sh`（默认回上一版本 / `rollback.sh 0.1.0-rc.5` 指定版本）；`resume-auto-update.sh` 恢复自动更新。
 
 ### 绿联 NAS UI 显示
@@ -68,7 +68,7 @@ NAS watchtower（已有）──5min 轮询──► 拉取并重建 deepseek-ha
 # 1) 把 nas/ 目录放到 NAS（例）：
 #    scp -r nas/ lzg@192.168.5.16:/volume1/docker/dsh-deploy/
 
-# 2) 安装（备份旧 compose、装新 compose、装 watchdog cron、预拉镜像）：
+# 2) 安装（备份旧 compose、装新 compose、建 watchdog 守护容器、预拉镜像）：
 sh /volume1/docker/dsh-deploy/install.sh
 
 # 3) 切换容器到 GHCR 镜像（会重启 deepseek-harness 一次，约 1 分钟）：

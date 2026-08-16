@@ -27,12 +27,10 @@ fi
 cp "$SRC/docker-compose.yml" "$DIR/docker-compose.yml"
 echo "已安装新 compose（image=ghcr.io/llzg/dsh-docker:latest，可回滚钉住）"
 
-# 3) 脚本可执行 + watchdog cron
-chmod +x "$SRC/lib.sh" "$SRC/rollback.sh" "$SRC/resume-auto-update.sh" "$SRC/watchdog.sh" "$SRC/switch.sh"
-crontab -l 2>/dev/null | grep -v 'dsh-deploy/watchdog.sh' > /tmp/dsh-cron.new || true
-echo "*/5 * * * * $SRC/watchdog.sh >> $STATE/watchdog.log 2>&1" >> /tmp/dsh-cron.new
-crontab /tmp/dsh-cron.new
-echo "watchdog cron 已安装（每 5 分钟）"
+# 3) 脚本可执行 + watchdog 守护容器（UGOS 限制 lzg 的 crontab，用独立容器跑 cron）
+chmod +x "$SRC/lib.sh" "$SRC/rollback.sh" "$SRC/resume-auto-update.sh" "$SRC/watchdog.sh" "$SRC/switch.sh" "$SRC/watchdog-container.sh"
+sh "$SRC/watchdog-container.sh"
+echo "watchdog 守护容器已创建（每 5 分钟检查健康并自动回滚）"
 
 # 4) 预拉取 GHCR 镜像（首次）
 docker pull ghcr.io/llzg/dsh-docker:latest

@@ -82,7 +82,7 @@ NAS watchtower（已有，监控全部容器）: 每 5 分钟发现 ghcr latest 
                                                               ▼
 回滚保护:
    ① 构建期：补丁校验失败 → 不发布（NAS 保持旧版本）
-   ② 部署期：HEALTHCHECK 失败 → NAS watchdog（cron 每 5 分钟）连续 15 分钟不健康
+   ② 部署期：HEALTHCHECK 失败 → NAS watchdog 守护容器（cron 每 5 分钟）连续 15 分钟不健康
             且镜像是刚更新（≤3h）→ 自动回滚到上一版本并暂停自动更新
    ③ 手动：rollback.sh [版本] 一键回退；resume-auto-update.sh 恢复自动更新
                                                               ▼
