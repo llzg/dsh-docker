@@ -13,6 +13,10 @@ services:
       - DSH_TELEMETRY_DISABLED=1
     volumes:
       - ./dsh-data:/data/dsh
+      # 持久化 /root（含 DSH 工作区 /root/nas_docker）：
+      # 容器重建时若工作区目录不存在，bash 工具的 spawn cwd 失效会导致
+      # 所有命令报 "spawn <cmd> ENOENT"（2026-08-16 事故根因），挂载后根治。
+      - ./dsh-root:/root
     labels:
       - "org.opencontainers.image.title=DeepSeek Harness Web (dsh)"
       - "org.opencontainers.image.description=DeepSeek Harness web UI — auto-built from npm release, watchtower auto-update"
