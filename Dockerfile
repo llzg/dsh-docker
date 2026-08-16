@@ -1,0 +1,56 @@
+# DeepSeek Harness Web — auto-build image (GitHub Actions → GHCR → NAS watchtower)
+#
+# Pure source build from the official npm release channel:
+#   upstream deepseek-ai/deepseek-harness publishes via npm (@deepseek-ai/dsh,
+#   dist-tag "latest"); there are no GitHub Releases/tags upstream.
+#
+# Build args:
+#   DSH_VERSION  npm version to install (e.g. 0.1.0-rc.6); default = npm dist-tag latest
+#   GIT_REVISION short commit sha of the build (for traceability labels)
+
+ARG DSH_VERSION=0.1.0-rc.6
+
+FROM node:22-bookworm-slim AS base
+
+ARG DSH_VERSION
+ARG GIT_REVISION=unknown
+
+LABEL org.opencontainers.image.title="DeepSeek Harness Web (dsh)"
+LABEL org.opencontainers.image.description="DeepSeek Harness web UI with LAN patches — auto-built from npm release, auto-updated via watchtower"
+LABEL org.opencontainers.image.source="https://github.com/llzg/dsh-docker"
+LABEL org.opencontainers.image.version="${DSH_VERSION}"
+LABEL org.opencontainers.image.revision="${GIT_REVISION}"
+LABEL org.opencontainers.image.licenses="MIT"
+
+# Build toolchain for native modules (e.g. node-pty) if prebuilds are unavailable.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Official DeepSeek Harness CLI (npm registry, published by DeepSeek).
+# Version is parametric: the CI workflow resolves it from the npm dist-tag.
+RUN npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs "@deepseek-ai/dsh@${DSH_VERSION}"
+
+ENV DSH_HOME=/data/dsh
+ENV DSH_TELEMETRY_DISABLED=1
+WORKDIR /data
+
+COPY profiles/web/cordis.patch.yml /opt/dsh-profiles/web/cordis.patch.yml
+COPY entrypoint.sh /usr/local/bin/dsh-entrypoint
+RUN chmod +x /usr/local/bin/dsh-entrypoint
+
+EXPOSE 3080
+ENTRYPOINT ["/usr/local/bin/dsh-entrypoint"]
+CMD ["dsh", "--profile", "web", "--trusted-host", "192.168.5.16"]
+
+# LAN fixes (settings host mode + crypto.randomUUID polyfill + trusted hosts).
+# STRICT=1 turns every patch into a verified invariant: if upstream changes the
+# code so a patch can no longer be applied, the build FAILS instead of silently
+# shipping a broken LAN deployment (the CI never publishes, the NAS keeps the
+# last good image — this is the build-time rollback guard).
+COPY patch-dsh.sh /opt/patch-dsh.sh
+RUN chmod +x /opt/patch-dsh.sh && STRICT=1 /opt/patch-dsh.sh
+
+# Healthcheck used both by the NAS watchdog (auto-rollback) and docker itself.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD node -e "fetch('http://127.0.0.1:3080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"

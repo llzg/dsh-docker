@@ -1,0 +1,7 @@
+# LAN deployment: bind the web UI to all interfaces so devices on the LAN
+# can reach it. The CLI itself refuses --host 0.0.0.0; this patch is the
+# supported override.
+- id: webserver
+  config:
+    host: '0.0.0.0'
+    port: 3080

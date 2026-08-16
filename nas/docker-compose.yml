@@ -1,0 +1,18 @@
+services:
+  deepseek-harness:
+    # DSH_IMAGE：默认 latest 由 watchtower 自动跟随更新；
+    # 回滚时 rollback.sh 会把旧版本写入同目录 .env 钉住（暂停自动更新），
+    # resume-auto-update.sh 恢复跟随 latest。
+    image: ${DSH_IMAGE:-ghcr.io/llzg/dsh-docker:latest}
+    container_name: deepseek-harness
+    restart: unless-stopped
+    ports:
+      - "3081:3080"
+    environment:
+      - DSH_HOME=/data/dsh
+      - DSH_TELEMETRY_DISABLED=1
+    volumes:
+      - ./dsh-data:/data/dsh
+    labels:
+      - "org.opencontainers.image.title=DeepSeek Harness Web (dsh)"
+      - "org.opencontainers.image.description=DeepSeek Harness web UI — auto-built from npm release, watchtower auto-update"
