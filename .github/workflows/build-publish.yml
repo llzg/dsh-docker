@@ -1,0 +1,100 @@
+name: build-publish
+
+# 触发方式（二选一 + 手动）：
+#  1) schedule —— 每 30 分钟轮询 npm 的 @deepseek-ai/dsh dist-tag "latest"，
+#     发现新版自动构建并推送到 GHCR（上游 deepseek-harness 无 GitHub Release，
+#     实际发布通道是 npm，故用 npm 轮询）
+#  2) workflow_dispatch —— 手动触发，可显式指定版本
+#  3) push —— Dockerfile / 补丁 / 脚本变更时重建（重发 same-version 标签，
+#     NAS watchtower 会感知 digest 变化并更新）
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '可选：显式指定要构建的 @deepseek-ai/dsh 版本（默认 npm latest）'
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - patch-dsh.sh
+      - entrypoint.sh
+      - profiles/**
+      - scripts/**
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build-publish
+  cancel-in-progress: false
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: node scripts/check-new-version.js
+        env:
+          VERSION_OVERRIDE: ${{ github.event.inputs.version }}
+          FORCE: ${{ github.event_name == 'push' && '1' || '' }}
+
+      - name: No new version to build
+        if: steps.version.outputs.version == ''
+        run: echo "::notice::no new dsh version (npm=${{ steps.version.outputs.npm_version }}, built=${{ steps.version.outputs.current }})"
+
+      - name: Login to GHCR
+        if: steps.version.outputs.version != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        if: steps.version.outputs.version != ''
+        uses: docker/setup-buildx-action@v3
+
+      # 先构建到本地 daemon 做冒烟测试；通过后再推送，
+      # 保证坏镜像永远不会进入 latest（构建期回滚保护）。
+      - name: Build image (local, for smoke test)
+        if: steps.version.outputs.version != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/dsh-docker:latest
+          build-args: |
+            DSH_VERSION=${{ steps.version.outputs.version }}
+            GIT_REVISION=${{ github.sha }}
+
+      - name: Smoke test (web UI /health)
+        if: steps.version.outputs.version != ''
+        run: ./scripts/smoke-test.sh ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}
+
+      - name: Push to GHCR
+        if: steps.version.outputs.version != ''
+        run: |
+          docker push ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}
+          docker push ghcr.io/${{ github.repository_owner }}/dsh-docker:latest
+
+      - name: Record version
+        if: steps.version.outputs.version != ''
+        run: |
+          echo "${{ steps.version.outputs.version }}" > CURRENT_VERSION
+          git config user.name "dsh-docker bot"
+          git config user.email "actions@github.com"
+          git add CURRENT_VERSION
+          git commit -m "build: publish dsh ${{ steps.version.outputs.version }} (npm latest=${{ steps.version.outputs.npm_version }})" || echo "nothing to commit"
+          git push
