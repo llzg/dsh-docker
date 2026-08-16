@@ -3,6 +3,9 @@ node_modules
 .gitignore
 *.log
 .venv
+.vision-venv
+.vision-models
+.uv-cache
 nas
 docs
 AUDIT.md

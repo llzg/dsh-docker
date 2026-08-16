@@ -17,6 +17,12 @@ services:
       # 容器重建时若工作区目录不存在，bash 工具的 spawn cwd 失效会导致
       # 所有命令报 "spawn <cmd> ENOENT"（2026-08-16 事故根因），挂载后根治。
       - ./dsh-root:/root
+    # Intel 核显直通（Iris Xe，加速本地视觉模型的图像编码）：
+    # 宿主需已加载 i915 驱动（绿联 x86 NAS 默认有）。应用后需重建容器生效：
+    #   docker compose up -d --force-recreate deepseek-harness
+    # 无此设备时容器内仍可运行，视觉推理退回纯 CPU。
+    devices:
+      - /dev/dri:/dev/dri
     labels:
       - "org.opencontainers.image.title=DeepSeek Harness Web (dsh)"
       - "org.opencontainers.image.description=DeepSeek Harness web UI — auto-built from npm release, watchtower auto-update"

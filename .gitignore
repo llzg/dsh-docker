@@ -1,0 +1,12 @@
+# 本地视觉能力（Qwen2.5-VL 本地推理）——不进版本库
+.vision-venv/
+.vision-models/
+.uv-cache/
+.llama.cpp/
+.vulkan-headers/
+
+# Python 缓存
+__pycache__/
+
+# 其他本地临时产物
+*.log

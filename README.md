@@ -97,3 +97,13 @@ GitHub → llzg/dsh-docker → Actions → **build-publish** → Run workflow（
 - **NAS 侧凭据**：watchtower 已在用 `/home/lzg/.docker/config.json`（GHCR 凭据）拉私有/公共包；本仓库脚本优先复用该凭据，包本身设为 public，无凭据也能匿名拉取。
 - **数据安全**：容器重建只换镜像，`/volume1/docker/deepseek-harness/dsh-data`（DSH_HOME、会话、配置）全程持久化。
 - **上游无 Release 的说明**：deepseek-ai/deepseek-harness 仓库没有 GitHub Releases/tags，正式发布即 npm publish；因此本方案以 npm dist-tag 轮询作为"GitHub 发布新版本"的检测方式。
+
+## 本地识图（可选组件）
+
+dsh 智能体/命令行可用的本地"看图"工具：Qwen2.5-VL-3B 纯 CPU 推理，
+支持图片描述、问答、中英文 OCR，图片不离开本机。安装与用法见 [docs/vision.md](docs/vision.md)。
+
+```sh
+bash scripts/vision-setup.sh    # 一次性安装（约 8GB）
+scripts/see.sh 图片.jpg --question "这张图里有什么？"
+```

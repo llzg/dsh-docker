@@ -23,8 +23,11 @@ LABEL org.opencontainers.image.revision="${GIT_REVISION}"
 LABEL org.opencontainers.image.licenses="MIT"
 
 # Build toolchain for native modules (e.g. node-pty) if prebuilds are unavailable.
+# Vulkan 依赖：llama.cpp GGML_VULKAN 编译需要 glslc + 头文件（libvulkan-dev 自带）；
+# mesa-vulkan-drivers 提供 Intel Iris Xe 的 Vulkan ICD（运行时，配合 /dev/dri 直通）。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates curl \
+        libvulkan-dev libvulkan1 mesa-vulkan-drivers glslc glslang-tools spirv-tools spirv-headers \
     && rm -rf /var/lib/apt/lists/*
 
 # Official DeepSeek Harness CLI (npm registry, published by DeepSeek).
