@@ -84,11 +84,21 @@ dsh 的输入框原生支持粘贴/拖拽图片（PNG/JPEG/WebP/GIF），但原�
 说明：大头是**视觉编码**（ViT 处理整张图，CPU 上固有成本，量化帮不上太多）；
 生成阶段（文本输出）量化后快 5~10 倍。大图可调小 `VISION_MAX_PIXELS` 提速。
 
-## Intel 核显加速（Iris Xe，可选）
+## Intel 核显加速（Iris Xe，实验性）
 
 视觉编码（ViT 把整张图变 token）是 CPU 上的主要固定成本。Iris Xe 核显正好
 是干矩阵乘法的，把**视觉编码**放核显、主模型仍留 CPU（生成是内存带宽瓶颈，
-共享带宽下核显无意义），预期编码 55~73s → 10~30s，单图总耗时 1.3~1.8 倍提升。
+共享带宽下核显无意义）。
+
+**实测结论（2026-08-17，已部署验证）**：
+
+- ✅ `/dev/dri` 直通成功（card0/renderD128），Vulkan 版 llama-cli 编译成功，
+  GPU 路径确实接管（推理时 CPU 占用从 ~700s 降到 ~18s）；
+- ❌ **但视觉编码输出损坏**（模型输出变乱码）——bookworm 自带的 mesa 22.3.6
+  ANV Vulkan 驱动下，Qwen2.5-VL 的 mmproj 在 GPU 上编码结果错误（f16/f32
+  mmproj 均复现）。CPU 路径同一张图输出正常。
+- 因此 **VISION_GPU 默认关闭（0）**，走 CPU；待升级 mesa（Debian 13/手动装新版）
+  或改用 OpenVINO 后，设 `VISION_GPU=1` 再验证。
 
 前置（已写入本仓库）：
 

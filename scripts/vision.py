@@ -48,19 +48,19 @@ def run_llama_backend(model_dir: str, args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
-    # llama-cli 选择：优先 Vulkan 版（核显加速视觉编码，需要 /dev/dri 直通）。
-    # VISION_GPU=1 强制 GPU 版 / 0 强制 CPU 版 / auto（默认）自动检测。
+    # llama-cli 选择。GPU（Vulkan）路径默认关闭：
+    # /dev/dri 直通 + Vulkan 版二进制已就绪，但实测 bookworm 的 mesa 22.3.6
+    # ANV 驱动下 Qwen2.5-VL 视觉编码输出损坏（乱码），因此默认走 CPU。
+    # 待升级 mesa（或换 OpenVINO）后可设 VISION_GPU=1 启用核显。
     repo = os.path.join(os.path.dirname(__file__), "..")
     cpu_cli = os.path.join(repo, ".llama.cpp", "build", "bin", "llama-cli")
     vk_cli = os.path.join(repo, ".llama.cpp", "build-vulkan", "bin", "llama-cli")
-    use_gpu = os.environ.get("VISION_GPU", "auto")
+    use_gpu = os.environ.get("VISION_GPU", "0")
     gpu_ok = os.path.isdir("/dev/dri") and os.path.isfile(vk_cli)
     if use_gpu == "1":
         llama_cli, offload = vk_cli, gpu_ok
-    elif use_gpu == "0":
+    else:  # "0" 或任何其他值：CPU
         llama_cli, offload = cpu_cli, False
-    else:  # auto
-        llama_cli, offload = (vk_cli, True) if gpu_ok else (cpu_cli, False)
     llama_cli = os.environ.get("LLAMA_CLI", llama_cli)
     if not os.path.isfile(llama_cli):
         print(f"error: llama-cli not found at {llama_cli} (set LLAMA_CLI)", file=sys.stderr)
