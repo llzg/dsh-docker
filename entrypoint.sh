@@ -11,4 +11,8 @@ if [ -x /opt/patch-dsh.sh ]; then
 elif [ -x /root/nas_docker/patch-dsh.sh ]; then
   /root/nas_docker/patch-dsh.sh || echo "[entrypoint] 工作区 patch-dsh 自愈告警（非致命）"
 fi
+# 版本信息页（3082 端口）：http://<NAS-IP>:3082/  （镜像内嵌，随容器启动）
+if [ -f /opt/version-server.js ]; then
+  node /opt/version-server.js >>/tmp/version-server.log 2>&1 &
+fi
 exec "$@"

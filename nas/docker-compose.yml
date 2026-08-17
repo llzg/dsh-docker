@@ -8,6 +8,7 @@ services:
     restart: unless-stopped
     ports:
       - "3081:3080"
+      - "3082:3082"
     environment:
       - DSH_HOME=/data/dsh
       - DSH_TELEMETRY_DISABLED=1

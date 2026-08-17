@@ -65,6 +65,12 @@ RUN chmod +x /opt/patch-dsh.sh && STRICT=1 /opt/patch-dsh.sh
 RUN ln -sf /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/node-addon-landlock-run-linux-x64/bin/landlock-run /usr/local/bin/landlock-run && \
     ls -la /usr/local/bin/landlock-run
 
+# 版本信息页（3082 端口）：写入构建元数据（dsh 版本 / dsh-docker 提交 / 构建时间）
+RUN node -e "require('fs').writeFileSync('/opt/dsh-version.json', JSON.stringify({dshVersion: process.env.DSH_VERSION, buildCommit: process.env.GIT_REVISION, builtAt: new Date().toISOString()}, null, 2))" && \
+    cat /opt/dsh-version.json
+COPY scripts/version-server.js /opt/version-server.js
+RUN node --check /opt/version-server.js && chmod +x /opt/version-server.js
+
 # Healthcheck used both by the NAS watchdog (auto-rollback) and docker itself.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD node -e "fetch('http://127.0.0.1:3080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
