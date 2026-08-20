@@ -34,6 +34,15 @@ RUN apt-get update \
 # Version is parametric: the CI workflow resolves it from the npm dist-tag.
 RUN npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs "@deepseek-ai/dsh@${DSH_VERSION}"
 
+# pnpm（Profile 插件管理器依赖）：`dsh plugin` 是 pnpm 转发器，没有 pnpm 时
+# `dsh plugin --profile web add ...` 直接 exit 127（实测）。用 Node 自带
+# Corepack 固化固定版本 11.22.0（已验证），不用 latest，保证 CI/watchtower
+# 重建可复现。shim 落在 /usr/local/bin（镜像层，容器重建不丢）；
+# 包体落在 /root/.cache/node/corepack（运行时被 /root 持久卷继承）。
+RUN corepack enable \
+    && corepack prepare pnpm@11.22.0 --activate \
+    && pnpm --version
+
 # uv（Python 包管理器）——随镜像持久安装到 /usr/local/bin。
 # 此前装在容器可写层，容器重建即丢失；烤进镜像后每次重建都在。
 RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh \
