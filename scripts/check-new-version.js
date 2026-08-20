@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 // Resolve the dsh version to build and publish.
 //
+// Tracks BOTH npm dist-tags: `latest` and `next`. Upstream publishes new rc
+// releases under `next` first (e.g. rc.8 was `next` while `latest` stayed at
+// rc.7) — the build target is the NEWER of the two tags, so a `next` release
+// still triggers an automatic build+upgrade.
+//
 // "Last published version" is read from the GHCR `latest` image's
 // org.opencontainers.image.version label (no repo write-back needed, no races).
 // Falls back to the committed CURRENT_VERSION file if the GHCR query fails.
@@ -13,7 +18,7 @@
 //   file CURRENT_VERSION  fallback last-built version (committed)
 //   env GITHUB_OUTPUT     GitHub Actions output file
 //
-// Outputs (GITHUB_OUTPUT): version, npm_version, last_published
+// Outputs (GITHUB_OUTPUT): version, npm_version, npm_latest, npm_next, last_published
 //   version == ''  => nothing to build (CI skips downstream steps)
 const fs = require('fs');
 const https = require('https');
@@ -39,6 +44,28 @@ function getJson(url, auth, extraHeaders, redirects) {
       })
       .on('error', reject);
   });
+}
+
+// 简单版本比较（覆盖 0.1.0-rc.N 模式）：主版本逐段数字比较，再比较预发布段
+function semverGt(a, b) {
+  if (!a) return false;
+  if (!b) return true;
+  const mainA = a.split('-')[0].split('.').map(Number);
+  const mainB = b.split('-')[0].split('.').map(Number);
+  for (let i = 0; i < Math.max(mainA.length, mainB.length); i++) {
+    const x = mainA[i] || 0;
+    const y = mainB[i] || 0;
+    if (x !== y) return x > y;
+  }
+  const preA = a.includes('-') ? a.split('-').slice(1).join('-') : '';
+  const preB = b.includes('-') ? b.split('-').slice(1).join('-') : '';
+  if (!preA && !preB) return false;
+  if (!preA) return true; // 无预发布段（正式版）更大
+  if (!preB) return false;
+  const numA = parseInt((preA.match(/\d+/) || ['0'])[0], 10) || 0;
+  const numB = parseInt((preB.match(/\d+/) || ['0'])[0], 10) || 0;
+  if (numA !== numB) return numA > numB;
+  return preA > preB;
 }
 
 // Read org.opencontainers.image.version from the GHCR `latest` manifest config.
@@ -85,12 +112,16 @@ async function main() {
   try { current = fs.readFileSync('CURRENT_VERSION', 'utf8').trim(); } catch (_) {}
 
   const pkg = await getJson('https://registry.npmjs.org/@deepseek-ai/dsh');
-  const npmLatest = (pkg['dist-tags'] || {}).latest || '';
-  if (!npmLatest) throw new Error('cannot resolve npm dist-tag "latest" for @deepseek-ai/dsh');
+  const distTags = pkg['dist-tags'] || {};
+  const npmLatest = distTags.latest || '';
+  const npmNext = distTags.next || '';
+  if (!npmLatest && !npmNext) throw new Error('cannot resolve npm dist-tags for @deepseek-ai/dsh');
+  // 构建目标 = latest 与 next 中较新者
+  const target = semverGt(npmNext, npmLatest) ? npmNext : npmLatest;
 
   const ghcrLast = await ghcrLastVersion();
   const lastPublished = ghcrLast || current;
-  console.log(`npm latest=${npmLatest}  lastPublished(ghcr)=${ghcrLast || '(unavailable)'}  fallbackFile=${current}`);
+  console.log(`npm latest=${npmLatest} next=${npmNext} target=${target}  lastPublished(ghcr)=${ghcrLast || '(unavailable)'}  fallbackFile=${current}`);
 
   let version = '';
   if (override) {
@@ -98,12 +129,18 @@ async function main() {
       throw new Error(`version "${override}" is not published on npm`);
     version = override;
   } else if (force) {
-    version = npmLatest;
-  } else if (npmLatest !== lastPublished) {
-    version = npmLatest;
+    version = target;
+  } else if (target !== lastPublished) {
+    version = target;
   }
 
-  const lines = [`version=${version}`, `npm_version=${npmLatest}`, `last_published=${lastPublished}`];
+  const lines = [
+    `version=${version}`,
+    `npm_version=${target}`,
+    `npm_latest=${npmLatest}`,
+    `npm_next=${npmNext}`,
+    `last_published=${lastPublished}`,
+  ];
   if (process.env.GITHUB_OUTPUT) {
     fs.appendFileSync(process.env.GITHUB_OUTPUT, lines.map((l) => l + '\n').join(''));
   }

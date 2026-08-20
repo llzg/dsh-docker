@@ -15,7 +15,7 @@ const VERSION_FILE = '/opt/dsh-version.json';
 const NPM_URL = 'https://registry.npmjs.org/@deepseek-ai/dsh/latest';
 const CACHE_MS = 10 * 60 * 1000;
 
-let npmCache = { latest: null, checkedAt: 0 };
+let npmCache = { latest: null, next: null, checkedAt: 0 };
 
 function readDeployed() {
   try {
@@ -30,34 +30,60 @@ function readDeployed() {
   }
 }
 
-function fetchNpmLatest() {
+// 拉取 dist-tags（latest + next）。上游 rc 新版本常先发到 next，
+// 只跟 latest 会漏判（2026-08-20 事故根因），故两者都跟踪。
+function fetchNpmDistTags() {
   return new Promise((resolve) => {
     https
-      .get(NPM_URL, { headers: { 'User-Agent': 'dsh-version-server' } }, (res) => {
+      .get(NPM_URL, { headers: { 'User-Agent': 'dsh-version-server', 'Accept': 'application/vnd.npm.install-v1+json' } }, (res) => {
         let data = '';
         res.on('data', (c) => (data += c));
         res.on('end', () => {
-          try { resolve(JSON.parse(data).version || null); } catch { resolve(null); }
+          try {
+            const tags = JSON.parse(data)['dist-tags'] || {};
+            resolve({ latest: tags.latest || null, next: tags.next || null });
+          } catch { resolve({ latest: null, next: null }); }
         });
       })
-      .on('error', () => resolve(null));
+      .on('error', () => resolve({ latest: null, next: null }));
   });
 }
 
 async function npmLatest() {
   const now = Date.now();
   if (npmCache.latest !== null && now - npmCache.checkedAt < CACHE_MS) return npmCache;
-  const latest = await fetchNpmLatest();
-  npmCache = { latest, checkedAt: Date.now() };
+  npmCache = { ...(await fetchNpmDistTags()), checkedAt: Date.now() };
   return npmCache;
+}
+
+function semverGt(a, b) {
+  if (!a) return false;
+  if (!b) return true;
+  const mainA = a.split('-')[0].split('.').map(Number);
+  const mainB = b.split('-')[0].split('.').map(Number);
+  for (let i = 0; i < Math.max(mainA.length, mainB.length); i++) {
+    const x = mainA[i] || 0, y = mainB[i] || 0;
+    if (x !== y) return x > y;
+  }
+  const preA = a.includes('-') ? a.split('-').slice(1).join('-') : '';
+  const preB = b.includes('-') ? b.split('-').slice(1).join('-') : '';
+  if (!preA && !preB) return false;
+  if (!preA) return true;
+  if (!preB) return false;
+  const numA = parseInt((preA.match(/\d+/) || ['0'])[0], 10) || 0;
+  const numB = parseInt((preB.match(/\d+/) || ['0'])[0], 10) || 0;
+  return numA !== numB ? numA > numB : preA > preB;
 }
 
 function buildInfo(deployed, npm) {
   const dshVersion = deployed.dshVersion || '(unknown)';
+  const target = semverGt(npm.next, npm.latest) ? npm.next : npm.latest;
   return {
     dshVersion,
     npmLatest: npm.latest,
-    isLatest: npm.latest ? dshVersion === npm.latest : null,
+    npmNext: npm.next,
+    npmTarget: target,
+    isLatest: target ? dshVersion === target : null,
     buildCommit: deployed.buildCommit || '(unknown)',
     builtAt: deployed.builtAt || '(unknown)',
     checkedAt: new Date(npm.checkedAt).toISOString(),
@@ -101,7 +127,9 @@ function html(info) {
   <div class="badge">${badge}</div>
   <h2>部署信息</h2>
   <div class="row"><span class="k">当前 dsh 版本（GitHub 源码/npm）</span><span class="v">${info.dshVersion}</span></div>
-  <div class="row"><span class="k">npm 最新版本</span><span class="v">${info.npmLatest || '—'}</span></div>
+  <div class="row"><span class="k">npm 最新稳定（latest 标签）</span><span class="v">${info.npmLatest || '—'}</span></div>
+  <div class="row"><span class="k">npm 最新预发布（next 标签）</span><span class="v">${info.npmNext || '—'}</span></div>
+  <div class="row"><span class="k">自动构建目标（两者较新者）</span><span class="v">${info.npmTarget || '—'}</span></div>
   <div class="row"><span class="k">最新检查时间</span><span class="v">${new Date(info.checkedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}</span></div>
   <h2>构建信息（dsh-docker）</h2>
   <div class="row"><span class="k">构建提交</span><span class="v">${info.commitUrl ? `<a href="${info.commitUrl}" target="_blank">${info.buildCommit}</a>` : info.buildCommit}</span></div>
