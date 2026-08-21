@@ -1,92 +1,66 @@
 #!/usr/bin/env node
-// dsh 版本信息页（零依赖）。
-// 启动：node /opt/version-server.js （由 dsh-entrypoint 后台拉起，端口 3082）
+// dsh 版本信息页（零框架，依赖 semver，由 dsh-entrypoint 后台拉起，端口 3082）。
 // 页面：http://<NAS-IP>:3082/   JSON：http://<NAS-IP>:3082/version.json
 //
-// 数据源：
-//   /opt/dsh-version.json —— 镜像构建时写入（DSH_VERSION / GIT_REVISION / builtAt）
-//   npm registry —— @deepseek-ai/dsh dist-tag "latest"（服务端拉取 + 10 分钟缓存）
+// 数据源（每个源独立状态，单源失败不影响其他源）：
+//   GitHub Release / GitHub Tag（api.github.com，匿名，容器环境无 token）
+//   npm latest / npm next（registry.npmjs.org，10 分钟缓存）
+// 每个源：{ value, status: ok|error, error: 简短原因 }
+// 推荐构建目标：各源候选中最高的、且真实存在于 npm 的版本（Dockerfile 用 npm install）。
 const http = require('http');
 const fs = require('fs');
-const https = require('https');
+const path = require('path');
+const policy = require(path.join(__dirname, 'version-policy.js'));
 
 const PORT = Number(process.env.VERSION_PORT || 3082);
 const VERSION_FILE = '/opt/dsh-version.json';
-const NPM_URL = 'https://registry.npmjs.org/@deepseek-ai/dsh/latest';
 const CACHE_MS = 10 * 60 * 1000;
 
-let npmCache = { latest: null, next: null, checkedAt: 0 };
+let cache = { sources: null, checkedAt: 0 };
 
 function readDeployed() {
   try {
     return JSON.parse(fs.readFileSync(VERSION_FILE, 'utf8'));
   } catch {
-    return {
-      dshVersion: '(unknown)',
-      buildCommit: '(unknown)',
-      builtAt: '(unknown)',
-      note: '未找到 /opt/dsh-version.json（镜像可能过旧）',
-    };
+    return { dshVersion: '(unknown)', buildCommit: '(unknown)', builtAt: '(unknown)' };
   }
 }
 
-// 拉取 dist-tags（latest + next）。上游 rc 新版本常先发到 next，
-// 只跟 latest 会漏判（2026-08-20 事故根因），故两者都跟踪。
-function fetchNpmDistTags() {
-  return new Promise((resolve) => {
-    https
-      .get(NPM_URL, { headers: { 'User-Agent': 'dsh-version-server', 'Accept': 'application/vnd.npm.install-v1+json' } }, (res) => {
-        let data = '';
-        res.on('data', (c) => (data += c));
-        res.on('end', () => {
-          try {
-            const tags = JSON.parse(data)['dist-tags'] || {};
-            resolve({ latest: tags.latest || null, next: tags.next || null });
-          } catch { resolve({ latest: null, next: null }); }
-        });
-      })
-      .on('error', () => resolve({ latest: null, next: null }));
-  });
-}
-
-async function npmLatest() {
+async function getSources() {
   const now = Date.now();
-  if (npmCache.latest !== null && now - npmCache.checkedAt < CACHE_MS) return npmCache;
-  npmCache = { ...(await fetchNpmDistTags()), checkedAt: Date.now() };
-  return npmCache;
+  if (cache.sources && now - cache.checkedAt < CACHE_MS) return cache.sources;
+  cache.sources = await policy.fetchAllSources();
+  cache.checkedAt = Date.now();
+  return cache.sources;
 }
 
-function semverGt(a, b) {
-  if (!a) return false;
-  if (!b) return true;
-  const mainA = a.split('-')[0].split('.').map(Number);
-  const mainB = b.split('-')[0].split('.').map(Number);
-  for (let i = 0; i < Math.max(mainA.length, mainB.length); i++) {
-    const x = mainA[i] || 0, y = mainB[i] || 0;
-    if (x !== y) return x > y;
-  }
-  const preA = a.includes('-') ? a.split('-').slice(1).join('-') : '';
-  const preB = b.includes('-') ? b.split('-').slice(1).join('-') : '';
-  if (!preA && !preB) return false;
-  if (!preA) return true;
-  if (!preB) return false;
-  const numA = parseInt((preA.match(/\d+/) || ['0'])[0], 10) || 0;
-  const numB = parseInt((preB.match(/\d+/) || ['0'])[0], 10) || 0;
-  return numA !== numB ? numA > numB : preA > preB;
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
 }
 
-function buildInfo(deployed, npm) {
+function buildJson(deployed, sources, target) {
+  const { release, tag } = sources.github;
+  const npm = sources.npm;
   const dshVersion = deployed.dshVersion || '(unknown)';
-  const target = semverGt(npm.next, npm.latest) ? npm.next : npm.latest;
   return {
     dshVersion,
-    npmLatest: npm.latest,
-    npmNext: npm.next,
-    npmTarget: target,
-    isLatest: target ? dshVersion === target : null,
+    currentIsTarget: target.target ? dshVersion === target.target : null,
+    sources: {
+      githubRelease: release,
+      githubTag: tag,
+      npmLatest: npm.latest,
+      npmNext: npm.next,
+    },
+    npmInstallableVersions: npm.versions.length,
+    recommendedTarget: target.target,
+    newestUpstream: target.newestUpstream,
+    waitingForNpm: target.waitingForNpm,
+    npmError: npm.npmError || null,
     buildCommit: deployed.buildCommit || '(unknown)',
     builtAt: deployed.builtAt || '(unknown)',
-    checkedAt: new Date(npm.checkedAt).toISOString(),
+    checkedAt: sources.checkedAt,
     upstreamRepo: 'https://github.com/deepseek-ai/deepseek-harness',
     dockerRepo: 'https://github.com/llzg/dsh-docker',
     commitUrl: deployed.buildCommit && /^[0-9a-f]{7,40}$/i.test(deployed.buildCommit)
@@ -94,12 +68,38 @@ function buildInfo(deployed, npm) {
   };
 }
 
+function sourceRow(label, src, isTarget) {
+  const value = src.value ? esc(src.value) : '—';
+  const mark = isTarget ? ' <b style="color:#60a5fa">(构建目标)</b>' : '';
+  if (src.status === 'error') {
+    return `<div class="row"><span class="k">${label}</span><span class="v err">查询失败 · ${esc(src.error)}</span></div>`;
+  }
+  return `<div class="row"><span class="k">${label}</span><span class="v">${value}${mark}</span></div>`;
+}
+
 function html(info) {
-  const badge = info.isLatest === true
-    ? '<span class="ok">✓ 已是最新</span>'
-    : info.isLatest === false
-      ? '<span class="warn">▲ 有新版本可更新</span>'
-      : '<span class="na">— 无法获取最新版本</span>';
+  const t = info.sources;
+  const target = info.recommendedTarget;
+  let badge;
+  if (info.currentIsTarget === true) {
+    badge = '<span class="ok">✓ 当前已是最新可构建版本</span>';
+  } else if (info.currentIsTarget === false) {
+    badge = target
+      ? `<span class="warn">▲ 可升级至 ${esc(target)}</span>`
+      : '<span class="warn">▲ 上游存在更新版本</span>';
+  } else {
+    badge = '<span class="na">— 无法判断最新版本</span>';
+  }
+  let statusLine;
+  if (info.waitingForNpm && info.newestUpstream) {
+    statusLine = `<div class="status warn">⚠️ 上游最新为 <b>${esc(info.newestUpstream)}</b>，但 npm 尚未发布该版本，自动构建暂不可用，等待 npm 发布。</div>`;
+  } else if (target) {
+    statusLine = `<div class="status ok">✅ 上游版本已发布到 npm，自动构建目标 <b>${esc(target)}</b> 可安装可构建。</div>`;
+  } else {
+    statusLine = `<div class="status na">— 暂无可用构建目标。</div>`;
+  }
+  const allFailed = t.githubRelease.status === 'error' && t.githubTag.status === 'error'
+    && t.npmLatest.status === 'error' && t.npmNext.status === 'error';
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -108,13 +108,16 @@ function html(info) {
 <title>关于版本 — DeepSeek Harness</title>
 <style>
   body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#0f1115;color:#e6e6e6;margin:0;padding:24px}
-  .card{max-width:640px;margin:0 auto;background:#1a1d24;border:1px solid #2a2e37;border-radius:12px;padding:24px}
+  .card{max-width:680px;margin:0 auto;background:#1a1d24;border:1px solid #2a2e37;border-radius:12px;padding:24px}
   h1{font-size:20px;margin:0 0 16px}
   h2{font-size:14px;color:#8b93a3;margin:24px 0 8px;font-weight:600}
-  .row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #23272f;font-size:14px}
+  .row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid #23272f;font-size:14px}
   .row:last-child{border-bottom:none}
-  .k{color:#8b93a3}.v{font-family:ui-monospace,monospace;word-break:break-all;text-align:right}
+  .k{color:#8b93a3;flex-shrink:0}.v{font-family:ui-monospace,monospace;word-break:break-all;text-align:right}
+  .v.err{color:#f87171;font-family:inherit}
   .badge{margin-top:12px;font-size:14px}
+  .status{margin-top:12px;padding:10px 12px;border-radius:8px;font-size:13px}
+  .status.ok{background:#052e16;color:#4ade80}.status.warn{background:#2e2505;color:#facc15}.status.na{background:#1f232b;color:#8b93a3}
   .ok{color:#4ade80;font-weight:600}.warn{color:#facc15;font-weight:600}.na{color:#8b93a3}
   a{color:#60a5fa;text-decoration:none}
   .foot{margin-top:16px;font-size:12px;color:#5b6370;text-align:center}
@@ -125,20 +128,23 @@ function html(info) {
 <div class="card">
   <h1>关于版本 · DeepSeek Harness（dsh）</h1>
   <div class="badge">${badge}</div>
+  ${statusLine}
+  <h2>上游版本（各来源独立）</h2>
+  ${sourceRow('GitHub 最新 Release', t.githubRelease, t.githubRelease.value === target)}
+  ${sourceRow('GitHub 最新 Tag', t.githubTag, t.githubTag.value === target)}
+  ${sourceRow('npm latest', t.npmLatest, t.npmLatest.value === target)}
+  ${sourceRow('npm next', t.npmNext, t.npmNext.value === target)}
+  <div class="row"><span class="k">推荐构建目标</span><span class="v">${target ? esc(target) : '—'}</span></div>
   <h2>部署信息</h2>
-  <div class="row"><span class="k">当前 dsh 版本（GitHub 源码/npm）</span><span class="v">${info.dshVersion}</span></div>
-  <div class="row"><span class="k">npm 最新稳定（latest 标签）</span><span class="v">${info.npmLatest || '—'}</span></div>
-  <div class="row"><span class="k">npm 最新预发布（next 标签）</span><span class="v">${info.npmNext || '—'}</span></div>
-  <div class="row"><span class="k">自动构建目标（两者较新者）</span><span class="v">${info.npmTarget || '—'}</span></div>
-  <div class="row"><span class="k">最新检查时间</span><span class="v">${new Date(info.checkedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}</span></div>
-  <h2>构建信息（dsh-docker）</h2>
-  <div class="row"><span class="k">构建提交</span><span class="v">${info.commitUrl ? `<a href="${info.commitUrl}" target="_blank">${info.buildCommit}</a>` : info.buildCommit}</span></div>
-  <div class="row"><span class="k">镜像构建时间</span><span class="v">${info.builtAt}</span></div>
+  <div class="row"><span class="k">当前运行版本</span><span class="v">${esc(info.dshVersion)}</span></div>
+  <div class="row"><span class="k">构建提交</span><span class="v">${info.commitUrl ? `<a href="${info.commitUrl}" target="_blank">${esc(info.buildCommit)}</a>` : esc(info.buildCommit)}</span></div>
+  <div class="row"><span class="k">镜像构建时间</span><span class="v">${esc(info.builtAt)}</span></div>
+  <div class="row"><span class="k">检查时间</span><span class="v">${new Date(info.checkedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}</span></div>
   <h2>相关仓库</h2>
   <div class="row"><span class="k">上游 DeepSeek Harness</span><span class="v"><a href="${info.upstreamRepo}" target="_blank">deepseek-ai/deepseek-harness</a></span></div>
   <div class="row"><span class="k">构建仓库 dsh-docker</span><span class="v"><a href="${info.dockerRepo}" target="_blank">llzg/dsh-docker</a></span></div>
   <button class="btn" onclick="location.reload()">重新检查</button>
-  <div class="foot">版本信息由容器内 /opt/version-server.js 提供，npm 最新版每 10 分钟缓存检查一次</div>
+  <div class="foot">各来源 10 分钟缓存；GitHub API 匿名限流时仅 GitHub 来源显示失败，不影响 npm 判断<br>${allFailed ? '⚠ 所有来源均查询失败，请检查容器网络（DNS/代理/出网）。' : ''}</div>
 </div>
 </body>
 </html>`;
@@ -146,8 +152,9 @@ function html(info) {
 
 const server = http.createServer(async (req, res) => {
   const deployed = readDeployed();
-  const npm = await npmLatest();
-  const info = buildInfo(deployed, npm);
+  const sources = await getSources();
+  const target = policy.computeTarget(sources);
+  const info = buildJson(deployed, sources, target);
   if (req.url === '/version.json' || req.url === '/version') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(info, null, 2));

@@ -27,9 +27,10 @@ if [ ! -x "$VENV/bin/python" ]; then
   uv venv "$VENV"
 fi
 
-echo "==> 2/3 安装依赖 (torch / transformers / accelerate / pillow / modelscope)"
+echo "==> 2/3 安装依赖 (torch / transformers / accelerate / pillow / modelscope / OCR)"
 uv pip install --python "$VENV/bin/python" \
-  torch transformers accelerate pillow safetensors modelscope
+  torch transformers accelerate pillow safetensors modelscope \
+  rapidocr_onnxruntime opencv-python-headless
 
 echo "==> 3/3 从 ModelScope 下载模型: $MODEL_ID"
 mkdir -p "$MODELS_DIR"

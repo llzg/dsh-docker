@@ -15,11 +15,51 @@
 输出：模型回答打印到 stdout（进度日志走 stderr，不干扰管道）。
 """
 import argparse
+import fcntl
 import glob
 import os
+import signal
 import subprocess
 import sys
 import time
+
+# 全局视觉任务锁：所有可能启动 llama-cli/加载视觉模型的入口共用，
+# flock 非阻塞独占，进程退出自动释放（无脏锁）。锁被占用即拒绝启动新视觉任务。
+VISION_LOCK_PATH = "/tmp/deepseek-harness-vision.lock"
+LOCK_BUSY_EXIT = 3
+LOCK_BUSY_MSG = "已有视觉任务运行，拒绝启动新任务"
+
+
+def acquire_vision_lock():
+    """非阻塞获取全局视觉锁。成功返回 fd（持有期间锁定），占用返回 None。"""
+    try:
+        fd = os.open(VISION_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def run_kill_on_timeout(cmd, timeout):
+    """以独立进程组运行命令；超时先 SIGTERM 整组，等 5s 仍不退则 SIGKILL 整组，
+    并 communicate() 回收子进程（不产生僵尸/孤儿）。返回 (returncode, stdout, stderr)。"""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            out, err = proc.communicate()
+        raise TimeoutError(f"命令超过 {timeout}s，进程组已清理") from None
+    return proc.returncode, out, err
 
 
 def run_llama_backend(model_dir: str, args: argparse.Namespace) -> int:
@@ -85,7 +125,7 @@ def run_llama_backend(model_dir: str, args: argparse.Namespace) -> int:
             im.convert("RGB").save(out, quality=90)
             image_paths.append(out)
 
-        threads = os.environ.get("VISION_THREADS", str(os.cpu_count() or 8))
+        # llama-cli 固定限制：threads=4 / threads-batch=4；单实例由全局锁保证。
         cmd = [
             llama_cli, "-m", main, "--mmproj", mmproj,
             "--image", ",".join(image_paths),
@@ -95,27 +135,28 @@ def run_llama_backend(model_dir: str, args: argparse.Namespace) -> int:
             "--no-display-prompt", "--simple-io",
             "--no-warmup",
             "--temp", "0",             # 贪心解码，防止长文重复（对齐旧后端 do_sample=False）
-            "-t", threads,
+            "-t", "4",
+            "-tb", "4",
         ]
         if offload:
             cmd += ["--mmproj-offload"]  # 视觉编码（ViT）放核显，主模型仍走 CPU
 
         t0 = time.time()
         print(f"[vision] llama.cpp: {os.path.basename(main)} + {os.path.basename(mmproj)}", file=sys.stderr)
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    except subprocess.TimeoutExpired:
-        print("error: llama-cli timed out", file=sys.stderr)
+        proc_rc, proc_out, proc_err = run_kill_on_timeout(cmd, 1800)
+    except TimeoutError:
+        print("error: llama-cli timed out（进程组已清理）", file=sys.stderr)
         return 1
     finally:
         tmpdir.cleanup()
-    if proc.returncode != 0:
-        print(f"error: llama-cli exit {proc.returncode}", file=sys.stderr)
-        sys.stderr.write(proc.stderr[-4000:])
+    if proc_rc != 0:
+        print(f"error: llama-cli exit {proc_rc}", file=sys.stderr)
+        sys.stderr.write(proc_err[-4000:])
         return 1
 
     # stdout = banner + "> 问题" 回显 + 回答 + 计时 + Exiting...
     # 取最后一个 "> " 之后的内容作为回答，再去掉计时/退出等杂行
-    answer = proc.stdout
+    answer = proc_out
     marker = "\n> "
     idx = answer.rfind(marker)
     if idx != -1:
@@ -135,7 +176,7 @@ def run_llama_backend(model_dir: str, args: argparse.Namespace) -> int:
     else:
         # 兜底：stdout 为空时给出 stderr 尾部，便于排查
         print("(no output; see stderr)", file=sys.stderr)
-        sys.stderr.write(proc.stderr[-2000:])
+        sys.stderr.write(proc_err[-2000:])
         return 1
     return 0
 
@@ -195,6 +236,12 @@ def main() -> int:
     ap.add_argument("--model-dir", default=None,
                     help="model directory (default: env VISION_MODEL_DIR)")
     args = ap.parse_args()
+
+    # 全局视觉锁：加载模型/启动 llama-cli 之前获取；占用则立即拒绝（不排队/不重试）
+    lock_fd = acquire_vision_lock()
+    if lock_fd is None:
+        print(LOCK_BUSY_MSG, file=sys.stderr)
+        return LOCK_BUSY_EXIT
 
     model_dir = args.model_dir or os.environ.get("VISION_MODEL_DIR")
     if not model_dir:

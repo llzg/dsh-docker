@@ -42,13 +42,16 @@ jobs:
 
       - name: Resolve version
         id: version
-        run: node scripts/check-new-version.js
+        run: |
+          npm install --no-save --no-audit --no-fund semver >/dev/null 2>&1 || true
+          node scripts/check-new-version.js
         env:
           VERSION_OVERRIDE: ${{ github.event.inputs.version }}
           FORCE: ${{ github.event_name == 'push' && '1' || '' }}
           GHCR_REPO: ${{ github.repository_owner }}/dsh-docker
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: No new version to build
         if: steps.version.outputs.version == ''

@@ -77,8 +77,11 @@ RUN ln -sf /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-a
 # 版本信息页（3082 端口）：写入构建元数据（dsh 版本 / dsh-docker 提交 / 构建时间）
 RUN node -e "require('fs').writeFileSync('/opt/dsh-version.json', JSON.stringify({dshVersion: process.env.DSH_VERSION, buildCommit: process.env.GIT_REVISION, builtAt: new Date().toISOString()}, null, 2))" && \
     cat /opt/dsh-version.json
+# semver（版本检测/版本页共用，随镜像持久）
+RUN cd /opt && npm init -y >/dev/null 2>&1 && npm install --no-audit --no-fund semver 2>&1 | tail -1
+COPY scripts/version-policy.js /opt/version-policy.js
 COPY scripts/version-server.js /opt/version-server.js
-RUN node --check /opt/version-server.js && chmod +x /opt/version-server.js
+RUN node --check /opt/version-policy.js && node --check /opt/version-server.js && chmod +x /opt/version-server.js
 
 # Healthcheck used both by the NAS watchdog (auto-rollback) and docker itself.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
