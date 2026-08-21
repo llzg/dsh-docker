@@ -22,7 +22,9 @@ while [ "$i" -lt 40 ]; do
   sleep 5
 done
 
-echo "--- container logs (tail) ---"
-docker logs "$NAME" 2>&1 | tail -80 || true
+echo "--- container logs (tail 120) ---"
+docker logs "$NAME" 2>&1 | tail -120 || true
+echo "--- final health probe ---"
+curl -sv -m 5 "http://127.0.0.1:$PORT/health" 2>&1 | tail -8 || true
 echo "SMOKE FAILED: $IMG did not become healthy within 200s"
 exit 1

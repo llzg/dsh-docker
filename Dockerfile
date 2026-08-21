@@ -58,7 +58,7 @@ RUN chmod +x /usr/local/bin/dsh-entrypoint
 
 EXPOSE 3080
 ENTRYPOINT ["/usr/local/bin/dsh-entrypoint"]
-CMD ["dsh", "--profile", "web", "--trusted-host", "192.168.5.16"]
+CMD ["dsh", "--profile", "web", "--trusted-host", "192.168.5.16", "--no-open"]
 
 # LAN fixes (settings host mode + crypto.randomUUID polyfill + trusted hosts).
 # STRICT=1 turns every patch into a verified invariant: if upstream changes the
