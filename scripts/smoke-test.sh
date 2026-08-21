@@ -15,7 +15,7 @@ trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
 i=0
 while [ "$i" -lt 40 ]; do
   i=$((i + 1))
-  if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+  if curl -sf "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
     echo "SMOKE OK (attempt $i)"
     exit 0
   fi
@@ -25,6 +25,6 @@ done
 echo "--- container logs (tail 120) ---"
 docker logs "$NAME" 2>&1 | tail -120 || true
 echo "--- final health probe ---"
-curl -sv -m 5 "http://127.0.0.1:$PORT/health" 2>&1 | tail -8 || true
+curl -sv -m 5 "http://127.0.0.1:$PORT/" 2>&1 | tail -8 || true
 echo "SMOKE FAILED: $IMG did not become healthy within 200s"
 exit 1

@@ -84,5 +84,6 @@ COPY scripts/version-server.js /opt/version-server.js
 RUN node --check /opt/version-policy.js && node --check /opt/version-server.js && chmod +x /opt/version-server.js
 
 # Healthcheck used both by the NAS watchdog (auto-rollback) and docker itself.
+# 0.1.1-rc.1 起未知路径返回 404（不再回退 SPA），故探活根路径 "/"。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD node -e "fetch('http://127.0.0.1:3080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+    CMD node -e "fetch('http://127.0.0.1:3080/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
