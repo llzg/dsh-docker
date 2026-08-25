@@ -156,6 +156,19 @@ open(f, "w", encoding="utf-8").write(src)
 print("vision-gate: patched dsh-host-apiproxy")
 PY
 
+# 5) 自定义图标：将 /opt/dsh-icon.jpg 嵌入前端 favicon.svg
+#    （浏览器标签页 + PWA manifest 共用 favicon.svg，替换它即整体生效）
+FAVICON="$BASE/dsh-web-frontend/dist/favicon.svg"
+if [ -f /opt/dsh-icon.jpg ] && [ -f /opt/make-favicon.js ]; then
+  if grep -q 'data:image/jpeg;base64' "$FAVICON" 2>/dev/null; then
+    echo "favicon-custom: already applied"
+  else
+    node /opt/make-favicon.js "$FAVICON" /opt/dsh-icon.jpg || { echo "favicon-custom: generation failed" >&2; }
+  fi
+else
+  echo "favicon-custom: icon assets absent (skip)"
+fi
+
 # ── STRICT verification (build-time guard) ────────────────────────────────
 if [ "$STRICT" = "1" ]; then
   FAIL=0
@@ -196,6 +209,11 @@ if [ "$STRICT" = "1" ]; then
   fi
   if grep -q 'MODEL_DOES_NOT_SUPPORT_IMAGES' "$APIPROXY"; then
     echo "VERIFY FAIL: vision-gate rejection still present in dsh-host-apiproxy" >&2
+    FAIL=1
+  fi
+  # 5) custom favicon must be embedded (icon assets present in image)
+  if [ -f /opt/dsh-icon.jpg ] && ! grep -q 'data:image/jpeg;base64' "$FAVICON"; then
+    echo "VERIFY FAIL: favicon-custom not applied in dsh-web-frontend" >&2
     FAIL=1
   fi
   if [ "$FAIL" = "1" ]; then

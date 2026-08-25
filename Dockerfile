@@ -66,6 +66,9 @@ CMD ["dsh", "--profile", "web", "--trusted-host", "192.168.5.16", "--no-open"]
 # shipping a broken LAN deployment (the CI never publishes, the NAS keeps the
 # last good image — this is the build-time rollback guard).
 COPY patch-dsh.sh /opt/patch-dsh.sh
+# 自定义图标资源（favicon 嵌入用，patch-dsh.sh 构建时与容器启动自愈时读取）
+COPY assets/dsh-icon.jpg /opt/dsh-icon.jpg
+COPY scripts/make-favicon.js /opt/make-favicon.js
 RUN chmod +x /opt/patch-dsh.sh && STRICT=1 /opt/patch-dsh.sh
 
 # landlock-run 同时链接到 /usr/local/bin，方便 `which`/排障查看。
