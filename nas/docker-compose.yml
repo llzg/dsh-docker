@@ -18,6 +18,16 @@ services:
       # 容器重建时若工作区目录不存在，bash 工具的 spawn cwd 失效会导致
       # 所有命令报 "spawn <cmd> ENOENT"（2026-08-16 事故根因），挂载后根治。
       - ./dsh-root:/root
+      # ── Phase 5 go-live（2026-08-26）：宿主 Docker socket 挂入 DSH ──
+      # 使 Codex/DSH 能 inspect/exec 生产容器（docker exec preflight 等）。
+      # 安全边界：docker.sock == host root-equivalent；只挂给可信 agent，
+      # DSH UI 禁止公网匿名访问。应用后需重建容器：
+      #   docker compose up -d --force-recreate deepseek-harness
+      - /var/run/docker.sock:/var/run/docker.sock
+      # GitHub SSH（可选）：宿主存在 GitHub deploy key 时启用只读挂载。
+      # ⚠ 若宿主路径不存在，docker compose up 会失败——先确认宿主 key 路径。
+      # - /root/.ssh:/root/.ssh:ro
+      # - /home/lzg/.ssh:/root/.ssh:ro
     # Intel 核显直通（Iris Xe，加速本地视觉模型的图像编码）：
     # 宿主需已加载 i915 驱动（绿联 x86 NAS 默认有）。应用后需重建容器生效：
     #   docker compose up -d --force-recreate deepseek-harness
