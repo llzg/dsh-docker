@@ -77,3 +77,31 @@ bash scripts/test-dsh-safe-deploy.sh && node scripts/test-version-policy.js
 - Renovate：GitHub App 安装后自动接管 `testCandidate` 更新；安装前 SSOT 由 `scripts/check-new-version.js` 的多源检测人工确认后手动更新。
 - docker-rollout：宿主安装 `wowu/docker-rollout` 插件后自动启用；未安装时回退 Compose `up -d --force-recreate` + health gate。
 - 保留策略：不自动 prune；保留 production/rollback/test 镜像与最近 snapshot（`/data/dsh/backups/<version>-<ts>`）。
+
+## 8. Isolated Test 实测状态（2026-09-01）
+
+候选镜像已构建并推送（prerelease 门控实证：latest 未动，生产安全）：
+
+```text
+TEST_CANDIDATE     0.1.2-alpha.3
+IMAGE_TAG          ghcr.io/llzg/dsh-docker:0.1.2-alpha.3
+IMMUTABLE_TAG      ghcr.io/llzg/dsh-docker:0.1.2-alpha.3-e478cdf21a08fdc2b7e26467672728546b53371d
+DIGEST             sha256:f7112e0b3158eb291d158cbb5b4d171e9fe315779b99796fa649f7da0d53386e
+PRODUCTION_LATEST  sha256:67fc4c76...（未变 = 0.1.1-rc.2，prerelease 门控生效）
+```
+
+宿主执行隔离测试（容器挂载 docker.sock 后，或直接 NAS 宿主）：
+
+```bash
+# 1) 只读评估
+scripts/dsh-safe-deploy check
+# 2) 隔离测试：snapshot → /data/dsh/test/0.1.2-alpha.3（独立端口容器 + smoke）
+scripts/dsh-safe-deploy test
+# 3) 通过后如需 promote（alpha 为 HIGH 风险，需显式 --force）
+scripts/dsh-safe-deploy promote --force
+# 4) 回滚
+scripts/dsh-safe-deploy rollback
+```
+
+0.1.2-alpha.3 注意：dsh web 默认启用 token 认证（URL 带 ?token=，base64url 含 -/_）；
+smoke 已适配；promote 前需决策认证策略（LAN trusted-host 是否保持认证）。
