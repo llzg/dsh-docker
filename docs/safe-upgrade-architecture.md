@@ -105,3 +105,12 @@ scripts/dsh-safe-deploy rollback
 
 0.1.2-alpha.3 注意：dsh web 默认启用 token 认证（URL 带 ?token=，base64url 含 -/_）；
 smoke 已适配；promote 前需决策认证策略（LAN trusted-host 是否保持认证）。
+
+## 9. 连接传输指标命名（canonical）
+
+DSH 连接载体随版本可能变化（实测 alpha.3 用 HTTP fetch RPC/streaming，非传统 WebSocket）。
+指标命名使用 transport 中性的 canonical 字段，避免锁死实现：
+
+- `SESSION_TRANSPORT_RECOVERY`（canonical；替代旧 `WEBSOCKET_RECONNECT`）
+  含义：会话连接丢失后，客户端指数退避重连 + cookie 会话认证（HttpOnly）下无需重新认证。
+- 旧字段 `WEBSOCKET_RECONNECT` 仅作兼容别名保留，新报告一律使用 `SESSION_TRANSPORT_RECOVERY`。
