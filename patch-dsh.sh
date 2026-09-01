@@ -13,6 +13,10 @@ STRICT="${STRICT:-0}"
 #    loads when accessed from a LAN IP (upstream defaults to "memory" off-loopback).
 for pkg in dsh-client-ui-settings dsh-client-ui-settings-models dsh-client-ui-settings-general; do
   f="$BASE/$pkg/lib/client.js"
+  if [ ! -f "$f" ]; then
+    echo "SKIP settings-host-mode: 目标不存在（上游移除 $pkg，patch 不适用）: $f"
+    continue
+  fi
   if grep -q 'connection.isLoopback ? "host" : "memory"' "$f"; then
     sed -i 's/connection.isLoopback ? "host" : "memory"/"host"/g' "$f"
     echo "settings-host-mode: patched $pkg"
@@ -26,6 +30,10 @@ done
 POLYFILL='if(!globalThis.crypto.randomUUID){globalThis.crypto.randomUUID=function(){var a=crypto.getRandomValues(new Uint8Array(16));a[6]=a[6]&15|64;a[8]=a[8]&63|128;return Array.from(a,function(b,i){var h=b.toString(16).padStart(2,"0");return(i===4||i===6||i===8||i===10)?"-"+h:h}).join("");};}'
 for pkg in dsh-client-connection dsh-client-ui-conversation; do
   f="$BASE/$pkg/lib/client.js"
+  if [ ! -f "$f" ]; then
+    echo "SKIP randomuuid-polyfill: 目标不存在（上游移除 $pkg，patch 不适用）: $f"
+    continue
+  fi
   if grep -q 'globalThis.crypto.randomUUID' "$f"; then
     echo "randomuuid-polyfill: already present in $pkg"
   else
@@ -38,7 +46,9 @@ done
 #    are pinned to loopback by default. Trust the same --trusted-host list
 #    so the LAN deployment can configure providers in the UI.
 CONN_INDEX="$BASE/dsh-client-connection/lib/index.js"
-if grep -q 'PRIVILEGED_METHODS.has(method) && !isTrustedApiRequest(request, trustedHosts)' "$CONN_INDEX"; then
+if [ ! -f "$CONN_INDEX" ]; then
+  echo "SKIP privileged-loopback: 目标不存在（上游移除 dsh-client-connection，patch 不适用）: $CONN_INDEX"
+elif grep -q 'PRIVILEGED_METHODS.has(method) && !isTrustedApiRequest(request, trustedHosts)' "$CONN_INDEX"; then
   echo "privileged-loopback: already patched"
 else
   sed -i 's/PRIVILEGED_METHODS.has(method) && !isTrustedApiRequest(request, \[\])/PRIVILEGED_METHODS.has(method) \&\& !isTrustedApiRequest(request, trustedHosts)/' "$CONN_INDEX"
@@ -51,8 +61,11 @@ fi
 #    无需读写字节），智能体看到路径后可用 scripts/see.sh 看图。
 LLM_DS="$BASE/dsh-llm-deepseek/lib/index.js"
 python3 - "$LLM_DS" <<'PY'
-import sys
+import os, sys
 f = sys.argv[1]
+if not os.path.exists(f):
+    print("SKIP vision-materialize: 目标不存在（上游移除 dsh-llm-deepseek，patch 不适用）:", f)
+    sys.exit(0)
 src = open(f, encoding="utf-8").read()
 if "materializeImages" in src:
     print("vision-materialize: already patched")
@@ -131,8 +144,11 @@ PY
 #     附件路径文本），而不是在入口一刀切。
 APIPROXY="$BASE/dsh-host-apiproxy/lib/index.js"
 python3 - "$APIPROXY" <<'PY'
-import sys
+import os, sys
 f = sys.argv[1]
+if not os.path.exists(f):
+    print("SKIP vision-gate: 目标不存在（上游移除 dsh-host-apiproxy，patch 不适用）:", f)
+    sys.exit(0)
 src = open(f, encoding="utf-8").read()
 marker = "vision-gate: pasted images pass through"
 if marker in src:
@@ -175,7 +191,7 @@ if [ "$STRICT" = "1" ]; then
   # 1) settings: original off-loopback "memory" fallback must be gone
   for pkg in dsh-client-ui-settings dsh-client-ui-settings-models dsh-client-ui-settings-general; do
     f="$BASE/$pkg/lib/client.js"
-    if grep -q 'connection.isLoopback ? "host" : "memory"' "$f"; then
+    if [ -f "$f" ] && grep -q 'connection.isLoopback ? "host" : "memory"' "$f"; then
       echo "VERIFY FAIL: settings-host-mode not applied in $pkg (upstream changed?)" >&2
       FAIL=1
     fi
@@ -183,36 +199,36 @@ if [ "$STRICT" = "1" ]; then
   # 2) randomUUID polyfill marker must exist in both client bundles
   for pkg in dsh-client-connection dsh-client-ui-conversation; do
     f="$BASE/$pkg/lib/client.js"
-    if ! grep -q 'crypto.randomUUID=function' "$f"; then
+    if [ -f "$f" ] && ! grep -q 'crypto.randomUUID=function' "$f"; then
       echo "VERIFY FAIL: randomuuid-polyfill missing in $pkg (upstream changed?)" >&2
       FAIL=1
     fi
   done
   # 3) privileged methods must trust the --trusted-host list
-  if ! grep -q 'isTrustedApiRequest(request, trustedHosts' "$CONN_INDEX"; then
+  if [ -f "$CONN_INDEX" ] && ! grep -q 'isTrustedApiRequest(request, trustedHosts' "$CONN_INDEX"; then
     echo "VERIFY FAIL: privileged-loopback not applied in dsh-client-connection (upstream changed?)" >&2
     FAIL=1
   fi
   # 4) vision-materialize marker must exist; original rejection must be gone
-  if ! grep -q 'materializeImages' "$LLM_DS"; then
+  if [ -f "$LLM_DS" ] && ! grep -q 'materializeImages' "$LLM_DS"; then
     echo "VERIFY FAIL: vision-materialize not applied in dsh-llm-deepseek (upstream changed?)" >&2
     FAIL=1
   fi
-  if grep -q 'does not support image content' "$LLM_DS"; then
+  if [ -f "$LLM_DS" ] && grep -q 'does not support image content' "$LLM_DS"; then
     echo "VERIFY FAIL: vision-materialize rejection still present in dsh-llm-deepseek" >&2
     FAIL=1
   fi
   # 4b) vision-gate marker must exist; MODEL_DOES_NOT_SUPPORT_IMAGES must be gone
-  if ! grep -q 'vision-gate: pasted images pass through' "$APIPROXY"; then
+  if [ -f "$APIPROXY" ] && ! grep -q 'vision-gate: pasted images pass through' "$APIPROXY"; then
     echo "VERIFY FAIL: vision-gate not applied in dsh-host-apiproxy (upstream changed?)" >&2
     FAIL=1
   fi
-  if grep -q 'MODEL_DOES_NOT_SUPPORT_IMAGES' "$APIPROXY"; then
+  if [ -f "$APIPROXY" ] && grep -q 'MODEL_DOES_NOT_SUPPORT_IMAGES' "$APIPROXY"; then
     echo "VERIFY FAIL: vision-gate rejection still present in dsh-host-apiproxy" >&2
     FAIL=1
   fi
   # 5) custom favicon must be embedded (icon assets present in image)
-  if [ -f /opt/dsh-icon.jpg ] && ! grep -q 'data:image/jpeg;base64' "$FAVICON"; then
+  if [ -f /opt/dsh-icon.jpg ] && [ -f "$FAVICON" ] && ! grep -q 'data:image/jpeg;base64' "$FAVICON"; then
     echo "VERIFY FAIL: favicon-custom not applied in dsh-web-frontend" >&2
     FAIL=1
   fi
