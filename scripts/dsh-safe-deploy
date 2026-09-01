@@ -51,9 +51,12 @@ with_lock() {
 }
 
 snapshot_dsh() {
-  local ver="$1" ts="$(date +%Y%m%d-%H%M%S)" dst="$BACKUP_ROOT/${ver:-unknown}-$ts"
+  local ver="$1"
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  local dst="$BACKUP_ROOT/${ver:-unknown}-$ts"
   mkdir -p "$dst"
-  echo "snapshot: /data/dsh -> $dst"
+  echo "snapshot: /data/dsh -> $dst" >&2
   # 排除可重建/超大目录：node_modules、pnpm store、测试目录、历史备份
   tar -C /data/dsh -cf - \
       --exclude='profiles/web/node_modules' \
@@ -70,7 +73,7 @@ snapshot_dsh() {
       return 1
     fi
   done
-  echo "snapshot OK: $dst"
+  echo "snapshot OK: $dst" >&2
   echo "$dst"
 }
 
@@ -98,25 +101,50 @@ cmd_test() {
   echo "test: target=$target risk=$risk"
 
   local snap; snap="$(snapshot_dsh "$target")" || exit 1
-  local test_home="$TEST_ROOT/$target"
-  rm -rf "$test_home"; mkdir -p "$test_home"
+  # 容器内执行时 /data/dsh 挂自宿主 dsh-data：docker -v 的源路径需宿主视角
+  local host_dsh
+  host_dsh="$(docker inspect "$CONTAINER" --format '{{range .HostConfig.Binds}}{{println .}}{{end}}' 2>/dev/null | awk -F: '$2=="/data/dsh"{print $1; exit}')"
+  local host_data="${host_dsh:-/data/dsh}"
+  local test_home_cont="$TEST_ROOT/$target"
+  local test_home="$host_data/test/$target"
+  rm -rf "$test_home_cont"; mkdir -p "$test_home_cont"
   # 用 snapshot 构建隔离 TEST_DSH_HOME（保留权限/owner/hidden/symlink）
-  tar -C "$snap" -cf - . | tar -C "$test_home" -xf -
-  echo "TEST_DSH_HOME=$test_home"
+  tar -C "$snap" -cf - . | tar -C "$test_home_cont" -xf -
+  # 恢复 profile 树外 bundle（snapshot 排除 node_modules；复制生产 profile 的——
+  # codex/claude bundle rc.8 已实测兼容 alpha.3 host；bundles 列表已排除 siliconflow，包在但不加载）
+  [ -d /data/dsh/profiles/web/node_modules ] && cp -a /data/dsh/profiles/web/node_modules "$test_home_cont/profiles/web/"
+  [ -d /data/dsh/profiles/headless ] && [ -d /data/dsh/profiles/headless/node_modules ] && cp -a /data/dsh/profiles/headless/node_modules "$test_home_cont/profiles/headless/"
+  # Codex 认证（test 专用副本，不共享生产 /root/.codex）：通过 CODEX_HOME 指向 test 副本
+  [ -d /root/.codex ] && cp -a /root/.codex "$test_home_cont/.codex" && echo "CODEX_HOME 副本: $test_home_cont/.codex"
+  echo "TEST_DSH_HOME=$test_home_cont (host: $test_home)"
 
   local port; port="${DSH_TEST_PORT:-$(( ( RANDOM % 1000 ) + 12000 ))}"
   local cname="${CONTAINER}-test-$$"
-  echo "test container: $cname on :$port"
+  # test 容器加入生产网络（compose project 网络），使探活可直达 test IP；
+  # 数据仍完全隔离（只挂 TEST_DSH_HOME，不挂生产 DSH_HOME）。
+  local net
+  net="$(docker inspect "$CONTAINER" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null || true)"
+  echo "test container: $cname on :$port (network: ${net:-default})"
   docker run -d --name "$cname" \
-    -e DSH_HOME="$test_home" -e DSH_TELEMETRY_DISABLED=1 \
-    -p "127.0.0.1:$port:3080" \
-    -v "$test_home:$test_home" \
+    -e DSH_HOME="$test_home_cont" -e DSH_TELEMETRY_DISABLED=1 \
+    -e CODEX_HOME="$test_home_cont/.codex" \
+    -p "0.0.0.0:$port:3080" \
+    ${net:+--network "$net"} \
+    -v "$test_home:$test_home_cont" \
     "${IMAGE_BASE}:${target}" dsh --profile web --no-open --host 127.0.0.1 >/dev/null
   trap 'docker rm -f "$cname" >/dev/null 2>&1 || true' EXIT
 
-  local ok=1 i
+  local ok=1 i tok cip
+  # 容器内执行 docker test 时：docker -p 映射在宿主 netns，本容器 curl 127.0.0.1 访问不到；
+  # 用 test 容器 IP 直连（同 bridge 网络）。
+  cip="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$v.IPAddress}}{{end}}' "$cname" 2>/dev/null || true)"
   for i in $(seq 1 40); do
-    if curl -sf "http://127.0.0.1:$port/" >/dev/null 2>&1; then ok=0; break; fi
+    # 0.1.2-alpha.3+ 默认 token 认证：从容器日志提取 token 探活（base64url 含 -_）
+    tok="$(docker logs "$cname" 2>/dev/null | grep -oE 'token=[A-Za-z0-9_-]+' | head -1 | sed 's/token=//' || true)"
+    if { [ -n "$tok" ] && [ -n "$cip" ] && curl -sf "http://$cip:3080/?token=$tok" >/dev/null 2>&1; } \
+       || { [ -n "$cip" ] && curl -sf "http://$cip:3080/" >/dev/null 2>&1; }; then
+      ok=0; break
+    fi
     sleep 5
   done
   if [ "$ok" -ne 0 ]; then echo "FAIL: test instance 未就绪"; echo "TEST_VERDICT=FAIL" | tee "$verdict_file"; exit 1; fi
