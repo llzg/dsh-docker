@@ -69,6 +69,24 @@ jobs:
         if: steps.version.outputs.version != ''
         uses: docker/setup-buildx-action@v3
 
+      # 计算镜像 tag 集：prerelease（alpha/beta/rc）不打 latest，
+      # 防止 watchtower/任何 latest 消费者自动把 prerelease 部署到生产；
+      # stable 全量打（latest 仅 stable 或显式 promote 流程）。
+      - name: Compute image tags
+        if: steps.version.outputs.version != ''
+        id: tags
+        run: |
+          BASE="ghcr.io/${{ github.repository_owner }}/dsh-docker"
+          V="${{ steps.version.outputs.version }}"
+          SHA="${{ github.sha }}"
+          if [ "${{ steps.version.outputs.is_prerelease }}" = "1" ]; then
+            printf 'IMAGE_TAGS=%s\n%s\n' "${BASE}:${V}-${SHA}" "${BASE}:${V}" >> "$GITHUB_ENV"
+            echo "prerelease: 仅 immutable + version tag（不打 latest）"
+          else
+            printf 'IMAGE_TAGS=%s\n%s\n%s\n' "${BASE}:${V}-${SHA}" "${BASE}:${V}" "${BASE}:latest" >> "$GITHUB_ENV"
+            echo "stable: immutable + version + latest"
+          fi
+
       # 先构建到本地 daemon 做冒烟测试；通过后再推送，
       # 保证坏镜像永远不会进入 latest（构建期回滚保护）。
       - name: Build image (local, for smoke test)
@@ -78,10 +96,7 @@ jobs:
           context: .
           load: true
           push: false
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}-${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/dsh-docker:latest
+          tags: ${{ env.IMAGE_TAGS }}
           build-args: |
             DSH_VERSION=${{ steps.version.outputs.version }}
             GIT_REVISION=${{ github.sha }}
@@ -93,6 +108,4 @@ jobs:
       - name: Push to GHCR
         if: steps.version.outputs.version != ''
         run: |
-          docker push ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}-${{ github.sha }}
-          docker push ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}
-          docker push ghcr.io/${{ github.repository_owner }}/dsh-docker:latest
+          echo "$IMAGE_TAGS" | while IFS= read -r t; do [ -n "$t" ] && docker push "$t"; done

@@ -126,6 +126,9 @@ async function main() {
     `git_tag=${tag.status === 'ok' ? tag.value || '' : ''}`,
     `last_published=${lastPublished}`,
     `waiting_for_npm=${target.waitingForNpm ? '1' : '0'}`,
+    // prerelease 标记：prerelease 版本只构建 immutable/<version> tag，不打 latest
+    // （防 watchtower 自动把 alpha/beta/rc 部署到生产；生产由 dsh-safe-deploy promote 接管）
+    `is_prerelease=${version && /^[0-9.]+-[0-9A-Za-z.-]+$/.test(version) ? '1' : '0'}`,
   ];
   if (process.env.GITHUB_OUTPUT) {
     fs.appendFileSync(process.env.GITHUB_OUTPUT, lines.map((l) => l + '\n').join(''));
