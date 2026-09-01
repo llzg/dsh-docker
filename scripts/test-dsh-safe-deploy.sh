@@ -89,3 +89,40 @@ rm -rf "$SNAP"
 echo "----------------------------------------"
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
+
+# ── 插件兼容性策略（REQUIRED 才 BLOCK；OPTIONAL/UNUSED 仅告警）────────────
+TMPSSOT2=$(mktemp)
+cat > "$TMPSSOT2" <<'JSON'
+{
+  "version": "0.1.1-rc.2",
+  "productionChannel": "0.1.1-rc.2",
+  "testCandidate": "0.1.2-alpha.3",
+  "requiredPlugins": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-subagent-codex"],
+  "optionalPlugins": ["@siliconflow-official/dsh-llm-siliconflow"],
+  "pluginCompat": {
+    "@siliconflow-official/dsh-llm-siliconflow": { "status": "FAIL", "reason": "CallId removed" }
+  }
+}
+JSON
+A=$(node -e "const p=require('./$POLICY');const r=p.computeAll({ssotFile:'$TMPSSOT2'});console.log([r.siliconflow.class,r.siliconflow.blocking,r.promoteBlocked,r.pluginBlockers.length].join('|'))")
+t T35 "OPTIONAL 插件 FAIL → 不阻塞 promote" "$([ "$A" = "OPTIONAL|false|false|0" ] && echo 1 || echo 0)" "got=$A"
+
+cat > "$TMPSSOT2" <<'JSON'
+{
+  "version": "0.1.1-rc.2",
+  "productionChannel": "0.1.1-rc.2",
+  "testCandidate": "0.1.2-alpha.3",
+  "requiredPlugins": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-subagent-codex"],
+  "optionalPlugins": [],
+  "pluginCompat": {
+    "@deepseek-ai/dsh-subagent-codex": { "status": "FAIL", "reason": "provider API mismatch" }
+  }
+}
+JSON
+A=$(node -e "const p=require('./$POLICY');const r=p.computeAll({ssotFile:'$TMPSSOT2'});console.log([r.pluginBlockers.length,r.promoteBlocked].join('|'))")
+t T36 "REQUIRED 插件 FAIL → 阻塞 promote" "$([ "$A" = "1|true" ] && echo 1 || echo 0)" "got=$A"
+rm -f "$TMPSSOT2"
+
+echo "----------------------------------------"
+echo "RESULT: PASS=$PASS FAIL=$FAIL"
+[ "$FAIL" -eq 0 ]

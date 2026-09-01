@@ -24,6 +24,9 @@ function parseSSOT(file) {
     testCandidate,
     updatedAt: j.updatedAt || null,
     source: j.source || 'unknown',
+    requiredPlugins: Array.isArray(j.requiredPlugins) ? j.requiredPlugins : [],
+    optionalPlugins: Array.isArray(j.optionalPlugins) ? j.optionalPlugins : [],
+    pluginCompat: j.pluginCompat && typeof j.pluginCompat === 'object' ? j.pluginCompat : {},
   };
 }
 
@@ -91,13 +94,54 @@ function computeRisk(production, candidate, { migration = 'none', notes = '' } =
   return 'MEDIUM'; // 阶段回退（生产 rc → 候选 alpha）视为需注意
 }
 
-// 汇总一次 check 的全部字段
+// 插件兼容性分类：REQUIRED（实际启用/生产必需）→ FAIL 阻塞 promote；
+// OPTIONAL/UNUSED（已配置但未启用/未使用）→ FAIL 仅告警，不阻塞。
+function classifyPlugins(ssot) {
+  const required = new Set(ssot.requiredPlugins || []);
+  const optional = new Set(ssot.optionalPlugins || []);
+  const out = {};
+  for (const name of Object.keys(ssot.pluginCompat || {})) {
+    out[name] = required.has(name) ? 'REQUIRED' : optional.has(name) ? 'OPTIONAL' : 'UNUSED';
+  }
+  return out;
+}
+
+// 仅 REQUIRED 且 FAIL 的插件构成 promote blocker；OPTIONAL/UNUSED 的 FAIL 只告警。
+function pluginBlockers(ssot) {
+  const cls = classifyPlugins(ssot);
+  const blockers = [];
+  const warnings = [];
+  for (const [name, info] of Object.entries(ssot.pluginCompat || {})) {
+    if (info.status !== 'FAIL') continue;
+    if (cls[name] === 'REQUIRED') blockers.push({ name, class: cls[name], reason: info.reason });
+    else warnings.push({ name, class: cls[name], reason: info.reason });
+  }
+  return { blockers, warnings, classes: cls };
+}
+
+// 汇总一次 check 的全部字段（含插件兼容性策略与 promote 阻塞判定）
 function computeAll({ ssotFile, notes = '' } = {}) {
   const file = ssotFile || path.join(__dirname, '..', 'dsh-version.json');
   const ssot = parseSSOT(file);
   const migration = detectMigration(notes);
   const risk = computeRisk(ssot.productionChannel, ssot.testCandidate, { migration, notes });
   const hasCandidate = !!ssot.testCandidate && ssot.testCandidate !== ssot.productionChannel;
+  const pb = pluginBlockers(ssot);
+  // 版本级 BLOCKED（migration forward-only/unknown、非法版本）与 REQUIRED 插件 blocker 合并
+  const versionBlocked = risk === 'BLOCKED';
+  const otherBlockers = [
+    ...(versionBlocked ? [{ kind: 'version', detail: migration === 'none' ? '版本不可解析/非法' : `migration=${migration}` }] : []),
+    ...pb.blockers,
+  ];
+  // siliconflow 专项（OPTIONAL，不阻塞；保留记录）
+  const sf = ssot.pluginCompat && ssot.pluginCompat['@siliconflow-official/dsh-llm-siliconflow'];
+  const siliconflow = {
+    inUse: false,
+    compat: sf ? (sf.status === 'FAIL' ? 'FAIL' : sf.status) : 'N/A',
+    blocking: false,
+    class: pb.classes['@siliconflow-official/dsh-llm-siliconflow'] || 'UNUSED',
+    record: sf ? sf.reason : null,
+  };
   return {
     currentVersion: ssot.version,
     productionChannel: ssot.productionChannel,
@@ -110,11 +154,21 @@ function computeAll({ ssotFile, notes = '' } = {}) {
     candidateIsNewer: hasCandidate,
     ssotSource: ssot.source,
     ssotUpdatedAt: ssot.updatedAt,
+    requiredRuntimeDependencies: [...(ssot.requiredPlugins || [])],
+    optionalPlugins: [...(ssot.optionalPlugins || [])],
+    pluginCompat: ssot.pluginCompat || {},
+    pluginClass: pb.classes,
+    pluginBlockers: pb.blockers,
+    pluginWarnings: pb.warnings,
+    otherBlockers,
+    promoteBlocked: otherBlockers.length > 0,
+    siliconflow,
   };
 }
 
 module.exports = {
   parseSSOT, channelOf, sameCore, channelStep, detectMigration, computeRisk, computeAll,
+  classifyPlugins, pluginBlockers,
   CHANNEL_ORDER, CHANNEL_RANK,
 };
 

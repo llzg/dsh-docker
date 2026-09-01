@@ -114,3 +114,23 @@ DSH 连接载体随版本可能变化（实测 alpha.3 用 HTTP fetch RPC/stream
 - `SESSION_TRANSPORT_RECOVERY`（canonical；替代旧 `WEBSOCKET_RECONNECT`）
   含义：会话连接丢失后，客户端指数退避重连 + cookie 会话认证（HttpOnly）下无需重新认证。
 - 旧字段 `WEBSOCKET_RECONNECT` 仅作兼容别名保留，新报告一律使用 `SESSION_TRANSPORT_RECOVERY`。
+
+## 10. 插件兼容性策略（REQUIRED 才 BLOCK，OPTIONAL/UNUSED 仅告警）
+
+插件分三类（SSOT `requiredPlugins` / `optionalPlugins` 声明；其余 = UNUSED）：
+
+- **REQUIRED_PLUGIN**：实际启用/生产必需（内置 bundle + 已启用子代理）。其 compatibility FAIL → **BLOCK promote**。
+- **OPTIONAL_PLUGIN**：已安装/已配置但未启用或非默认使用。其 FAIL → **告警（pluginWarnings），不 BLOCK**。
+- **UNUSED_PLUGIN**：未安装/无配置。不参与评估。
+
+当前 REQUIRED_RUNTIME_DEPENDENCIES（生产实际使用，2026-09-01 确认）：
+`@deepseek-ai/dsh-base, @deepseek-ai/dsh-web-app, @deepseek-ai/dsh-subagent-codex`
+（claude-code 子代理 preset 中 disabled → OPTIONAL；siliconflow 默认模型为 deepseek-official、非默认使用 → OPTIONAL）
+
+兼容性记录（保留，不删除）：
+- `@siliconflow-official/dsh-llm-siliconflow@0.2.0-rc.1` 与 DSH 0.1.2-alpha.3 的 `@deepseek-ai/dsh-llm` **CallId 导出不兼容**（上游 main 分支亦未修复）。
+- 归类 OPTIONAL、`SILICONFLOW_BLOCKING=NO`：**不阻塞 alpha.3 promote**。
+- **重新启用 SiliconFlow 前必须重新执行 compatibility gate**（更新 SSOT pluginCompat + 重跑 check）。
+
+promote verdict 规则：`otherBlockers`（版本级 BLOCKED + REQUIRED 插件 FAIL）为空 → 不 BLOCK；
+LAN_ACCESS / MOBILE_VPN 未人工验证前 → `TEST_ONLY`；两项 PASS 且 docker isolated test / rollback gate 正常 → `PROMOTE_OK`。
