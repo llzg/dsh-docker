@@ -27,6 +27,7 @@ function parseSSOT(file) {
     requiredPlugins: Array.isArray(j.requiredPlugins) ? j.requiredPlugins : [],
     optionalPlugins: Array.isArray(j.optionalPlugins) ? j.optionalPlugins : [],
     pluginCompat: j.pluginCompat && typeof j.pluginCompat === 'object' ? j.pluginCompat : {},
+    pluginState: j.pluginState && typeof j.pluginState === 'object' ? j.pluginState : {},
   };
 }
 
@@ -99,21 +100,30 @@ function computeRisk(production, candidate, { migration = 'none', notes = '' } =
 function classifyPlugins(ssot) {
   const required = new Set(ssot.requiredPlugins || []);
   const optional = new Set(ssot.optionalPlugins || []);
+  const state = ssot.pluginState || {};
   const out = {};
   for (const name of Object.keys(ssot.pluginCompat || {})) {
-    out[name] = required.has(name) ? 'REQUIRED' : optional.has(name) ? 'OPTIONAL' : 'UNUSED';
+    // 状态判定：REQUIRED > OPTIONAL_ACTIVE(enabled) > OPTIONAL_INACTIVE(安装/配置但 enabled=false) > UNUSED
+    const st = state[name] || {};
+    if (required.has(name)) out[name] = 'REQUIRED';
+    else if (st.enabled === true) out[name] = 'OPTIONAL_ACTIVE';
+    else if (optional.has(name) || st.classification) out[name] = 'OPTIONAL_INACTIVE';
+    else out[name] = 'UNUSED';
   }
   return out;
 }
 
-// 仅 REQUIRED 且 FAIL 的插件构成 promote blocker；OPTIONAL/UNUSED 的 FAIL 只告警。
+// promote blocker 判定基于 ACTIVE runtime 依赖（REQUIRED 或 OPTIONAL_ACTIVE）：
+//   REQUIRED/OPTIONAL_ACTIVE + FAIL → BLOCK；OPTIONAL_INACTIVE/UNUSED + FAIL → WARN 不 BLOCK。
+// 一致性要求：OPTIONAL_INACTIVE 必须同时不进入 runtime bundle set（由 profile bundles 排除 + 启动实测保证）。
 function pluginBlockers(ssot) {
   const cls = classifyPlugins(ssot);
   const blockers = [];
   const warnings = [];
+  const activeSet = new Set(['REQUIRED', 'OPTIONAL_ACTIVE']);
   for (const [name, info] of Object.entries(ssot.pluginCompat || {})) {
     if (info.status !== 'FAIL') continue;
-    if (cls[name] === 'REQUIRED') blockers.push({ name, class: cls[name], reason: info.reason });
+    if (activeSet.has(cls[name])) blockers.push({ name, class: cls[name], reason: info.reason });
     else warnings.push({ name, class: cls[name], reason: info.reason });
   }
   return { blockers, warnings, classes: cls };

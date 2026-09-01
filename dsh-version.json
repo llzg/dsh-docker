@@ -20,5 +20,13 @@
       "targetVersion": "0.1.2-alpha.3",
       "reason": "CallId 导出在 DSH 0.1.2-alpha.3 的 @deepseek-ai/dsh-llm 中移除；siliconflow 0.2.0-rc.1（npm 与 main 分支）均依赖 CallId。当前生产默认模型为 deepseek-official，siliconflow 未作默认/未主动使用（IN_USE=NO），归类 OPTIONAL —— 不阻塞 promote；重新启用前必须重跑 compatibility gate。"
     }
+  },
+  "pluginState": {
+    "@siliconflow-official/dsh-llm-siliconflow": {
+      "classification": "OPTIONAL",
+      "enabled": false,
+      "compatibility": "FAIL",
+      "reason": "active bundle set 已排除（不 autoload）；重新启用需：上游修复 CallId + compatibility gate PASS + enabled=true + 恢复 bundles 条目"
+    }
   }
 }

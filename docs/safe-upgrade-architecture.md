@@ -134,3 +134,15 @@ DSH 连接载体随版本可能变化（实测 alpha.3 用 HTTP fetch RPC/stream
 
 promote verdict 规则：`otherBlockers`（版本级 BLOCKED + REQUIRED 插件 FAIL）为空 → 不 BLOCK；
 LAN_ACCESS / MOBILE_VPN 未人工验证前 → `TEST_ONLY`；两项 PASS 且 docker isolated test / rollback gate 正常 → `PROMOTE_OK`。
+
+## 11. SiliconFlow Inactive（active bundle set 排除，2026-09-01）
+
+- **AUTOLOAD_TRIGGER**：`profiles/web/package.json` 的 `dsh.profile.bundles` 列表条目（loader 按 bundles import）。
+- **最小修改**：从 `dsh.profile.bundles` 移除 `@siliconflow-official/dsh-llm-siliconflow`（active set 不含）；
+  `dependencies` / `settings.yaml`（llm-siliconflow）/ `.credentials.yaml`（SILICONFLOW_API_KEY）全部保留。
+  生产 manifest 备份：`/data/dsh/profiles/web/package.json.bak-sf-inactive-20260901-131516`。
+- **SSOT 状态**：`pluginState.siliconflow = { classification: OPTIONAL, enabled: false, compatibility: FAIL }`。
+- **验证（production-equivalent alpha.3）**：bundles 无 sf + 包物理存在 → 启动 PASS、plugin tree 无 siliconflow、
+  CallId error 消失、DeepSeek smoke PASS、Codex smoke PASS、old/new session、restart cookie 持久 PASS。
+- **重新启用路径**：上游修复 CallId → compatibility gate PASS → `enabled=true` → 恢复 bundles 条目（credential/settings 无需重建）。
+- **policy**：OPTIONAL_INACTIVE + FAIL → WARN 不 BLOCK；OPTIONAL_ACTIVE/REQUIRED + FAIL → BLOCK。

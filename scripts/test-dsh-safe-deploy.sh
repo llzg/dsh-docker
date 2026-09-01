@@ -105,7 +105,7 @@ cat > "$TMPSSOT2" <<'JSON'
 }
 JSON
 A=$(node -e "const p=require('./$POLICY');const r=p.computeAll({ssotFile:'$TMPSSOT2'});console.log([r.siliconflow.class,r.siliconflow.blocking,r.promoteBlocked,r.pluginBlockers.length].join('|'))")
-t T35 "OPTIONAL 插件 FAIL → 不阻塞 promote" "$([ "$A" = "OPTIONAL|false|false|0" ] && echo 1 || echo 0)" "got=$A"
+t T35 "OPTIONAL 插件 FAIL → 不阻塞 promote" "$([ "$A" = "OPTIONAL_INACTIVE|false|false|0" ] && echo 1 || echo 0)" "got=$A"
 
 cat > "$TMPSSOT2" <<'JSON'
 {
@@ -122,6 +122,54 @@ JSON
 A=$(node -e "const p=require('./$POLICY');const r=p.computeAll({ssotFile:'$TMPSSOT2'});console.log([r.pluginBlockers.length,r.promoteBlocked].join('|'))")
 t T36 "REQUIRED 插件 FAIL → 阻塞 promote" "$([ "$A" = "1|true" ] && echo 1 || echo 0)" "got=$A"
 rm -f "$TMPSSOT2"
+
+echo "----------------------------------------"
+echo "RESULT: PASS=$PASS FAIL=$FAIL"
+[ "$FAIL" -eq 0 ]
+
+# ── 插件状态机：installed / active / required（T1-T3 policy；T4/T5 运行时）──
+TMPSSOT3=$(mktemp)
+cat > "$TMPSSOT3" <<'JSON'
+{
+  "version": "0.1.1-rc.2",
+  "productionChannel": "0.1.1-rc.2",
+  "testCandidate": "0.1.2-alpha.3",
+  "requiredPlugins": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-subagent-codex"],
+  "optionalPlugins": ["@siliconflow-official/dsh-llm-siliconflow"],
+  "pluginCompat": { "@siliconflow-official/dsh-llm-siliconflow": { "status": "FAIL", "reason": "CallId" } },
+  "pluginState": { "@siliconflow-official/dsh-llm-siliconflow": { "classification": "OPTIONAL", "enabled": false } }
+}
+JSON
+A=$(node -e "const p=require('./$POLICY');const r=p.computeAll({ssotFile:'$TMPSSOT3'});console.log([r.pluginClass['@siliconflow-official/dsh-llm-siliconflow'],r.promoteBlocked,r.pluginBlockers.length].join('|'))")
+t T1 "installed=true active=false compat=FAIL → 不阻塞 + OPTIONAL_INACTIVE" "$([ "$A" = "OPTIONAL_INACTIVE|false|0" ] && echo 1 || echo 0)" "got=$A"
+
+node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('$TMPSSOT3','utf8'));j.pluginState['@siliconflow-official/dsh-llm-siliconflow'].enabled=true;fs.writeFileSync('$TMPSSOT3',JSON.stringify(j,null,2))"
+A=$(node -e "const p=require('./$POLICY');const r=p.computeAll({ssotFile:'$TMPSSOT3'});console.log([r.pluginClass['@siliconflow-official/dsh-llm-siliconflow'],r.promoteBlocked,r.pluginBlockers.length].join('|'))")
+t T2 "OPTIONAL_ACTIVE + compat=FAIL → 阻塞" "$([ "$A" = "OPTIONAL_ACTIVE|true|1" ] && echo 1 || echo 0)" "got=$A"
+rm -f "$TMPSSOT3"
+
+TMPSSOT4=$(mktemp)
+cat > "$TMPSSOT4" <<'JSON'
+{
+  "version": "0.1.1-rc.2",
+  "productionChannel": "0.1.1-rc.2",
+  "testCandidate": "0.1.2-alpha.3",
+  "requiredPlugins": ["@deepseek-ai/dsh-subagent-codex"],
+  "optionalPlugins": [],
+  "pluginCompat": { "@deepseek-ai/dsh-subagent-codex": { "status": "FAIL", "reason": "mismatch" } },
+  "pluginState": {}
+}
+JSON
+A=$(node -e "const p=require('./$POLICY');const r=p.computeAll({ssotFile:'$TMPSSOT4'});console.log(r.promoteBlocked)")
+t T3 "REQUIRED + compat=FAIL → BLOCK" "$([ "$A" = "true" ] && echo 1 || echo 0)" "got=$A"
+rm -f "$TMPSSOT4"
+
+# T4: SiliconFlow inactive → production-equivalent profile bundles 不含 sf（runtime selection 一致）
+A=$(node -e "const j=require('/data/dsh/profiles/web/package.json');console.log(j.dsh.profile.bundles.includes('@siliconflow-official/dsh-llm-siliconflow'))")
+t T4 "inactive → active bundle set 不含 siliconflow" "$([ "$A" = "false" ] && echo 1 || echo 0)" "got=$A"
+# T5: inactive → credentials/settings 保留
+A=$(node -e "const fs=require('fs');const s=fs.readFileSync('/data/dsh/settings.yaml','utf8');const c=fs.readFileSync('/data/dsh/.credentials.yaml','utf8');console.log((s.toLowerCase().includes('siliconflow')?'S':'')+(c.includes('SILICONFLOW_API_KEY')?'C':''))")
+t T5 "inactive → settings+credential 保留" "$([ "$A" = "SC" ] && echo 1 || echo 0)" "got=$A"
 
 echo "----------------------------------------"
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
