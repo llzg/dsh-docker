@@ -79,11 +79,18 @@ jobs:
           BASE="ghcr.io/${{ github.repository_owner }}/dsh-docker"
           V="${{ steps.version.outputs.version }}"
           SHA="${{ github.sha }}"
+          {
+            echo "IMAGE_TAGS<<__DSH_TAGS__"
+            echo "${BASE}:${V}-${SHA}"
+            echo "${BASE}:${V}"
+            if [ "${{ steps.version.outputs.is_prerelease }}" != "1" ]; then
+              echo "${BASE}:latest"
+            fi
+            echo "__DSH_TAGS__"
+          } >> "$GITHUB_ENV"
           if [ "${{ steps.version.outputs.is_prerelease }}" = "1" ]; then
-            printf 'IMAGE_TAGS=%s\n%s\n' "${BASE}:${V}-${SHA}" "${BASE}:${V}" >> "$GITHUB_ENV"
             echo "prerelease: 仅 immutable + version tag（不打 latest）"
           else
-            printf 'IMAGE_TAGS=%s\n%s\n%s\n' "${BASE}:${V}-${SHA}" "${BASE}:${V}" "${BASE}:latest" >> "$GITHUB_ENV"
             echo "stable: immutable + version + latest"
           fi
 
