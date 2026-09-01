@@ -1,0 +1,34 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:base",
+    ":disableDependencyDashboard",
+    ":ignoreModulesAndTests"
+  ],
+  "repositories": ["llzg/dsh-docker"],
+  "regexManagers": [
+    {
+      "fileMatch": ["^dsh-version\\.json$"],
+      "matchStrings": [
+        "\"testCandidate\"\\s*:\\s*\"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "@deepseek-ai/dsh",
+      "datasourceTemplate": "npm",
+      "packageNameTemplate": "@deepseek-ai/dsh"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchDatasources": ["npm"],
+      "matchPackageNames": ["@deepseek-ai/dsh"],
+      "groupName": "dsh upstream",
+      "prerelease": "non-zero",
+      "separateMajorMinor": true,
+      "separateMinorPatch": true
+    }
+  ],
+  "schedule": ["every weekend"],
+  "branchConcurrentLimit": 1,
+  "prConcurrentLimit": 1,
+  "enabledManagers": ["regex", "npm"]
+}

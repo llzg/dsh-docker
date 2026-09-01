@@ -1,9 +1,10 @@
 services:
   deepseek-harness:
-    # DSH_IMAGE：默认 latest 由 watchtower 自动跟随更新；
-    # 回滚时 rollback.sh 会把旧版本写入同目录 .env 钉住（暂停自动更新），
-    # resume-auto-update.sh 恢复跟随 latest。
-    image: ${DSH_IMAGE:-ghcr.io/llzg/dsh-docker:latest}
+    # DSH 版本更新机制（2026-09 起）：
+    #   Renovate(发现/SSOT) → CI(immutable build) → dsh-safe-deploy(隔离测试+promote+rollback)
+    # DSH 已退出 Watchtower 自动替换（label 禁用）；watchtower 仅保留给无状态/低风险容器。
+    # 回滚：dsh-safe-deploy rollback（恢复旧 image + snapshot + env），不依赖 tag 覆盖。
+    image: ${DSH_IMAGE:-ghcr.io/llzg/dsh-docker:0.1.1-rc.2}
     container_name: deepseek-harness
     restart: unless-stopped
     ports:
@@ -36,4 +37,7 @@ services:
       - /dev/dri:/dev/dri
     labels:
       - "org.opencontainers.image.title=DeepSeek Harness Web (dsh)"
-      - "org.opencontainers.image.description=DeepSeek Harness web UI — auto-built from npm release, watchtower auto-update"
+      - "org.opencontainers.image.description=DeepSeek Harness web UI — auto-built from npm release, controlled promote via dsh-safe-deploy"
+      # 关键：DSH 退出 Watchtower 自动更新（防未经验证的跨版本替换）。
+      # watchtower 仍可管理其他无状态容器；只有此服务被排除。
+      - "com.centurylinklabs.watchtower.enable=false"

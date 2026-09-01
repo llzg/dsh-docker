@@ -79,6 +79,7 @@ jobs:
           load: true
           push: false
           tags: |
+            ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}-${{ github.sha }}
             ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}
             ghcr.io/${{ github.repository_owner }}/dsh-docker:latest
           build-args: |
@@ -87,10 +88,11 @@ jobs:
 
       - name: Smoke test (web UI /health)
         if: steps.version.outputs.version != ''
-        run: ./scripts/smoke-test.sh ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}
+        run: ./scripts/smoke-test.sh ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}-${{ github.sha }}
 
       - name: Push to GHCR
         if: steps.version.outputs.version != ''
         run: |
+          docker push ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}-${{ github.sha }}
           docker push ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}
           docker push ghcr.io/${{ github.repository_owner }}/dsh-docker:latest

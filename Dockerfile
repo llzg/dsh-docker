@@ -83,8 +83,11 @@ RUN node -e "require('fs').writeFileSync('/opt/dsh-version.json', JSON.stringify
 # semver（版本检测/版本页共用，随镜像持久）
 RUN cd /opt && npm init -y >/dev/null 2>&1 && npm install --no-audit --no-fund semver 2>&1 | tail -1
 COPY scripts/version-policy.js /opt/version-policy.js
+COPY scripts/safe-deploy-policy.js /opt/safe-deploy-policy.js
 COPY scripts/version-server.js /opt/version-server.js
-RUN node --check /opt/version-policy.js && node --check /opt/version-server.js && chmod +x /opt/version-server.js
+# 版本 SSOT（镜像内置副本；运行时优先读 /root/nas_docker/dsh-version.json 工作区实时版）
+COPY dsh-version.json /opt/dsh-version-ssot.json
+RUN node --check /opt/version-policy.js && node --check /opt/safe-deploy-policy.js && node --check /opt/version-server.js && chmod +x /opt/version-server.js
 
 # Healthcheck used both by the NAS watchdog (auto-rollback) and docker itself.
 # 0.1.1-rc.1 起未知路径返回 404（不再回退 SPA），故探活根路径 "/"。

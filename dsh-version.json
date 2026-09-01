@@ -1,0 +1,8 @@
+{
+  "version": "0.1.1-rc.2",
+  "productionChannel": "0.1.1-rc.2",
+  "testCandidate": "0.1.2-alpha.3",
+  "updatedAt": "2026-09-01T00:00:00.000Z",
+  "source": "manual",
+  "comment": "单一版本声明源（SSOT）。Renovate 只更新 testCandidate；productionChannel 仅由 dsh-safe-deploy promote 提升；version 镜像当前生产运行版本。"
+}

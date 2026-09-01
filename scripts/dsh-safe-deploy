@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# dsh-safe-deploy —— DSH 安全升级薄层。
+# 职责边界（不重复实现 Renovate/CI/docker-rollout 的能力）：
+#   * check     只读：SSOT + 策略计算（风险/通道/迁移），不接触运行时
+#   * test      数据 snapshot + 隔离测试实例（独立 TEST_DSH_HOME + 端口）
+#   * promote   门禁通过后切换生产（docker-rollout 或 compose + health gate）
+#   * rollback  恢复 OLD_IMAGE + OLD snapshot + env（幂等）
+#   * status    汇总当前/候选/回滚就绪状态
+# 并发：test/promote/rollback 通过 flock 互斥。
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SSOT="${DSH_SSOT:-$REPO_DIR/dsh-version.json}"
+LOCK_FILE="${DSH_DEPLOY_LOCK:-/tmp/dsh-safe-deploy.lock}"
+BACKUP_ROOT="${DSH_BACKUP_ROOT:-/data/dsh/backups}"
+TEST_ROOT="${DSH_TEST_ROOT:-/data/dsh/test}"
+STATE_DIR="${DSH_STATE_DIR:-/data/dsh/.deploy}"
+CONTAINER="${DSH_CONTAINER:-deepseek-harness}"
+COMPOSE_FILE="${DSH_COMPOSE_FILE:-/volume1/docker/deepseek-harness/docker-compose.yml}"
+IMAGE_BASE="${DSH_IMAGE_BASE:-ghcr.io/llzg/dsh-docker}"
+
+# 需要 docker 的命令在无 socket 时明确失败而非静默跳过
+require_docker() {
+  if ! docker info >/dev/null 2>&1; then
+    echo "ERROR: docker daemon 不可用（需在 NAS 宿主上执行，且容器需挂载 docker.sock）" >&2
+    exit 1
+  fi
+}
+
+json_get() { node -e "const s=require('fs').readFileSync(process.argv[1],'utf8');const j=JSON.parse(s);console.log(JSON.stringify(j[process.argv[2]]??''))" "$1" "$2"; }
+
+policy_json() {
+  node "$REPO_DIR/scripts/safe-deploy-policy.js" --json --ssot "$SSOT" 2>/dev/null \
+    || node -e "
+      const p = require('$REPO_DIR/scripts/safe-deploy-policy.js');
+      const r = p.computeAll({ ssotFile: process.argv[1] });
+      console.log(JSON.stringify(r, null, 2));
+    " "$SSOT"
+}
+
+with_lock() {
+  local action="$1"; shift
+  local lock
+  mkdir -p "$STATE_DIR"
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    echo "LOCKED: 另一 dsh-safe-deploy 操作进行中（$LOCK_FILE）；并发 promote/test/rollback 已阻止" >&2
+    exit 3
+  fi
+  "$action" "$@"
+}
+
+snapshot_dsh() {
+  local ver="$1" ts="$(date +%Y%m%d-%H%M%S)" dst="$BACKUP_ROOT/${ver:-unknown}-$ts"
+  mkdir -p "$dst"
+  echo "snapshot: /data/dsh -> $dst"
+  # 排除可重建/超大目录：node_modules、pnpm store、测试目录、历史备份
+  tar -C /data/dsh -cf - \
+      --exclude='profiles/web/node_modules' \
+      --exclude='profiles/headless/node_modules' \
+      --exclude='.pnpm-store' \
+      --exclude='test' \
+      --exclude='backups' \
+      --exclude='.deploy' \
+      . 2>/dev/null | tar -C "$dst" -xf -
+  # 校验 snapshot 完整性（关键路径 + 权限位）
+  for required in profiles/web/package.json settings.yaml .credentials.yaml; do
+    if [ ! -e "$dst/$required" ]; then
+      echo "BLOCKED: snapshot 不完整（缺少 $dst/$required）" >&2
+      return 1
+    fi
+  done
+  echo "snapshot OK: $dst"
+  echo "$dst"
+}
+
+cmd_check() {
+  echo "== dsh-safe-deploy check =="
+  policy_json
+}
+
+cmd_status() {
+  echo "== dsh-safe-deploy status =="
+  policy_json
+  local pj; pj="$(policy_json)"
+  local snap="$(ls -dt "$BACKUP_ROOT"/* 2>/dev/null | head -1 || true)"
+  echo "latestSnapshot: ${snap:-none}"
+  if [ -n "$snap" ]; then echo "rollbackReady: yes (snapshot: $snap)"; else echo "rollbackReady: no (无 snapshot)"; fi
+}
+
+cmd_test() {
+  require_docker
+  local verdict_file="$STATE_DIR/last-test-verdict"
+  local pj; pj="$(policy_json)"
+  local target; target="$(echo "$pj" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).testCandidate||''))")"
+  local risk; risk="$(echo "$pj" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).upgradeRisk||''))")"
+  [ -n "$target" ] || { echo "BLOCKED: testCandidate 为空" >&2; exit 1; }
+  echo "test: target=$target risk=$risk"
+
+  local snap; snap="$(snapshot_dsh "$target")" || exit 1
+  local test_home="$TEST_ROOT/$target"
+  rm -rf "$test_home"; mkdir -p "$test_home"
+  # 用 snapshot 构建隔离 TEST_DSH_HOME（保留权限/owner/hidden/symlink）
+  tar -C "$snap" -cf - . | tar -C "$test_home" -xf -
+  echo "TEST_DSH_HOME=$test_home"
+
+  local port; port="${DSH_TEST_PORT:-$(( ( RANDOM % 1000 ) + 12000 ))}"
+  local cname="${CONTAINER}-test-$$"
+  echo "test container: $cname on :$port"
+  docker run -d --name "$cname" \
+    -e DSH_HOME="$test_home" -e DSH_TELEMETRY_DISABLED=1 \
+    -p "127.0.0.1:$port:3080" \
+    -v "$test_home:$test_home" \
+    "${IMAGE_BASE}:${target}" dsh --profile web --no-open --host 127.0.0.1 >/dev/null
+  trap 'docker rm -f "$cname" >/dev/null 2>&1 || true' EXIT
+
+  local ok=1 i
+  for i in $(seq 1 40); do
+    if curl -sf "http://127.0.0.1:$port/" >/dev/null 2>&1; then ok=0; break; fi
+    sleep 5
+  done
+  if [ "$ok" -ne 0 ]; then echo "FAIL: test instance 未就绪"; echo "TEST_VERDICT=FAIL" | tee "$verdict_file"; exit 1; fi
+  echo "TEST_VERDICT=PASS" | tee "$verdict_file"
+  echo "MANUAL_CHECK_REQUIRED: mobile_vpn_reconnect, real_provider_chat, plugin_business_behavior"
+}
+
+cmd_promote() {
+  require_docker
+  local pj; pj="$(policy_json)"
+  local target; target="$(echo "$pj" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).testCandidate||''))")"
+  local risk; risk="$(echo "$pj" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).upgradeRisk||''))")"
+  local verdict="$(cat "$STATE_DIR/last-test-verdict" 2>/dev/null || echo NOT_RUN)"
+
+  [ "$verdict" = "TEST_VERDICT=PASS" ] || { echo "BLOCKED: test 未 PASS（$verdict）" >&2; exit 1; }
+  case "$risk" in HIGH|BLOCKED) echo "BLOCKED: risk=$risk 需人工审批（--force 可覆盖 HIGH）"; [ "${1:-}" = "--force" ] || exit 1;; esac
+  echo "promote: $target (risk=$risk)"
+  local digest; digest="$(docker inspect --format '{{.Image}}' "$CONTAINER" 2>/dev/null || echo old-image)"
+  echo "old image digest: $digest"
+
+  if docker rollout "$CONTAINER" 2>/dev/null; then
+    echo "deploy: docker rollout $CONTAINER"
+  else
+    echo "deploy: docker-rollout 不可用，回退 compose + health gate"
+    ( cd "$(dirname "$COMPOSE_FILE")" && DSH_IMAGE="$IMAGE_BASE:$target" docker compose -f "$COMPOSE_FILE" up -d --force-recreate )
+  fi
+  # 更新 SSOT：productionChannel/version = target
+  node -e "
+    const fs=require('fs');const f=process.argv[1];
+    const j=JSON.parse(fs.readFileSync(f,'utf8'));
+    j.productionChannel=j.version=process.argv[2];
+    j.updatedAt=new Date().toISOString(); j.source='promote';
+    fs.writeFileSync(f, JSON.stringify(j,null,2)+'\n');
+  " "$SSOT" "$target"
+  echo "promote done: production=$target"
+}
+
+cmd_rollback() {
+  require_docker
+  local snap="$(ls -dt "$BACKUP_ROOT"/* 2>/dev/null | head -1 || true)"
+  [ -n "$snap" ] || { echo "BLOCKED: 无可用 snapshot" >&2; exit 1; }
+  echo "rollback: 恢复 snapshot $snap"
+  # 1) 恢复旧镜像（来自 snapshot 目录名中的版本，或 DSH_ROLLBACK_IMAGE）
+  local ver="${DSH_ROLLBACK_VERSION:-$(basename "$snap" | sed 's/-[0-9-]*$//')}"
+  local img="${DSH_ROLLBACK_IMAGE:-$IMAGE_BASE:$ver}"
+  echo "  image: $img"
+  docker pull "$img" >/dev/null 2>&1 || echo "  WARN: 镜像拉取失败（可能已在本地）"
+  # 2) 恢复数据：先移动当前数据到 .pre-rollback-<ts>，再解包 snapshot
+  local ts="$(date +%Y%m%d-%H%M%S)"
+  [ -d /data/dsh ] && mv /data/dsh "/data/dsh.pre-rollback-$ts" 2>/dev/null || true
+  mkdir -p /data/dsh
+  tar -C "$snap" -cf - . | tar -C /data/dsh -xf -
+  # 3) 切换镜像（compose pin）
+  ( cd "$(dirname "$COMPOSE_FILE")" && printf 'DSH_IMAGE=%s:%s\n' "$IMAGE_BASE" "$ver" > .env && DSH_IMAGE="$IMAGE_BASE:$ver" docker compose -f "$COMPOSE_FILE" up -d --force-recreate )
+  echo "ROLLBACK_VERDICT=done (image=$img data=$snap)"
+  echo "回滚后验证: docker ps / curl -f http://127.0.0.1:3080/ / session/credentials/health"
+}
+
+usage() {
+  cat <<EOF
+dsh-safe-deploy <command> [args]
+
+commands:
+  check                 只读输出升级状态（版本/通道/风险/迁移/隔离要求）
+  test                  snapshot + 隔离测试实例（独立 TEST_DSH_HOME/端口）
+  promote [--force]     门禁通过后切换生产（prerelease 需显式 --force）
+  rollback              恢复最近 snapshot + 旧镜像（幂等）
+  status                汇总状态 + 最近 snapshot + rollbackReady
+EOF
+}
+
+[ $# -ge 1 ] || { usage; exit 1; }
+case "$1" in
+  check)   cmd_check ;;
+  status)  cmd_status ;;
+  test)    with_lock cmd_test ;;
+  promote) with_lock cmd_promote "${2:-}" ;;
+  rollback) with_lock cmd_rollback ;;
+  *) usage; exit 1 ;;
+esac

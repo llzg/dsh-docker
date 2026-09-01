@@ -11,10 +11,43 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const policy = require(path.join(__dirname, 'version-policy.js'));
+const safeDeployPolicy = require(path.join(__dirname, 'safe-deploy-policy.js'));
 
 const PORT = Number(process.env.VERSION_PORT || 3082);
 const VERSION_FILE = '/opt/dsh-version.json';
 const CACHE_MS = 10 * 60 * 1000;
+
+// SSOT：运行时工作区副本优先（实时），镜像内置副本兜底
+function readSsoT() {
+  const candidates = [
+    process.env.DSH_VERSION_SSOT,
+    '/root/nas_docker/dsh-version.json',
+    '/opt/dsh-version-ssot.json',
+  ].filter(Boolean);
+  for (const f of candidates) {
+    try {
+      const r = safeDeployPolicy.parseSSOT(f);
+      r.file = f;
+      return r;
+    } catch { /* 尝试下一个 */ }
+  }
+  return { version: '(no-ssot)', productionChannel: '(none)', testCandidate: '(none)', file: null };
+}
+
+// 测试状态与回滚就绪（从部署状态目录读取；纯信息展示，失败不影响页面）
+function readDeployState() {
+  const state = { testStatus: 'NOT_RUN', rollbackReady: 'NO' };
+  try {
+    const v = fs.readFileSync('/data/dsh/.deploy/last-test-verdict', 'utf8').trim();
+    if (v.includes('PASS')) state.testStatus = 'PASS';
+    else if (v.includes('FAIL')) state.testStatus = 'FAIL';
+  } catch { /* 未运行过 test */ }
+  try {
+    const dirs = fs.readdirSync('/data/dsh/backups').filter((d) => d !== '.' && d !== '..');
+    if (dirs.length > 0) state.rollbackReady = 'YES';
+  } catch { /* 无 backups 目录 */ }
+  return state;
+}
 
 let cache = { sources: null, checkedAt: 0 };
 
@@ -44,9 +77,22 @@ function buildJson(deployed, sources, target) {
   const { release, tag } = sources.github;
   const npm = sources.npm;
   const dshVersion = deployed.dshVersion || '(unknown)';
+  const ssot = readSsoT();
+  const state = readDeployState();
+  let safe = { currentVersion: ssot.version, productionChannel: ssot.productionChannel, testCandidate: ssot.testCandidate || '(none)', upgradeRisk: '(ssot-unreadable)', targetChannel: 'none', migrationStatus: 'none', dataIsolationRequired: false };
+  try {
+    safe = safeDeployPolicy.computeAll({ ssotFile: ssot.file });
+  } catch { /* SSOT 不可读时用占位 */ }
   return {
     dshVersion,
     currentIsTarget: target.target ? dshVersion === target.target : null,
+    safeUpgrade: {
+      ...safe,
+      currentRunning: dshVersion,
+      testStatus: state.testStatus,
+      rollbackReady: state.rollbackReady,
+      ssotFile: ssot.file,
+    },
     sources: {
       githubRelease: release,
       githubTag: tag,
@@ -135,6 +181,19 @@ function html(info) {
   ${sourceRow('npm latest', t.npmLatest, t.npmLatest.value === target)}
   ${sourceRow('npm next', t.npmNext, t.npmNext.value === target)}
   <div class="row"><span class="k">推荐构建目标</span><span class="v">${target ? esc(target) : '—'}</span></div>
+  <h2>安全升级（SSOT / dsh-safe-deploy）</h2>
+  ${info.safeUpgrade ? `
+  <div class="row"><span class="k">当前运行</span><span class="v">${esc(info.safeUpgrade.currentRunning)}</span></div>
+  <div class="row"><span class="k">生产通道 (productionChannel)</span><span class="v">${esc(info.safeUpgrade.productionChannel)}</span></div>
+  <div class="row"><span class="k">测试候选 (testCandidate)</span><span class="v">${esc(info.safeUpgrade.testCandidate)}</span></div>
+  <div class="row"><span class="k">候选通道</span><span class="v">${esc(info.safeUpgrade.targetChannel)}</span></div>
+  <div class="row"><span class="k">升级风险</span><span class="v ${info.safeUpgrade.upgradeRisk === 'BLOCKED' ? 'err' : info.safeUpgrade.upgradeRisk === 'HIGH' || info.safeUpgrade.upgradeRisk === 'MEDIUM' ? 'warn' : 'ok'}">${esc(info.safeUpgrade.upgradeRisk)}</span></div>
+  <div class="row"><span class="k">迁移状态</span><span class="v">${esc(info.safeUpgrade.migrationStatus)}</span></div>
+  <div class="row"><span class="k">隔离测试要求</span><span class="v">${info.safeUpgrade.dataIsolationRequired ? 'REQUIRED' : 'NOT_REQUIRED'}</span></div>
+  <div class="row"><span class="k">测试状态</span><span class="v">${esc(info.safeUpgrade.testStatus)}</span></div>
+  <div class="row"><span class="k">回滚就绪</span><span class="v">${esc(info.safeUpgrade.rollbackReady)}</span></div>
+  <div class="row"><span class="k">SSOT 来源</span><span class="v">${esc(info.safeUpgrade.ssotSource || '')} · ${esc(info.safeUpgrade.ssotUpdatedAt || '')}</span></div>
+  ` : '<div class="row"><span class="k">SSOT</span><span class="v na">不可读</span></div>'}
   <h2>部署信息</h2>
   <div class="row"><span class="k">当前运行版本</span><span class="v">${esc(info.dshVersion)}</span></div>
   <div class="row"><span class="k">构建提交</span><span class="v">${info.commitUrl ? `<a href="${info.commitUrl}" target="_blank">${esc(info.buildCommit)}</a>` : esc(info.buildCommit)}</span></div>
