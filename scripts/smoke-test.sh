@@ -15,12 +15,12 @@ docker run -d --name "$NAME" \
 trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
 
 probe() {
-  # 从日志提取 dsh web 打印的 token（`?token=<hex>`）
+  # 从日志提取 dsh web 打印的 token（`?token=<base64url>`；可能含 - _ 且以 - 开头）
   local tok
-  tok=$(docker logs "$NAME" 2>/dev/null | grep -oE '\?token=[0-9A-Za-z]+' | head -1 | sed 's/?token=//' || true)
+  tok=$(docker logs "$NAME" 2>/dev/null | grep -oE '\?token=[A-Za-z0-9_-]+' | head -1 | sed 's/?token=//' || true)
   if [ -n "$tok" ]; then
-    curl -sf -H "Authorization: Bearer $tok" "http://127.0.0.1:$PORT/" >/dev/null 2>&1 \
-      || curl -sf "http://127.0.0.1:$PORT/?token=$tok" >/dev/null 2>&1
+    curl -sf "http://127.0.0.1:$PORT/?token=$tok" >/dev/null 2>&1 \
+      || curl -sf -H "Authorization: Bearer $tok" "http://127.0.0.1:$PORT/" >/dev/null 2>&1
   else
     curl -sf "http://127.0.0.1:$PORT/" >/dev/null 2>&1
   fi
