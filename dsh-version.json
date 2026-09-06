@@ -1,10 +1,10 @@
 {
-  "version": "0.1.1-rc.2",
-  "productionChannel": "0.1.1-rc.2",
+  "version": "0.1.2-alpha.5",
+  "productionChannel": "0.1.2-alpha.5",
   "testCandidate": "0.1.2-alpha.5",
-  "updatedAt": "2026-09-02T00:00:00.000Z",
+  "updatedAt": "2026-09-06T00:00:00.000Z",
   "source": "manual",
-  "comment": "单一版本声明源（SSOT）。Renovate 只更新 testCandidate；productionChannel 仅由 dsh-safe-deploy promote 提升。",
+  "comment": "单一版本声明源（SSOT）。2026-09-06 生产切换：alpha.5 接管 :3081；rc.2(0.1.1-rc.2) 保留为回滚容器(deepseek-harness, 手动启动)。Renovate 只更新 testCandidate；productionChannel 仅由 dsh-safe-deploy promote / 显式切换提升。",
   "requiredPlugins": [
     "@deepseek-ai/dsh-base",
     "@deepseek-ai/dsh-web-app",
