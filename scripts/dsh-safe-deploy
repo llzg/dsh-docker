@@ -18,6 +18,11 @@ STATE_DIR="${DSH_STATE_DIR:-/data/dsh/.deploy}"
 CONTAINER="${DSH_CONTAINER:-deepseek-harness}"
 COMPOSE_FILE="${DSH_COMPOSE_FILE:-/volume1/docker/deepseek-harness/docker-compose.yml}"
 IMAGE_BASE="${DSH_IMAGE_BASE:-ghcr.io/llzg/dsh-docker}"
+# 数据源 home（旧 rc.2 拓扑=生产 /data/dsh；新拓扑=当前主力 home，如 /data/dsh/test/0.1.2-alpha.5）
+SOURCE_HOME="${DSH_SOURCE_HOME:-/data/dsh}"
+# /root 挂载源（workspace realpath 成员校验必需；rw 与生产一致）
+ROOT_SOURCE="${DSH_ROOT_SOURCE:-/volume1/docker/deepseek-harness/dsh-root}"
+TRUSTED_HOST="${DSH_TRUSTED_HOST:-192.168.5.16}"
 
 # 需要 docker 的命令在无 socket 时明确失败而非静默跳过
 require_docker() {
@@ -56,9 +61,9 @@ snapshot_dsh() {
   ts="$(date +%Y%m%d-%H%M%S)"
   local dst="$BACKUP_ROOT/${ver:-unknown}-$ts"
   mkdir -p "$dst"
-  echo "snapshot: /data/dsh -> $dst" >&2
+  echo "snapshot: $SOURCE_HOME -> $dst" >&2
   # 排除可重建/超大目录：node_modules、pnpm store、测试目录、历史备份
-  tar -C /data/dsh -cf - \
+  tar -C "$SOURCE_HOME" -cf - \
       --exclude='profiles/web/node_modules' \
       --exclude='profiles/headless/node_modules' \
       --exclude='.pnpm-store' \
@@ -110,12 +115,16 @@ cmd_test() {
   rm -rf "$test_home_cont"; mkdir -p "$test_home_cont"
   # 用 snapshot 构建隔离 TEST_DSH_HOME（保留权限/owner/hidden/symlink）
   tar -C "$snap" -cf - . | tar -C "$test_home_cont" -xf -
-  # 恢复 profile 树外 bundle（snapshot 排除 node_modules；复制生产 profile 的——
-  # codex/claude bundle rc.8 已实测兼容 alpha.3 host；bundles 列表已排除 siliconflow，包在但不加载）
-  [ -d /data/dsh/profiles/web/node_modules ] && cp -a /data/dsh/profiles/web/node_modules "$test_home_cont/profiles/web/"
-  [ -d /data/dsh/profiles/headless ] && [ -d /data/dsh/profiles/headless/node_modules ] && cp -a /data/dsh/profiles/headless/node_modules "$test_home_cont/profiles/headless/"
-  # Codex 认证（test 专用副本，不共享生产 /root/.codex）：通过 CODEX_HOME 指向 test 副本
-  [ -d /root/.codex ] && cp -a /root/.codex "$test_home_cont/.codex" && echo "CODEX_HOME 副本: $test_home_cont/.codex"
+  # 恢复 profile 树外 bundle（snapshot 排除 node_modules；从数据源 home 复制——
+  # codex/claude bundle rc.8 已实测兼容 alpha 线 host；bundles 列表已排除 siliconflow，包在但不加载）
+  [ -d "$SOURCE_HOME/profiles/web/node_modules" ] && cp -a "$SOURCE_HOME/profiles/web/node_modules" "$test_home_cont/profiles/web/"
+  [ -d "$SOURCE_HOME/profiles/headless" ] && [ -d "$SOURCE_HOME/profiles/headless/node_modules" ] && cp -a "$SOURCE_HOME/profiles/headless/node_modules" "$test_home_cont/profiles/headless/"
+  # Codex 认证（test 专用副本，不共享生产 /root/.codex）：优先取数据源 home 内的 .codex
+  if [ -d "$SOURCE_HOME/.codex" ]; then
+    cp -a "$SOURCE_HOME/.codex" "$test_home_cont/.codex" && echo "CODEX_HOME 副本(源 home): $test_home_cont/.codex"
+  elif [ -d /root/.codex ]; then
+    cp -a /root/.codex "$test_home_cont/.codex" && echo "CODEX_HOME 副本(/root): $test_home_cont/.codex"
+  fi
   echo "TEST_DSH_HOME=$test_home_cont (host: $test_home)"
 
   local port; port="${DSH_TEST_PORT:-$(( ( RANDOM % 1000 ) + 12000 ))}"
@@ -131,8 +140,12 @@ cmd_test() {
     -p "0.0.0.0:$port:3080" \
     ${net:+--network "$net"} \
     -v "$test_home:$test_home_cont" \
-    "${IMAGE_BASE}:${target}" dsh --profile web --no-open --host 127.0.0.1 >/dev/null
-  trap 'docker rm -f "$cname" >/dev/null 2>&1 || true' EXIT
+    -v "$ROOT_SOURCE:/root:rw" \
+    "${IMAGE_BASE}:${target}" dsh --profile web --no-open --host 127.0.0.1 --trusted-host "$TRUSTED_HOST" >/dev/null
+  # DSH_TEST_KEEP=1 时保留测试容器（深度 gate/浏览器验收用），否则退出即清理
+  if [ "${DSH_TEST_KEEP:-0}" != "1" ]; then
+    trap 'docker rm -f "$cname" >/dev/null 2>&1 || true' EXIT
+  fi
 
   local ok=1 i tok cip
   # 容器内执行 docker test 时：docker -p 映射在宿主 netns，本容器 curl 127.0.0.1 访问不到；
