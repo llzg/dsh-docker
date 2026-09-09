@@ -334,7 +334,7 @@ promote_locked() { # <target> [force]
 
   # 事务化 pin（nas/lib.sh：.env.pending → project/卷源断言 → 原子 mv → up --wait/健康轮询）
   # reason=manual：promote 是人工决策，watchdog 不得自动回滚它
-  if ! docker pull "$IMAGE_BASE:$target" >/dev/null 2>&1; then
+  if ! pull_image "$IMAGE_BASE:$target"; then
     echo "ERROR: 镜像拉取失败 $IMAGE_BASE:$target（.env 未改动）" >&2
     exit 1
   fi

@@ -107,8 +107,21 @@ DSH_CHANNEL=rc sh /volume1/docker/dsh-deploy/resume-auto-update.sh   # 恢复到
 - **NAS 侧凭据**：包为 public，匿名可拉；脚本优先复用 `/home/lzg/.docker/config.json`（可用 `DOCKER_CONFIG` 覆盖）。
 - **不再使用 watchtower 自动更新**：旧 README 的 watchtower/latest 链路已废弃（watchtower 只管理其他无状态容器）。
 
-## 本地识图（可选组件）
+## 接入自建设施（自建 runner / 代理 / 私有 registry）
 
+全部通过仓库 Variables/Secrets 开关，**不配置时行为不变**（GitHub 托管 runner + GHCR 单推）：
+
+| 类型 | 名称 | 作用 |
+|---|---|---|
+| Variables | `DSH_RUNNER` | 如 `["self-hosted","linux","x64"]`；不设 = `ubuntu-latest` |
+| Variables | `DSH_HTTP_PROXY` | 如 `http://192.168.5.36:7893`（仅自建 runner 有意义） |
+| Variables | `DSH_PRIVATE_IMAGE` | 如 `192.168.5.35:5050/llzg/dsh-docker`（一次构建双推） |
+| Variables | `DSH_REGISTRIES` | 收敛判定与版本页查询的仓库列表（逗号分隔） |
+| Secrets | `DSH_REGISTRY_USER` / `DSH_REGISTRY_PASSWORD` | 私有 registry Basic 认证 |
+
+详见 [docs/homelab-ci.md](docs/homelab-ci.md)（含实况核对：UGREEN 现为 `192.168.5.17`）。
+
+## 本地识图（可选组件）
 dsh 智能体/命令行可用的本地"看图"工具：Qwen2.5-VL-3B 纯 CPU 推理，支持图片描述、问答、中英文 OCR，图片不离开本机。安装与用法见 [docs/vision.md](docs/vision.md)。
 
 ```sh

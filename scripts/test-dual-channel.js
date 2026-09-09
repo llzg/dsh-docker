@@ -128,8 +128,17 @@ t('D21', '插件兼容性字段跨通道一致', JSON.stringify(alphaView.plugin
 const server = fs.readFileSync(path.join(__dirname, 'version-server.js'), 'utf8');
 t('D22', '版本页支持实时 SSOT 与兜底标注', server.includes('DSH_VERSION_SSOT') && server.includes('ssotIsFallback'));
 t('D23', '版本页支持 ?refresh=1 强制刷新与节流', server.includes('refresh') && server.includes('FORCE_MIN_INTERVAL_MS'));
-t('D24', '版本页含构建状态（GHCR + CI）', server.includes('ghcr.io/token') && server.includes('actions/runs'));
+t('D24', '版本页含构建状态（registry tags + CI）',
+  server.includes("registry.js") && server.includes('loadRegistryTags') && server.includes('actions/runs'));
 t('D25', '版本页未知路径返回 404 且带安全头', server.includes('notFound') && server.includes('X-Content-Type-Options'));
+
+// D26: version-server.js 的每个本地 require 都必须在 Dockerfile 里被 COPY 进 /opt，
+//      否则镜像里的版本页会 require 失败（静默挂掉）。这是易漏的集成点。
+const dockerfile = fs.readFileSync(path.join(__dirname, '..', 'Dockerfile'), 'utf8');
+const localReqs = [...server.matchAll(/require\(path\.join\(__dirname,\s*'([^']+)'\)\)/g)].map((m) => m[1]);
+const missing = localReqs.filter((f) => !new RegExp(`COPY\\s+scripts/${f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+/opt/`).test(dockerfile));
+t('D26', 'Dockerfile 覆盖 version-server 的全部本地依赖', localReqs.length > 0 && missing.length === 0,
+  `requires=[${localReqs.join(',')}] missing=[${missing.join(',')}]`);
 
 fs.rmSync(tmp, { recursive: true, force: true });
 

@@ -10,20 +10,29 @@
 #   * pin_version() 事务化：.env.pending → 校验（project/卷源断言）→ 原子 mv → up --wait
 #     （不可用则健康轮询）→ 失败还原旧 .env 并回滚容器。
 #   * prev_version() 用 semver 比较，排除 <ver>-<sha> 不可变标签；当前版本不在候选列表
-#     时返回非 0（不得回退成"列表最高"）。GHCR 不可达时降级为本地镜像标签并告警。
+#     时返回非 0（不得回退成"列表最高"）。registry 不可达时降级为本地镜像标签并告警。
+#   * registry 无关（任意 registry v2）：registry_of()/repo_of() 拆分 IMG；
+#     registry_tags() 对 ghcr.io 走匿名 token 流，对其他 registry 走 Basic/匿名 + https→http 探测。
 #   * 所有写操作加 flock（$STATE/deploy.lock）。
 #   * DSH_PIN_REASON 取值：manual（人工钉住/回滚，watchdog 跳过）| auto-rollback（watchdog 自动
-#     回滚，残留可重试）| ssot-production（resume/switch 跟随 SSOT production，watchdog 仍可自动回滚）。
-#     注：契约 §9 只列了 manual|auto-rollback；ssot-production 是集成方要求的第三个取值，
+#     回滚，残留可重试）| ssot-production（resume/switch 跟随 SSOT production，watchdog 仍可自动回滚）|
+#     ssot-fallback（SSOT production 不可用时显式钉 latest，强告警）。
+#     注：契约 §9 只列了 manual|auto-rollback；后两个是集成方要求的扩展取值，
 #     watchdog 的判定是"仅 manual 跳过"，因此新增取值不改变回滚安全性。
 #
-# 环境覆盖（全部可选）：
+# 环境覆盖（全部可选，环境变量优先；registry 相关的 5 个也可写在通道 .env 里）：
 #   DSH_CHANNEL=alpha|rc|stable   通道（默认 SSOT primaryChannel，再默认 alpha）
 #   DSH_DEPLOY_DIR=<dir>          compose 目录（默认 SSOT channels[ch].dataDir / 内置表）
 #   DSH_DEPLOY_STATE=<dir>        状态根目录（默认 /volume1/docker/dsh-deploy/state）
-#   DSH_PROJECT DSH_CONTAINER DSH_PORT DSH_VERSION_PORT DSH_IMAGE_BASE DSH_SSOT
+#   DSH_PROJECT DSH_CONTAINER DSH_PORT DSH_VERSION_PORT DSH_SSOT
 #   DSH_TRUSTED_HOST DSH_HOME DSH_LOCK_FILE DSH_HEALTH_RETRIES DSH_HEALTH_INTERVAL
-#   DSH_WATCHDOG_THRESHOLD DSH_WATCHDOG_MAX_AGE DSH_GHCR_TIMEOUT DSH_DOCKER_CFG
+#   DSH_WATCHDOG_THRESHOLD DSH_WATCHDOG_MAX_AGE DSH_DOCKER_CFG
+#   DSH_IMAGE_BASE=<registry>/<repo>   镜像仓库（默认 ghcr.io/llzg/dsh-docker；
+#                                      内网可改 192.168.5.35:5050/llzg/dsh-docker）
+#   DSH_REGISTRY_USER / DSH_REGISTRY_PASSWORD  内联 Basic 凭据（优先级最高；不写日志）
+#   DSH_REGISTRY_SCHEME=https|http      强制 scheme（默认 https→http 自动探测）
+#   DSH_REGISTRY_TIMEOUT=10             registry API 超时秒数
+#   DSH_GHCR_TIMEOUT=10                 ghcr token/tags 超时秒数
 
 LIB_DIR=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)
 
@@ -220,11 +229,95 @@ is_release_tag() {
   printf '%s' "${1:-}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$'
 }
 
+# ── registry 解析（任意 registry v2，不只 GHCR）───────────────────────────
+# registry_of <image-base>：首段含 "." / ":" / "localhost" 视为 registry（可带端口，
+#   例如 192.168.5.35:5050），否则按 Docker Hub（docker.io）。
+# repo_of     <image-base>：去掉 registry 段后的 repository（可含多级路径）。
+registry_of() {
+  case "${1:-}" in
+    */*)
+      _rg_first="${1%%/*}"
+      case "$_rg_first" in
+        *.*|*:*|localhost) printf '%s' "$_rg_first" ;;
+        *) printf 'docker.io' ;;
+      esac
+      ;;
+    *) printf 'docker.io' ;;
+  esac
+}
+
+repo_of() {
+  case "${1:-}" in
+    */*)
+      _rp_first="${1%%/*}"
+      case "$_rp_first" in
+        *.*|*:*|localhost) printf '%s' "${1#*/}" ;;
+        *) printf '%s' "$1" ;;
+      esac
+      ;;
+    *) printf '%s' "${1:-}" ;;
+  esac
+}
+
+b64_encode() { # stdin → base64（单行）
+  if command -v base64 >/dev/null 2>&1; then
+    base64 | tr -d '\r\n'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl base64 | tr -d '\r\n'
+  else
+    return 1
+  fi
+}
+
+# 探测顺序：DSH_REGISTRY_SCHEME 强制；否则 https → http（内网 registry 常为 http）
+registry_schemes() { # <registry>
+  case "${DSH_REGISTRY_SCHEME:-}" in
+    https|http) printf '%s\n' "$DSH_REGISTRY_SCHEME"; return 0 ;;
+  esac
+  printf 'https\nhttp\n'
+}
+
+# Basic 凭据（只读取，不写入）：$DSH_REGISTRY_USER/PASSWORD →
+# $DOCKER_CONFIG/config.json → ~/.docker/config.json → /home/lzg/.docker/config.json
+# （.auths["<registry>"].auth 的 base64，或 username/password 字段）；无凭据 → 匿名（空）
+registry_auth_header() { # <registry>
+  if [ -n "${DSH_REGISTRY_USER:-}" ]; then
+    _ra_b64=$(printf '%s:%s' "$DSH_REGISTRY_USER" "${DSH_REGISTRY_PASSWORD:-}" | b64_encode 2>/dev/null) || _ra_b64=""
+    if [ -n "$_ra_b64" ]; then
+      printf 'Authorization: Basic %s' "$_ra_b64"
+    else
+      warn "DSH_REGISTRY_USER 已设置但无 base64/openssl 可用，改为匿名请求"
+    fi
+    return 0
+  fi
+  for _ra_cfg in "${DOCKER_CONFIG:-}/config.json" "${HOME:-/root}/.docker/config.json" \
+                 "/home/lzg/.docker/config.json" "${DSH_DOCKER_CFG:-}"; do
+    case "$_ra_cfg" in "/config.json"|"") continue ;; esac
+    [ -f "$_ra_cfg" ] || continue
+    command -v jq >/dev/null 2>&1 || break
+    # 注意：jq 在 config.json 非法时返回非 0，赋值会继承该状态；调用方普遍 set -e → || true
+    _ra_auth=$(jq -r --arg r "$1" '.auths[$r].auth // empty' "$_ra_cfg" 2>/dev/null || true)
+    if [ -z "$_ra_auth" ]; then
+      _ra_u=$(jq -r --arg r "$1" '.auths[$r].username // empty' "$_ra_cfg" 2>/dev/null || true)
+      _ra_p=$(jq -r --arg r "$1" '.auths[$r].password // empty' "$_ra_cfg" 2>/dev/null || true)
+      if [ -n "$_ra_u" ]; then
+        _ra_auth=$(printf '%s:%s' "$_ra_u" "$_ra_p" | b64_encode 2>/dev/null) || _ra_auth=""
+      fi
+    fi
+    if [ -n "$_ra_auth" ]; then
+      printf 'Authorization: Basic %s' "$_ra_auth"
+      return 0
+    fi
+  done
+  return 0
+}
+
 # ── 版本候选来源 ──────────────────────────────────────────────────────────
-# GHCR 标签列表（匿名 token 优先，失败再试 docker 凭据）。不可达 → 非 0。
+# GHCR 专用：匿名 token 流（保持原行为不变）。不可达 → 非 0。
 ghcr_tags() {
+  _ghcr_repo=$(repo_of "$IMG")
   _tok=$(curl -sf --max-time "${DSH_GHCR_TIMEOUT:-10}" \
-      "https://ghcr.io/token?scope=repository:llzg/dsh-docker:pull&service=ghcr.io" 2>/dev/null \
+      "https://ghcr.io/token?scope=repository:${_ghcr_repo}:pull&service=ghcr.io" 2>/dev/null \
       | jq -r '.token // empty' 2>/dev/null || true)
   _hdr=""
   [ -n "$_tok" ] && _hdr="Authorization: Bearer $_tok"
@@ -234,12 +327,83 @@ ghcr_tags() {
   fi
   [ -n "$_hdr" ] || { warn "GHCR 匿名 token 获取失败（无可用凭据）"; return 1; }
   _out=$(curl -sf --max-time "${DSH_GHCR_TIMEOUT:-10}" -H "$_hdr" \
-      "https://ghcr.io/v2/llzg/dsh-docker/tags/list" 2>/dev/null) || return 1
+      "https://ghcr.io/v2/${_ghcr_repo}/tags/list" 2>/dev/null) || return 1
   [ -n "$_out" ] || return 1
   printf '%s' "$_out" | jq -r '.tags[]? // empty' 2>/dev/null | grep -v '^latest$' || true
 }
 
-# 本地镜像标签（GHCR 降级路径）
+# 通用 registry v2 标签列表（[image-base] 默认 $IMG）：
+#   ghcr.io → token 流；其他 registry → Basic（有凭据时）或匿名，https→http 探测。
+# 失败返回非 0，由 version_candidates() 走"降级本地镜像 + 告警"。
+registry_tags() { # [image-base]
+  _rt_img="${1:-$IMG}"
+  _rt_reg=$(registry_of "$_rt_img")
+  _rt_repo=$(repo_of "$_rt_img")
+  if [ "$_rt_reg" = "ghcr.io" ]; then
+    ghcr_tags
+    return $?
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "jq 不可用，无法解析 registry 响应（$_rt_reg）"
+    return 1
+  fi
+  _rt_auth=$(registry_auth_header "$_rt_reg")
+  for _rt_scheme in $(registry_schemes "$_rt_reg"); do
+    _rt_url="$_rt_scheme://$_rt_reg/v2/$_rt_repo/tags/list"
+    _rt_out=""
+    if [ -n "$_rt_auth" ]; then
+      _rt_out=$(curl -sf --max-time "${DSH_REGISTRY_TIMEOUT:-10}" -H "$_rt_auth" "$_rt_url" 2>/dev/null) || _rt_out=""
+    else
+      _rt_out=$(curl -sf --max-time "${DSH_REGISTRY_TIMEOUT:-10}" "$_rt_url" 2>/dev/null) || _rt_out=""
+    fi
+    if [ -n "$_rt_out" ]; then
+      printf '%s' "$_rt_out" | jq -r '.tags[]? // empty' 2>/dev/null | grep -v '^latest$' || true
+      return 0
+    fi
+  done
+  warn "registry 不可达或鉴权失败：$_rt_reg/$_rt_repo（已尝试：$(registry_schemes "$_rt_reg" | tr '\n' ' '))"
+  return 1
+}
+
+# 从错误文本识别鉴权失败 → 打印可执行的修复提示（不静默）
+registry_hint_from_text() { # <text> [registry]
+  case "${1:-}" in
+    *401*|*403*|*[Uu]nauthorized*|*[Uu]nauthenticated*|*[Dd]enied*|*[Ff]orbidden*|*authentication*)
+      warn "registry 鉴权失败（${2:-registry}）：请执行 docker login ${2:-<registry>}；若该 registry 走 http（无 TLS），还需把 \"${2:-<registry>}\" 加入 /etc/docker/daemon.json 的 insecure-registries 并重启 docker"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# 带鉴权提示的 docker pull
+pull_image() { # <image-ref>
+  _pi_reg=$(registry_of "$1")
+  _pi_rc=0
+  _pi_out=$(docker pull "$1" 2>&1) || _pi_rc=$?
+  if [ "$_pi_rc" -eq 0 ]; then
+    return 0
+  fi
+  printf '%s\n' "$_pi_out" >&2
+  registry_hint_from_text "$_pi_out" "$_pi_reg" || true
+  return 1
+}
+
+# 带鉴权提示的 compose pull（registry 取自 .env 的 DSH_IMAGE，回退 $IMG）
+compose_pull() {
+  _cp_img=$(env_get DSH_IMAGE 2>/dev/null)
+  [ -n "$_cp_img" ] || _cp_img="$IMG"
+  _cp_rc=0
+  _cp_out=$(compose_cmd pull 2>&1) || _cp_rc=$?
+  if [ "$_cp_rc" -eq 0 ]; then
+    return 0
+  fi
+  printf '%s\n' "$_cp_out" >&2
+  registry_hint_from_text "$_cp_out" "$(registry_of "$_cp_img")" || true
+  return 1
+}
+
+# 本地镜像标签（registry 不可达时的降级路径）
 local_tags() {
   docker image ls --format '{{.Tag}}' "$IMG" 2>/dev/null \
     | grep -v '^<none>$' | grep -v '^latest$' || true
@@ -247,11 +411,11 @@ local_tags() {
 
 # 候选版本集合（已过滤不可变/非法标签）
 version_candidates() {
-  _list=$(ghcr_tags 2>/dev/null) || _list=""
+  _list=$(registry_tags 2>/dev/null) || _list=""
   if [ -z "$_list" ]; then
-    warn "GHCR 不可达 → 降级使用本地镜像标签作为回滚候选（候选集可能不完整）"
+    warn "registry（$(registry_of "$IMG")）不可达 → 降级使用本地镜像标签作为回滚候选（候选集可能不完整）"
     _list=$(local_tags)
-    [ -n "$_list" ] || { warn "GHCR 与本地镜像均无候选标签"; return 1; }
+    [ -n "$_list" ] || { warn "registry 与本地镜像均无候选标签"; return 1; }
   fi
   printf '%s\n' "$_list" | while read -r _t; do
     is_release_tag "$_t" && printf '%s\n' "$_t"
@@ -490,7 +654,7 @@ pin_version_locked() { # <version> [reason=manual] [digest]
   mkdir -p "$DIR" "$STATE" 2>/dev/null || true
 
   # 1) 先拉镜像（失败则完全不碰 .env）
-  if ! docker pull "$IMG:$_v" >/dev/null 2>&1; then
+  if ! pull_image "$IMG:$_v"; then
     warn "镜像拉取失败：$IMG:$_v（.env 未改动）"
     return 1
   fi
@@ -565,7 +729,7 @@ resume_to_channel_production() {
   warn "回退：显式钉住 $IMG:latest（DSH_PIN_REASON=ssot-fallback）——latest 仅由 stable 通道发布，alpha/rc 可能被降级，请人工确认目标版本"
   write_env_image "latest" "ssot-fallback" "" "$DIR/.env.pending" || return 1
   mv -f "$DIR/.env.pending" "$DIR/.env" || return 1
-  compose_cmd pull >/dev/null 2>&1 || warn "compose pull 失败（继续尝试 up）"
+  compose_pull || warn "compose pull 失败（继续尝试 up）"
   compose_up_wait || { warn "回退 latest 后容器未就绪"; return 1; }
   log "resume $CHANNEL -> latest (fallback, reason=ssot-fallback)"
   return 0
@@ -668,7 +832,6 @@ lib_ssot_resolve() {
 
 lib_init() {
   lib_ssot_resolve
-  IMG="${DSH_IMAGE_BASE:-ghcr.io/llzg/dsh-docker}"
   SERVICE="${DSH_SERVICE:-dsh}"
   TRUSTED_HOST="${DSH_TRUSTED_HOST:-192.168.5.17}"
 
@@ -699,6 +862,25 @@ lib_init() {
   [ -n "$_data_dir" ] || _data_dir=$(channel_default "$CHANNEL" dataDir)
   DIR="${DSH_DEPLOY_DIR:-$_data_dir}"
   [ -n "$DIR" ] || DIR="/volume1/docker/$PROJECT"
+
+  # registry 相关：环境变量优先；也允许写在通道 .env 里（人工可读，脚本只读不写）
+  # 注：DSH_REGISTRY_PASSWORD 是可选的内联凭据；默认走 docker config.json / docker login。
+  for _rk in DSH_IMAGE_BASE DSH_REGISTRY_USER DSH_REGISTRY_PASSWORD DSH_REGISTRY_SCHEME DSH_REGISTRY_TIMEOUT; do
+    if command -v printenv >/dev/null 2>&1; then
+      # printenv 在变量未设置时退出码 1；赋值语句会继承该状态，
+      # 调用方普遍 set -e → 直接静默退出（本次回归的根因）。必须 || true。
+      _rv=$(printenv "$_rk" 2>/dev/null || true)
+    else
+      _rv=""
+    fi
+    if [ -z "$_rv" ]; then
+      _rv=$(env_get "$_rk" || true)
+      # 同理：不要写 `[ -n "$_rv" ] && export ...`（空值时整行返回 1）
+      if [ -n "$_rv" ]; then export "$_rk=$_rv"; fi
+    fi
+  done
+
+  IMG="${DSH_IMAGE_BASE:-ghcr.io/llzg/dsh-docker}"
 
   STATE_ROOT="${DSH_DEPLOY_STATE:-/volume1/docker/dsh-deploy/state}"
   # 通道隔离：$STATE_ROOT/<channel>/

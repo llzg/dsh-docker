@@ -65,7 +65,7 @@ cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in
   info) exit 0 ;;
   pull)
-    if [ "${STUB_PULL_FAIL:-0}" = "1" ]; then echo "stub: pull failed" >&2; exit 1; fi
+    if [ "${STUB_PULL_FAIL:-0}" = "1" ]; then echo "${STUB_PULL_ERR:-stub: pull failed}" >&2; exit 1; fi
     exit 0 ;;
   image)
     sub="${1:-}"; [ $# -gt 0 ] && shift
@@ -136,7 +136,9 @@ case "$cmd" in
           *" --wait "*) [ "${STUB_WAIT_SUPPORT:-1}" = "0" ] && { echo "stub: unknown flag: --wait" >&2; exit 1; } ;;
         esac
         exit 0 ;;
-      pull) exit 0 ;;
+      pull)
+        if [ "${STUB_COMPOSE_PULL_FAIL:-0}" = "1" ]; then echo "${STUB_COMPOSE_PULL_ERR:-stub: compose pull failed}" >&2; exit 1; fi
+        exit 0 ;;
     esac
     exit 0 ;;
   run|rm|ps|logs|exec) exit 0 ;;
@@ -148,14 +150,43 @@ chmod +x "$BIN/docker"
 # ── stub: curl（GHCR token/tags）──────────────────────────────────────────
 cat > "$BIN/curl" <<'STUB'
 #!/usr/bin/env bash
+# 记录完整参数 + scheme/auth 摘要（auth 只记“有/无”，不落明文）
 printf 'curl %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
-if [ "${STUB_GHCR_DOWN:-0}" = "1" ]; then exit 22; fi
-for a in "$@"; do
-  case "$a" in
-    *ghcr.io/token*) printf '{"token":"stub-token"}\n'; exit 0 ;;
-    *tags/list*) printf '%s\n' "${STUB_GHCR_TAGS:-{\"tags\":[\"latest\"]}}"; exit 0 ;;
+url=""; auth=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -H) auth="$2"; shift 2 ;;
+    -H*) auth="${1#-H}"; shift ;;
+    http://*|https://*) url="$1"; shift ;;
+    *) shift ;;
   esac
 done
+scheme=""
+case "$url" in
+  https://*) scheme=https ;;
+  http://*) scheme=http ;;
+esac
+printf 'curl-meta scheme=%s auth=%s url=%s\n' "${scheme:-none}" "${auth:-none}" "$url" >> "${STUB_LOG:-/dev/null}"
+
+# GHCR 专用流（匿名 token → tags）
+case "$url" in
+  *ghcr.io/token*)
+    [ "${STUB_GHCR_DOWN:-0}" = "1" ] && exit 22
+    printf '{"token":"stub-token"}\n'; exit 0 ;;
+  *ghcr.io/v2/*tags/list*)
+    [ "${STUB_GHCR_DOWN:-0}" = "1" ] && exit 22
+    printf '%s\n' "${STUB_GHCR_TAGS:-{\"tags\":[\"latest\"]}}"; exit 0 ;;
+esac
+
+# 通用 registry v2
+case "$url" in
+  */v2/*/tags/list*)
+    if [ "${STUB_HTTPS_FAIL:-0}" = "1" ] && [ "$scheme" = "https" ]; then exit 7; fi
+    if [ "${STUB_REG_401:-0}" = "1" ]; then exit 22; fi
+    if [ "${STUB_REQUIRE_BASIC:-0}" = "1" ] && [ -z "$auth" ]; then exit 22; fi
+    printf '%s\n' "${STUB_REG_TAGS:-{\"tags\":[\"0.1.2-alpha.5\",\"0.1.3-alpha.2\",\"latest\"]}}"
+    exit 0 ;;
+esac
 exit 0
 STUB
 chmod +x "$BIN/curl"
@@ -737,6 +768,47 @@ PROD=$(env DSH_CHANNEL=alpha DSH_DEPLOY_DIR="$ALPHA_DIR" DSH_DEPLOY_STATE="$STAT
        sh -c ". '$NAS/lib.sh'; ssot_channel_production alpha" 2>/dev/null)
 t D2-legacy-ssot "旧格式 SSOT（无 channels）→ production 回退顶层 productionChannel" \
   "$([ "$PROD" = "0.1.2-alpha.5" ] && echo 1 || echo 0)" "got=$PROD"
+
+# ── registry 泛化（任意 registry v2：ghcr 匿名 token / 内网 Basic / http 探测）──
+OUT=$(run_lib "$ALPHA_DIR" alpha 'printf "%s|%s|%s|%s" "$(registry_of ghcr.io/llzg/dsh-docker)" "$(repo_of ghcr.io/llzg/dsh-docker)" "$(registry_of 192.168.5.35:5050/llzg/dsh-docker)" "$(repo_of 192.168.5.35:5050/llzg/dsh-docker)"' 2>/dev/null)
+t REG-split "registry_of/repo_of 正确拆分 host 与 host:port" \
+  "$([ "$OUT" = "ghcr.io|llzg/dsh-docker|192.168.5.35:5050|llzg/dsh-docker" ] && echo 1 || echo 0)" "got=$OUT"
+
+: > "$STUB_LOG"
+OUT=$(run_lib "$ALPHA_DIR" alpha 'registry_tags ghcr.io/llzg/dsh-docker' STUB_GHCR_TAGS='{"tags":["0.1.3-alpha.2","latest"]}' 2>&1)
+t REG-ghcr "ghcr.io 仍走匿名 token 流（且过滤 latest）" \
+  "$(has "$OUT" "0.1.3-alpha.2" && log_has 'ghcr.io/token' && echo 1 || echo 0)" "out=$(printf '%s' "$OUT" | tr '\n' ',')"
+
+: > "$STUB_LOG"
+OUT=$(run_lib "$ALPHA_DIR" alpha 'registry_tags 192.168.5.35:5050/llzg/dsh-docker' \
+      DSH_REGISTRY_SCHEME=http DSH_REGISTRY_USER=ci-deploy DSH_REGISTRY_PASSWORD=stub-secret STUB_REQUIRE_BASIC=1 2>&1)
+t REG-basic "http + Basic Auth 私有 registry 可列 tags" \
+  "$(has "$OUT" "0.1.3-alpha.2" && log_has 'scheme=http' && log_has 'auth=Authorization: Basic' && echo 1 || echo 0)" "out=$(printf '%s' "$OUT" | tr '\n' ',')"
+
+: > "$STUB_LOG"
+OUT=$(run_lib "$ALPHA_DIR" alpha 'registry_tags 192.168.5.35:5050/llzg/dsh-docker' DSH_REGISTRY_SCHEME=http 2>&1)
+t REG-anon "无凭据 registry 匿名可读" \
+  "$(has "$OUT" "0.1.3-alpha.2" && log_has 'auth=none' && echo 1 || echo 0)" "out=$(printf '%s' "$OUT" | tr '\n' ',')"
+
+: > "$STUB_LOG"
+OUT=$(run_lib "$ALPHA_DIR" alpha 'registry_tags 192.168.5.35:5050/llzg/dsh-docker' STUB_HTTPS_FAIL=1 2>&1)
+t REG-scheme "https 失败自动回退 http" \
+  "$(has "$OUT" "0.1.3-alpha.2" && log_has 'scheme=http' && echo 1 || echo 0)" "out=$(printf '%s' "$OUT" | tr '\n' ',')"
+
+OUT=$(run_lib "$ALPHA_DIR" alpha 'registry_tags 192.168.5.35:5050/llzg/dsh-docker' DSH_REGISTRY_SCHEME=http STUB_REG_401=1 2>&1); RC=$?
+t REG-401 "401 → 非 0 且明确告警（不静默）" \
+  "$([ "$RC" -ne 0 ] && has "$OUT" "registry 不可达或鉴权失败" && echo 1 || echo 0)" "rc=$RC"
+
+OUT=$(run_lib "$ALPHA_DIR" alpha 'pull_image 192.168.5.35:5050/llzg/dsh-docker:0.1.3-alpha.2' \
+      STUB_PULL_FAIL=1 STUB_PULL_ERR='Error response from daemon: unauthorized: authentication required' 2>&1); RC=$?
+t REG-401-hint "pull 鉴权失败 → 提示 docker login / insecure-registries" \
+  "$(has "$OUT" 'docker login 192.168.5.35:5050' && has "$OUT" 'insecure-registries' && echo 1 || echo 0)" "rc=$RC"
+
+# 私有 registry 的镜像基址要能被 prev_version 消费（候选来自新 registry）
+: > "$STUB_LOG"
+OUT=$(run_lib "$ALPHA_DIR" alpha 'version_candidates' DSH_IMAGE_BASE=192.168.5.35:5050/llzg/dsh-docker DSH_REGISTRY_SCHEME=http 2>&1)
+t REG-candidates "version_candidates 从私有 registry 取候选（过滤 latest）" \
+  "$(has "$OUT" "0.1.2-alpha.5" && ! has "$OUT" "latest" && echo 1 || echo 0)" "out=$(printf '%s' "$OUT" | tr '\n' ',')"
 
 # ── 语法门禁 ──────────────────────────────────────────────────────────────
 SYNTAX_OK=1

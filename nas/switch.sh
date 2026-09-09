@@ -22,7 +22,7 @@ switch_main() {
   log "switch $CHANNEL container=$CONTAINER project=$PROJECT dir=$DIR"
   if [ -n "$(env_get DSH_IMAGE)" ]; then
     echo "switch: 沿用 .env 钉住版本 $(current_version)（DSH_PIN_REASON=$(env_get DSH_PIN_REASON)）"
-    compose_cmd pull
+    compose_pull || warn "compose pull 失败（继续尝试 up）"
     compose_cmd up -d --force-recreate
   else
     echo "switch: .env 未钉住 → 跟随 SSOT channels.$CHANNEL.production"

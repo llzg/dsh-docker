@@ -22,6 +22,7 @@ run() {
 # 静态检查
 run node --check scripts/version-policy.js
 run node --check scripts/safe-deploy-policy.js
+run node --check scripts/registry.js
 run node --check scripts/version-server.js
 run node --check scripts/check-new-version.js
 run node --check scripts/test-dual-channel.js
@@ -36,6 +37,7 @@ run bash -n scripts/dsh-safe-deploy
 run bash -n patch-dsh.sh
 
 # 策略/契约测试
+run node scripts/test-registry.js
 run node scripts/test-dual-channel.js
 run node scripts/test-version-server.js
 run node scripts/test-version-policy.js

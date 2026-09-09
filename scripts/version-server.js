@@ -18,6 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const policy = require(path.join(__dirname, 'version-policy.js'));
 const safeDeployPolicy = require(path.join(__dirname, 'safe-deploy-policy.js'));
+const registry = require(path.join(__dirname, 'registry.js'));
 
 const PORT = Number(process.env.DSH_VERSION_PORT || process.env.VERSION_PORT || 3082);
 const CHANNEL = process.env.DSH_CHANNEL || 'alpha';
@@ -26,7 +27,8 @@ const CACHE_MS = 10 * 60 * 1000;
 // 强制刷新节流：一次强制刷新会打 2 个 api.github.com（releases + tags）+ 1 个 npm，
 // GitHub 匿名限额 60/h → 取 120s，最坏 60/h 不越界；正常 10 分钟缓存下每小时仅 ~18 次。
 const FORCE_MIN_INTERVAL_MS = 120 * 1000;
-const GHCR_REPO = process.env.GHCR_REPO || 'llzg/dsh-docker';
+// 镜像仓库（可多个，逗号分隔）：GHCR 公开包 + 内网私有 registry（需凭据，见 registry.js）
+const REGISTRY_REFS = registry.registriesFromEnv();
 const DOCKER_REPO = process.env.DOCKER_REPO || 'llzg/dsh-docker';
 const UPSTREAM_REPO_URL = 'https://github.com/deepseek-ai/deepseek-harness';
 
@@ -107,7 +109,7 @@ function readDeployed() {
 
 // ── 缓存 ────────────────────────────────────────────────────────────────────
 let sourcesCache = { data: null, at: 0, inflight: null };
-let ghcrCache = { data: null, at: 0, inflight: null };
+let registryCache = { data: null, at: 0, inflight: null };
 let runsCache = { data: null, at: 0, inflight: null };
 let lastForcedAt = 0;
 
@@ -139,19 +141,28 @@ async function getSources(force) {
   return memoized(sourcesCache, () => policy.fetchAllSources());
 }
 
-// ── 构建状态（GHCR tags + 最近一次 CI 运行）─────────────────────────────────
-async function loadGhcrTags() {
-  const tok = await policy.fetchJson(`https://ghcr.io/token?scope=repository:${GHCR_REPO}:pull&service=ghcr.io`);
-  if (tok.error || !tok.data || !tok.data.token) {
-    return { status: 'error', error: (tok.error || 'token 获取失败'), tags: [] };
-  }
-  const res = await policy.fetchJson(`https://ghcr.io/v2/${GHCR_REPO}/tags/list?n=1000`, {
-    headers: { Authorization: `Bearer ${tok.data.token}` },
-  });
-  if (res.error || !res.data || !Array.isArray(res.data.tags)) {
-    return { status: 'error', error: (res.error || 'tags 列表不可读'), tags: [] };
-  }
-  return { status: 'ok', error: null, tags: res.data.tags };
+// ── 构建状态（镜像 registry tags + 最近一次 CI 运行）────────────────────────
+// registry 列表可配（DSH_REGISTRIES）；GHCR 匿名可读，内网私有 registry 需凭据
+// （DSH_REGISTRY_USER/PASSWORD 或容器内 docker config.json）。
+async function loadRegistryTags() {
+  const results = await Promise.all(REGISTRY_REFS.map((ref) => registry.listTags(ref)
+    .catch((e) => ({ status: 'error', registry: ref, repository: '', tags: [], error: e.message }))));
+  const tags = new Set();
+  for (const r of results) if (r.status === 'ok') for (const t of r.tags) tags.add(t);
+  const okCount = results.filter((r) => r.status === 'ok').length;
+  return {
+    status: okCount > 0 ? 'ok' : 'error',
+    error: okCount > 0 ? null : results.map((r) => `${r.registry}/${r.repository || ''}: ${r.error}`).join('; '),
+    tags: [...tags],
+    registries: results.map((r) => ({
+      ref: `${r.registry}/${r.repository || ''}`,
+      status: r.status,
+      scheme: r.scheme || null,
+      authUsed: !!r.authUsed,
+      tagCount: (r.tags || []).length,
+      error: r.error || null,
+    })),
+  };
 }
 
 async function loadLastRun() {
@@ -172,17 +183,18 @@ async function loadLastRun() {
   };
 }
 
-function buildStatus(target, ghcr, runs) {
-  if (!target) return { target: null, status: 'na', targetBuilt: null, builtTags: [], lastRun: null, error: null };
-  const tags = (ghcr && ghcr.tags) || [];
+function buildStatus(target, reg, runs) {
+  if (!target) return { target: null, status: 'na', targetBuilt: null, builtTags: [], registries: [], lastRun: null, error: null };
+  const tags = (reg && reg.tags) || [];
   const builtTags = tags.filter((t) => t === target || t.startsWith(`${target}-`));
   return {
     target,
-    status: ghcr && ghcr.status === 'ok' ? 'ok' : 'error',
-    targetBuilt: ghcr && ghcr.status === 'ok' ? builtTags.length > 0 : null,
+    status: reg && reg.status === 'ok' ? 'ok' : 'error',
+    targetBuilt: reg && reg.status === 'ok' ? builtTags.length > 0 : null,
     builtTags,
+    registries: (reg && reg.registries) || [],
     lastRun: (runs && runs.run) || null,
-    error: (ghcr && ghcr.error) || (runs && runs.error) || null,
+    error: (reg && reg.error) || (runs && runs.error) || null,
   };
 }
 
@@ -192,7 +204,7 @@ async function buildInfo({ force }) {
   const sources = await getSources(force);
   const targets = policy.computeTargets(sources);
   const { ssot, file, isFallback } = readSsoT();
-  const ghcr = await memoized(ghcrCache, loadGhcrTags).catch((e) => ({ status: 'error', error: e.message, tags: [] }));
+  const reg = await memoized(registryCache, loadRegistryTags).catch((e) => ({ status: 'error', error: e.message, tags: [] }));
   const runs = await memoized(runsCache, loadLastRun).catch((e) => ({ status: 'error', error: e.message, run: null }));
 
   const channelViews = {};
@@ -217,7 +229,7 @@ async function buildInfo({ force }) {
         newestUpstream: (targets.channels[name] && targets.channels[name].newestUpstream) || null,
         waitingForNpm: !!(targets.channels[name] && targets.channels[name].waitingForNpm),
         currentIsTarget: target ? view.currentVersion === target : null,
-        build: buildStatus(target, ghcr, runs),
+        build: buildStatus(target, reg, runs),
       };
     }
   }
@@ -258,7 +270,7 @@ async function buildInfo({ force }) {
       cacheMs: CACHE_MS,
       ssotFile: file,
       ssotIsFallback: isFallback,
-      ghcrStatus: ghcr.status,
+      registryStatus: reg.status,
       runsStatus: runs.status,
       lastForcedAt: lastForcedAt ? new Date(lastForcedAt).toISOString() : null,
     },

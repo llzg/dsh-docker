@@ -20,22 +20,28 @@ const fs = require('fs');
 const path = require('path');
 const policy = require('./version-policy.js');
 const safeDeploy = require('./safe-deploy-policy.js');
+const registry = require('./registry.js');
 
-const GHCR_REPO = process.env.GHCR_REPO || 'llzg/dsh-docker';
+// 收敛判定用的镜像仓库列表（可多个）：
+//   DSH_REGISTRIES='ghcr.io/llzg/dsh-docker,192.168.5.35:5050/llzg/dsh-docker'
+//   未设置时 = DSH_IMAGE_REF / 默认 GHCR。内网 registry 凭据走 DSH_REGISTRY_USER/PASSWORD
+//   或 docker config.json（见 scripts/registry.js）。
+function registryRefs() {
+  return registry.registriesFromEnv();
+}
 
-// 已发布的镜像 tag（匿名可读；失败返回 error 而不是抛异常）
-async function ghcrTags() {
-  const tok = await policy.fetchJson(`https://ghcr.io/token?scope=repository:${GHCR_REPO}:pull&service=ghcr.io`);
-  if (tok.error || !tok.data || !tok.data.token) {
-    return { status: 'error', error: tok.error || 'token 获取失败', tags: [] };
-  }
-  const res = await policy.fetchJson(`https://ghcr.io/v2/${GHCR_REPO}/tags/list?n=1000`, {
-    headers: { Authorization: `Bearer ${tok.data.token}` },
-  });
-  if (res.error || !res.data || !Array.isArray(res.data.tags)) {
-    return { status: 'error', error: res.error || 'tags 列表不可读', tags: [] };
-  }
-  return { status: 'ok', error: null, tags: res.data.tags };
+// 二级收敛源：CI 回写的 build-status.json（只认成功的构建）。
+// 用途：所有 registry 都不可达时仍能判断"这个版本是否已经构建过"，避免退回"每 30 分钟重建"。
+function versionsFromBuildStatus() {
+  const file = process.env.DSH_BUILD_STATUS || path.join(__dirname, '..', 'build-status.json');
+  const out = new Set();
+  try {
+    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    for (const c of Object.values(j.channels || {})) {
+      if (c && c.conclusion === 'success' && c.version) out.add(String(c.version));
+    }
+  } catch { /* 文件不存在/损坏 → 空 */ }
+  return out;
 }
 
 // 输出值净化：GITHUB_OUTPUT 是 key=value 行协议，值里出现换行会注入额外键
@@ -54,15 +60,26 @@ async function main() {
 
   const sources = await policy.fetchAllSources();
   const targets = policy.computeTargets(sources);
-  const ghcr = await ghcrTags();
-  const builtSet = new Set(ghcr.tags || []);
-  const isBuilt = (v) => builtSet.has(v) || (ghcr.tags || []).some((t) => t.startsWith(`${v}-`));
+
+  // 收敛判定：目标版本是否已存在于任一 registry 的 tag 列表（或 build-status.json 的成功记录）
+  const refs = registryRefs();
+  const regResults = await Promise.all(refs.map((r) => registry.listTags(r).catch((e) => ({ status: 'error', registry: r, tags: [], error: e.message }))));
+  const builtSet = new Set();
+  for (const r of regResults) if (r.status === 'ok') for (const tg of r.tags) builtSet.add(tg);
+  const statusVersions = versionsFromBuildStatus();
+  const registryOk = regResults.some((r) => r.status === 'ok');
+  const canDecide = registryOk || statusVersions.size > 0;
+  const isBuilt = (v) => statusVersions.has(v) || builtSet.has(v) || [...builtSet].some((t) => t.startsWith(`${v}-`));
+
+  for (const r of regResults) {
+    console.log(`registry ${r.registry}/${r.repository}: ${r.status === 'ok' ? `${r.tags.length} tags (${r.scheme}${r.authUsed ? ', auth' : ', anonymous'})` : `ERROR ${r.error}`}`);
+  }
+  console.log(`build-status.json 成功记录: ${statusVersions.size ? [...statusVersions].join(',') : '(无)'}`);
 
   console.log(`sources: github release=${sources.github.release.status === 'ok' ? sources.github.release.value : 'ERR'} `
     + `tag=${sources.github.tag.status === 'ok' ? sources.github.tag.value : 'ERR'} `
     + `npm latest=${sources.npm.latest.status === 'ok' ? sources.npm.latest.value : 'ERR'} `
     + `next=${sources.npm.next.status === 'ok' ? sources.npm.next.value : 'ERR'}`);
-  console.log(`ghcr: ${ghcr.status === 'ok' ? `${ghcr.tags.length} tags` : `ERROR ${ghcr.error}`}`);
   console.log(`ssot: ${ssotFile} primary=${ssot.primaryChannel} channels=${channelNames.join(',')}`);
 
   if (override && !channelNames.includes(policy.channelOf(override))) {
@@ -89,6 +106,13 @@ async function main() {
     }
     if (!version) {
       decisions.push({ channel: ch, version: null, build: false, reason: 'no target', ssotCandidate: ssot.channels[ch].candidate });
+      continue;
+    }
+    // 收敛信息不可用（所有 registry 都查不到 且 没有 build-status 记录）：
+    // 宁可跳过也不盲目重建——旧实现正是"判定不出就每 30 分钟重建一次"。
+    // FORCE（push 事件）仍然构建，因为那是"补丁/脚本变了必须重发"的语义。
+    if (!canDecide && !force) {
+      decisions.push({ channel: ch, version, build: false, alreadyBuilt: null, reason: 'convergence unknown (no registry reachable, no build-status record)' });
       continue;
     }
     const alreadyBuilt = isBuilt(version);

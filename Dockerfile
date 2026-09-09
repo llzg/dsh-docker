@@ -111,10 +111,13 @@ ARG SEMVER_VERSION=7.6.3
 RUN cd /opt && npm init -y >/dev/null 2>&1 && npm install --no-audit --no-fund "semver@${SEMVER_VERSION}" 2>&1 | tail -1
 COPY scripts/version-policy.js /opt/version-policy.js
 COPY scripts/safe-deploy-policy.js /opt/safe-deploy-policy.js
+COPY scripts/registry.js /opt/registry.js
 COPY scripts/version-server.js /opt/version-server.js
 # 版本 SSOT（镜像内置副本；运行时优先读 /root/nas_docker/dsh-version.json 工作区实时版）
 COPY dsh-version.json /opt/dsh-version-ssot.json
-RUN node --check /opt/version-policy.js && node --check /opt/safe-deploy-policy.js && node --check /opt/version-server.js && chmod +x /opt/version-server.js
+RUN node --check /opt/version-policy.js && node --check /opt/safe-deploy-policy.js \
+    && node --check /opt/registry.js && node --check /opt/version-server.js \
+    && chmod +x /opt/version-server.js
 
 # Healthcheck used both by the NAS watchdog (auto-rollback) and docker itself.
 # 探 3080（dsh web UI）；版本页 3082 的存活由 entrypoint 的守护循环负责（契约 §6）。

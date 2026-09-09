@@ -40,9 +40,20 @@ concurrency:
   group: build-publish
   cancel-in-progress: false
 
+# ── 自建设施开关（全部通过仓库 Variables/Secrets 配置，不设时行为与原来一致）──────
+#   vars.DSH_RUNNER          JSON 数组，如 ["self-hosted","linux","x64"]；默认 ubuntu-latest
+#   vars.DSH_HTTP_PROXY      出网代理，如 http://192.168.5.36:7893（仅自建 runner 可用内网地址）
+#   vars.DSH_PRIVATE_IMAGE   私有 registry 镜像前缀，如 192.168.5.35:5050/llzg/dsh-docker
+#   vars.DSH_REGISTRIES      收敛判定/版本页查询的仓库列表（逗号分隔）；默认 GHCR
+#   secrets.DSH_REGISTRY_USER / DSH_REGISTRY_PASSWORD   私有 registry 凭据
+env:
+  HTTP_PROXY: ${{ vars.DSH_HTTP_PROXY }}
+  HTTPS_PROXY: ${{ vars.DSH_HTTP_PROXY }}
+  NO_PROXY: localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,.local
+
 jobs:
   resolve:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.DSH_RUNNER || '"ubuntu-latest"') }}
     outputs:
       matrix: ${{ steps.version.outputs.matrix }}
       any_build: ${{ steps.version.outputs.any_build }}
@@ -58,8 +69,10 @@ jobs:
         run: |
           node --check scripts/version-policy.js
           node --check scripts/safe-deploy-policy.js
+          node --check scripts/registry.js
           node --check scripts/version-server.js
           node --check scripts/check-new-version.js
+          node scripts/test-registry.js
           node scripts/test-dual-channel.js
           node scripts/test-version-server.js
           node scripts/test-version-policy.js
@@ -74,8 +87,11 @@ jobs:
           VERSION_OVERRIDE: ${{ github.event.inputs.version }}
           DSH_CHANNELS: ${{ github.event.inputs.channel }}
           FORCE: ${{ github.event_name == 'push' && '1' || '' }}
-          GHCR_REPO: ${{ github.repository_owner }}/dsh-docker
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 收敛判定查询的仓库列表（含内网私有 registry 时需要凭据）
+          DSH_REGISTRIES: ${{ vars.DSH_REGISTRIES }}
+          DSH_REGISTRY_USER: ${{ secrets.DSH_REGISTRY_USER }}
+          DSH_REGISTRY_PASSWORD: ${{ secrets.DSH_REGISTRY_PASSWORD }}
 
       - name: Nothing to build
         if: steps.version.outputs.any_build != '1'
@@ -84,7 +100,7 @@ jobs:
   build-publish:
     needs: resolve
     if: needs.resolve.outputs.any_build == '1'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.DSH_RUNNER || '"ubuntu-latest"') }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -99,27 +115,45 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 私有 registry（可选）：vars.DSH_PRIVATE_IMAGE 形如 192.168.5.35:5050/llzg/dsh-docker。
+      # 注意：http(无 TLS) 的 registry 需要 runner 的 daemon 配 insecure-registries。
+      - name: Login to private registry
+        if: vars.DSH_PRIVATE_IMAGE != ''
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ vars.DSH_PRIVATE_IMAGE }}
+          username: ${{ secrets.DSH_REGISTRY_USER }}
+          password: ${{ secrets.DSH_REGISTRY_PASSWORD }}
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       # prerelease（alpha/beta/rc）不打 latest，防止任何 latest 消费者把预发布版部署到生产；
       # stable 追加 latest。回滚一律用不可变 <version>-<sha> 或 <version>。
+      # 同时打 GHCR 与（可选）内网私有 registry 的 tag，一次构建双推。
       - name: Compute image tags
         id: tags
         run: |
-          BASE="ghcr.io/${{ github.repository_owner }}/dsh-docker"
+          set -euo pipefail
+          GHCR_BASE="ghcr.io/${{ github.repository_owner }}/dsh-docker"
+          PRIV_BASE="${{ vars.DSH_PRIVATE_IMAGE }}"
           V="${{ matrix.version }}"
           SHA="${{ github.sha }}"
+          PRE="${{ matrix.is_prerelease }}"
           {
             echo "IMAGE_TAGS<<__DSH_TAGS__"
-            echo "${BASE}:${V}-${SHA}"
-            echo "${BASE}:${V}"
-            if [ "${{ matrix.is_prerelease }}" != "1" ]; then
-              echo "${BASE}:latest"
+            echo "${GHCR_BASE}:${V}-${SHA}"
+            echo "${GHCR_BASE}:${V}"
+            if [ "$PRE" != "1" ]; then echo "${GHCR_BASE}:latest"; fi
+            if [ -n "$PRIV_BASE" ]; then
+              echo "${PRIV_BASE}:${V}-${SHA}"
+              echo "${PRIV_BASE}:${V}"
+              if [ "$PRE" != "1" ]; then echo "${PRIV_BASE}:latest"; fi
             fi
             echo "__DSH_TAGS__"
           } >> "$GITHUB_ENV"
-          echo "channel=${{ matrix.channel }} version=$V prerelease=${{ matrix.is_prerelease }}"
+          echo "GHCR_SMOKE_TAG=${GHCR_BASE}:${V}-${SHA}" >> "$GITHUB_ENV"
+          echo "channel=${{ matrix.channel }} version=$V prerelease=$PRE ghcr=$GHCR_BASE private=${PRIV_BASE:-none}"
 
       # 先构建到本地 daemon 做冒烟测试；通过后才推送（坏镜像不进 registry）
       - name: Build image (local, for smoke test)
@@ -135,7 +169,7 @@ jobs:
             DSH_CHANNEL=${{ matrix.channel }}
 
       - name: Smoke test (web UI)
-        run: ./scripts/smoke-test.sh ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ matrix.version }}-${{ github.sha }}
+        run: ./scripts/smoke-test.sh "$GHCR_SMOKE_TAG"
 
       - name: Push to GHCR
         run: |
@@ -175,7 +209,7 @@ jobs:
   record-status:
     needs: [resolve, build-publish]
     if: always() && needs.resolve.outputs.any_build == '1'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.DSH_RUNNER || '"ubuntu-latest"') }}
     steps:
       # 显式 checkout 默认分支（而不是触发 SHA 的 detached HEAD），否则回写会推到游离提交
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

@@ -111,16 +111,16 @@ install_main() {
     _pull=$(ssot_channel_production "$CHANNEL")
     if is_release_tag "$_pull"; then
       echo "预拉取 $IMG:$_pull（来源 SSOT channels.$CHANNEL.production）"
-      docker pull "$IMG:$_pull" >/dev/null 2>&1 || echo "WARN: 预拉取 $IMG:$_pull 失败（首次可忽略）" >&2
+      pull_image "$IMG:$_pull" || echo "WARN: 预拉取 $IMG:$_pull 失败（首次可忽略）" >&2
     else
       echo "WARN: SSOT 未提供合法的 channels.$CHANNEL.production（got='${_pull:-}'）→ 预拉取 $IMG:latest（可能跨通道降级）" >&2
-      docker pull "$IMG:latest" >/dev/null 2>&1 || echo "WARN: 预拉取 $IMG:latest 失败（首次可忽略）" >&2
+      pull_image "$IMG:latest" || echo "WARN: 预拉取 $IMG:latest 失败（首次可忽略）" >&2
     fi
     _pinned=$(env_get DSH_IMAGE)
     case "$_pinned" in
       ""|"$IMG:$_pull") : ;;
       *) echo "预拉取 .env 钉住的镜像 $_pinned"
-         docker pull "$_pinned" >/dev/null 2>&1 || echo "WARN: 预拉取 $_pinned 失败" >&2 ;;
+         pull_image "$_pinned" || echo "WARN: 预拉取 $_pinned 失败" >&2 ;;
     esac
   fi
 
