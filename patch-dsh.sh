@@ -1,28 +1,61 @@
 #!/bin/bash
-# LAN patches for DeepSeek Harness web UI (idempotent)
+# LAN patches for DeepSeek Harness web UI (idempotent, marker-verified)
 #
-# STRICT=1 (used at image build time): after patching, verifies the *final
-# behavior invariants* hold. If upstream changed the code so a patch can no
-# longer be applied, the build FAILS loudly instead of silently shipping a
-# broken LAN deployment.
-set -e
-BASE=/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai
+# 契约：docs/dual-channel.md §10。每个补丁三段式，缺一不可：
+#   1) 锚点预检 → 2) 应用 → 3) 写唯一 marker → STRICT 正向校验 marker 存在
+# 锚点既不存在、也没有 marker → `VERIFY FAIL: anchor missing ...` 且 exit 1（构建失败）。
+#
+# 旧实现（fd8b3a7）的致命缺陷（已实测）：STRICT 校验的是“原始模式必须消失”，
+# 锚点从未匹配时该条件恒真 → 每次构建都打印 all LAN patch invariants OK，
+# 实际一个补丁都没打。现改为正向校验 marker。
+#
+# STRICT=1（构建期）打开最终逐条校验；STRICT=0（容器启动自愈）只做锚点预检。
+set -eu
+# 生产默认路径不变；DSH_PATCH_BASE 仅供本地/CI 用真实文件系统模拟上游包（无需 docker）。
+BASE="${DSH_PATCH_BASE:-/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai}"
 STRICT="${STRICT:-0}"
+# 图标资源（构建期在 /opt；可用环境变量覆盖以便本地模拟，默认值不变）
+ICON="${DSH_ICON:-/opt/dsh-icon.jpg}"
+MAKE_FAVICON="${DSH_MAKE_FAVICON:-/opt/make-favicon.js}"
+MARKER="dsh-docker-patch"
+
+FAIL=0
+fail() { echo "VERIFY FAIL: $*" >&2; FAIL=1; }
+# 追加唯一 marker（前置换行：避免吃到“末行无换行”的文件最后一行代码）
+write_marker() { printf '\n// %s:%s\n' "$MARKER" "$2" >> "$1"; }
+# 契约 §10 的 YAML/文本形态 marker（当前无 YAML 补丁，保留 helper 以便扩展）
+write_marker_hash() { printf '\n# %s:%s\n' "$MARKER" "$2" >> "$1"; }
+has_marker() { [ -f "$1" ] && grep -qF "$MARKER:$2" "$1"; }
 
 # 1) Settings pages: force "host" persistence mode so plugin/model config
 #    loads when accessed from a LAN IP (upstream defaults to "memory" off-loopback).
+#    锚点变更史（已核对 npm 包 lib/client.js）：
+#      0.1.0-rc.6 / 0.1.1-rc.1        : connection.isLoopback ? "host" : "memory"   （旧文本，兼容）
+#      >= 0.1.2-alpha.2（当前上游）   : ctx.remote.$host.isLoopback ? "host" : "memory"
+#    两者任一命中都必须替换为强制 "host" 并写 marker；两者都不在且无 marker → FAIL。
+ANCHOR_HOST_NEW='ctx.remote.$host.isLoopback ? "host" : "memory"'
+ANCHOR_HOST_OLD='connection.isLoopback ? "host" : "memory"'
 for pkg in dsh-client-ui-settings dsh-client-ui-settings-models dsh-client-ui-settings-general; do
   f="$BASE/$pkg/lib/client.js"
   if [ ! -f "$f" ]; then
     echo "SKIP settings-host-mode: 目标不存在（上游移除 $pkg，patch 不适用）: $f"
     continue
   fi
-  if grep -q 'connection.isLoopback ? "host" : "memory"' "$f"; then
-    sed -i 's/connection.isLoopback ? "host" : "memory"/"host"/g' "$f"
-    echo "settings-host-mode: patched $pkg"
-  else
-    echo "settings-host-mode: already patched or pattern absent in $pkg"
+  if has_marker "$f" settings-host-mode; then
+    echo "settings-host-mode: already patched (marker present) in $pkg"
+    continue
   fi
+  if grep -qF "$ANCHOR_HOST_NEW" "$f"; then
+    sed -i 's/ctx\.remote\.\$host\.isLoopback ? "host" : "memory"/"host"/g' "$f"
+    echo "settings-host-mode: patched $pkg (new anchor)"
+  elif grep -qF "$ANCHOR_HOST_OLD" "$f"; then
+    sed -i 's/connection\.isLoopback ? "host" : "memory"/"host"/g' "$f"
+    echo "settings-host-mode: patched $pkg (legacy anchor)"
+  else
+    fail "anchor missing settings-host-mode: 既无新锚点 '$ANCHOR_HOST_NEW' 也无旧锚点 '$ANCHOR_HOST_OLD'，且无 marker: $f"
+    continue
+  fi
+  write_marker "$f" settings-host-mode
 done
 
 # 2) crypto.randomUUID polyfill: in a non-secure context (plain HTTP over a LAN IP)
@@ -34,25 +67,46 @@ for pkg in dsh-client-connection dsh-client-ui-conversation; do
     echo "SKIP randomuuid-polyfill: 目标不存在（上游移除 $pkg，patch 不适用）: $f"
     continue
   fi
-  if grep -q 'globalThis.crypto.randomUUID' "$f"; then
-    echo "randomuuid-polyfill: already present in $pkg"
-  else
-    sed -i "1i $POLYFILL" "$f"
-    echo "randomuuid-polyfill: added to $pkg"
+  if has_marker "$f" randomuuid-polyfill; then
+    echo "randomuuid-polyfill: already patched (marker present) in $pkg"
+    continue
   fi
+  # 锚点预检：客户端 bundle 必须是 __ModuleLoader__ 模块（结构变了就不能安全前置注入）
+  if ! grep -qF 'window.__ModuleLoader__.load(' "$f"; then
+    fail "anchor missing randomuuid-polyfill: 未找到 window.__ModuleLoader__.load( 结构: $f"
+    continue
+  fi
+  tmp="$(mktemp)"
+  { printf '// %s:%s\n' "$MARKER" randomuuid-polyfill; printf '%s\n' "$POLYFILL"; cat "$f"; } > "$tmp"
+  cat "$tmp" > "$f"   # 原地覆盖（保留原 inode/权限，避免 mv 掉成 0600）
+  rm -f "$tmp"
+  echo "randomuuid-polyfill: added to $pkg"
 done
 
 # 3) Server-side: privileged methods (settings/credentials/models discovery)
 #    are pinned to loopback by default. Trust the same --trusted-host list
 #    so the LAN deployment can configure providers in the UI.
+#
+#    上游形态核实（npm 包 lib/index.js）：
+#      >= 0.1.2-alpha.5 已自带 `isTrustedApiRequest(request, this.trustedHosts)`
+#      （0.1.2-alpha.5 / 0.1.3-alpha.2 / 0.1.5-alpha.1 / 0.1.5-alpha.2 逐一确认），
+#      此时不再 sed，只记 `privileged-loopback:upstream-satisfied` marker；
+#      老版本仍含旧锚点 `!isTrustedApiRequest(request, [])` 时照旧 sed；
+#      两者都没有且无 marker → FAIL。
 CONN_INDEX="$BASE/dsh-client-connection/lib/index.js"
 if [ ! -f "$CONN_INDEX" ]; then
   echo "SKIP privileged-loopback: 目标不存在（上游移除 dsh-client-connection，patch 不适用）: $CONN_INDEX"
-elif grep -q 'PRIVILEGED_METHODS.has(method) && !isTrustedApiRequest(request, trustedHosts)' "$CONN_INDEX"; then
-  echo "privileged-loopback: already patched"
-else
+elif has_marker "$CONN_INDEX" privileged-loopback; then
+  echo "privileged-loopback: already marked (patched or upstream-satisfied)"
+elif grep -qF 'PRIVILEGED_METHODS.has(method) && !isTrustedApiRequest(request, [])' "$CONN_INDEX"; then
   sed -i 's/PRIVILEGED_METHODS.has(method) && !isTrustedApiRequest(request, \[\])/PRIVILEGED_METHODS.has(method) \&\& !isTrustedApiRequest(request, trustedHosts)/' "$CONN_INDEX"
-  echo "privileged-loopback: patched"
+  write_marker "$CONN_INDEX" privileged-loopback
+  echo "privileged-loopback: patched (legacy anchor)"
+elif grep -qF 'isTrustedApiRequest(request, this.trustedHosts)' "$CONN_INDEX"; then
+  write_marker "$CONN_INDEX" privileged-loopback:upstream-satisfied
+  echo "privileged-loopback: upstream-satisfied (no sed needed)"
+else
+  fail "anchor missing privileged-loopback: 既无旧锚点 !isTrustedApiRequest(request, []) 也无 isTrustedApiRequest(request, this.trustedHosts)，且无 marker: $CONN_INDEX"
 fi
 
 # 4) vision-materialize: DeepSeek 适配器是纯文本 wire，遇到用户粘贴的图片
@@ -60,21 +114,29 @@ fi
 #    一段文本指针（附件是内容寻址存储，路径可由 attachmentId 直接推出，
 #    无需读写字节），智能体看到路径后可用 scripts/see.sh 看图。
 LLM_DS="$BASE/dsh-llm-deepseek/lib/index.js"
-python3 - "$LLM_DS" <<'PY'
+python3 - "$LLM_DS" <<'PY' || fail "vision-materialize: python 补丁未完成（见上，上游结构已变）"
 import os, sys
 f = sys.argv[1]
 if not os.path.exists(f):
     print("SKIP vision-materialize: 目标不存在（上游移除 dsh-llm-deepseek，patch 不适用）:", f)
     sys.exit(0)
+
+def need(cond, what):
+    """锚点预检：保留 assert 语义，但打印契约要求的 VERIFY FAIL 并以 exit 3 结束。"""
+    if not cond:
+        print("VERIFY FAIL: anchor missing vision-materialize:", what, file=sys.stderr)
+        sys.exit(3)
+
 src = open(f, encoding="utf-8").read()
-if "materializeImages" in src:
-    print("vision-materialize: already patched")
+if "dsh-docker-patch:vision-materialize" in src:
+    print("vision-materialize: already patched (marker present)")
     sys.exit(0)
 old_fn = '''/** Reject core image content before any text-flattening path can silently erase it. */
 function assertTextOnly(blocks) {
 	if (contentHasImage(blocks)) throw new LlmError("The DeepSeek chat-completions adapter does not support image content.", "UNSUPPORTED_CONTENT");
 }'''
-new_fn = '''/**
+new_fn = '''// dsh-docker-patch:vision-materialize
+/**
 * LAN patch (llzg/dsh-docker): the chat-completions wire is text-only; instead
 * of rejecting pasted images, materialize each image block into a text pointer
 * at its durable content-addressed attachment path (DSH_HOME/attachments/v1),
@@ -95,7 +157,7 @@ function materializeImages(content) {
 	}
 	return out;
 }'''
-assert old_fn in src, "vision-materialize: assertTextOnly pattern not found (upstream changed?)"
+need(old_fn in src, "assertTextOnly pattern not found (upstream changed?)")
 src = src.replace(old_fn, new_fn)
 old_loop = '''	for (const message of messages) {
 		assertTextOnly(message.content);
@@ -127,11 +189,11 @@ new_loop = '''	for (const message of messages) {
 		}
 		const toolResults = content.filter((block) => block.type === "tool-result");
 		const text = flattenText(content);'''
-assert old_loop in src, "vision-materialize: serializeMessages pattern not found (upstream changed?)"
+need(old_loop in src, "serializeMessages pattern not found (upstream changed?)")
 src = src.replace(old_loop, new_loop)
 old_tool = 'content: flattenText(result.content) || "(no output)"'
 new_tool = 'content: flattenText(materializeImages(result.content)) || "(no output)"'
-assert old_tool in src, "vision-materialize: tool-result pattern not found (upstream changed?)"
+need(old_tool in src, "tool-result pattern not found (upstream changed?)")
 src = src.replace(old_tool, new_tool)
 open(f, "w", encoding="utf-8").write(src)
 print("vision-materialize: patched dsh-llm-deepseek")
@@ -143,16 +205,23 @@ PY
 #     让图片流进消息；是否能用交给适配器层（vision-materialize 会物化成
 #     附件路径文本），而不是在入口一刀切。
 APIPROXY="$BASE/dsh-host-apiproxy/lib/index.js"
-python3 - "$APIPROXY" <<'PY'
+python3 - "$APIPROXY" <<'PY' || fail "vision-gate: python 补丁未完成（见上，上游结构已变）"
 import os, sys
 f = sys.argv[1]
 if not os.path.exists(f):
     print("SKIP vision-gate: 目标不存在（上游移除 dsh-host-apiproxy，patch 不适用）:", f)
     sys.exit(0)
+
+def need(cond, what):
+    """锚点预检：保留 assert 语义，但打印契约要求的 VERIFY FAIL 并以 exit 3 结束。"""
+    if not cond:
+        print("VERIFY FAIL: anchor missing vision-gate:", what, file=sys.stderr)
+        sys.exit(3)
+
 src = open(f, encoding="utf-8").read()
-marker = "vision-gate: pasted images pass through"
+marker = "dsh-docker-patch:vision-gate"
 if marker in src:
-    print("vision-gate: already patched")
+    print("vision-gate: already patched (marker present)")
     sys.exit(0)
 old_gate = '''						if (hasImage) {
 							const current = selectionFor(agent).current;
@@ -163,79 +232,74 @@ old_gate = '''						if (hasImage) {
 								details: { reason: "MODEL_DOES_NOT_SUPPORT_IMAGES" }
 							});
 						}'''
-new_gate = '''						// LAN patch (llzg/dsh-docker) vision-gate: pasted images pass through even
+new_gate = '''						// dsh-docker-patch:vision-gate
+						// LAN patch (llzg/dsh-docker) vision-gate: pasted images pass through even
 						// for text-only models; the DeepSeek adapter materializes them into
 						// attachment-path text (vision-materialize) instead of erroring.'''
-assert old_gate in src, "vision-gate: MODEL_DOES_NOT_SUPPORT_IMAGES pattern not found (upstream changed?)"
+need(old_gate in src, "MODEL_DOES_NOT_SUPPORT_IMAGES pattern not found (upstream changed?)")
 src = src.replace(old_gate, new_gate)
 open(f, "w", encoding="utf-8").write(src)
 print("vision-gate: patched dsh-host-apiproxy")
 PY
 
-# 5) 自定义图标：将 /opt/dsh-icon.jpg 嵌入前端 favicon.svg
+# 5) 自定义图标：将 dsh-icon.jpg 嵌入前端 favicon.svg
 #    （浏览器标签页 + PWA manifest 共用 favicon.svg，替换它即整体生效）
+#    锚点预检：favicon.svg 必须存在且是 SVG；生成后补 marker（SVG 只能用 XML 注释）。
 FAVICON="$BASE/dsh-web-frontend/dist/favicon.svg"
-if [ -f /opt/dsh-icon.jpg ] && [ -f /opt/make-favicon.js ]; then
-  if grep -q 'data:image/jpeg;base64' "$FAVICON" 2>/dev/null; then
-    echo "favicon-custom: already applied"
-  else
-    node /opt/make-favicon.js "$FAVICON" /opt/dsh-icon.jpg || { echo "favicon-custom: generation failed" >&2; }
-  fi
+if [ ! -f "$FAVICON" ]; then
+  echo "SKIP favicon-custom: 目标不存在（上游移除 dsh-web-frontend，patch 不适用）: $FAVICON"
+elif [ ! -f "$ICON" ] || [ ! -f "$MAKE_FAVICON" ]; then
+  echo "favicon-custom: icon assets absent (skip): $ICON / $MAKE_FAVICON"
+elif has_marker "$FAVICON" favicon-custom; then
+  echo "favicon-custom: already applied (marker present)"
+elif ! grep -qF '<svg' "$FAVICON"; then
+  fail "anchor missing favicon-custom: $FAVICON 不是 SVG（上游结构已变）"
 else
-  echo "favicon-custom: icon assets absent (skip)"
+  if node "$MAKE_FAVICON" "$FAVICON" "$ICON"; then
+    printf '\n<!-- %s:favicon-custom -->\n' "$MARKER" >> "$FAVICON"
+  else
+    fail "favicon-custom: make-favicon 生成失败（$MAKE_FAVICON）"
+  fi
 fi
 
-# ── STRICT verification (build-time guard) ────────────────────────────────
+# ── STRICT verification（构建期正向校验：marker 必须存在）──────────────────
+# 契约 §10：正向校验 marker，替代旧的“原始模式必须消失”（锚点失配时恒真）。
+verify_marker() { # file marker-name label
+  if [ ! -f "$1" ]; then
+    echo "verify: $2 SKIP（目标不存在，patch 不适用）: $3"
+    return 0
+  fi
+  if grep -qF "$MARKER:$2" "$1"; then
+    echo "verify: $2 OK ($3)"
+  else
+    fail "marker missing for $2 in $3 ($1)"
+  fi
+}
 if [ "$STRICT" = "1" ]; then
-  FAIL=0
-  # 1) settings: original off-loopback "memory" fallback must be gone
   for pkg in dsh-client-ui-settings dsh-client-ui-settings-models dsh-client-ui-settings-general; do
-    f="$BASE/$pkg/lib/client.js"
-    if [ -f "$f" ] && grep -q 'connection.isLoopback ? "host" : "memory"' "$f"; then
-      echo "VERIFY FAIL: settings-host-mode not applied in $pkg (upstream changed?)" >&2
-      FAIL=1
-    fi
+    verify_marker "$BASE/$pkg/lib/client.js" settings-host-mode "$pkg"
   done
-  # 2) randomUUID polyfill marker must exist in both client bundles
   for pkg in dsh-client-connection dsh-client-ui-conversation; do
-    f="$BASE/$pkg/lib/client.js"
-    if [ -f "$f" ] && ! grep -q 'crypto.randomUUID=function' "$f"; then
-      echo "VERIFY FAIL: randomuuid-polyfill missing in $pkg (upstream changed?)" >&2
-      FAIL=1
-    fi
+    verify_marker "$BASE/$pkg/lib/client.js" randomuuid-polyfill "$pkg"
   done
-  # 3) privileged methods must trust the --trusted-host list
-  if [ -f "$CONN_INDEX" ] && ! grep -q 'isTrustedApiRequest(request, trustedHosts' "$CONN_INDEX"; then
-    echo "VERIFY FAIL: privileged-loopback not applied in dsh-client-connection (upstream changed?)" >&2
-    FAIL=1
+  # marker 前缀匹配：privileged-loopback 或 privileged-loopback:upstream-satisfied 都算通过
+  verify_marker "$CONN_INDEX" privileged-loopback "dsh-client-connection"
+  verify_marker "$LLM_DS" vision-materialize "dsh-llm-deepseek"
+  verify_marker "$APIPROXY" vision-gate "dsh-host-apiproxy"
+  if [ -f "$ICON" ] && [ -f "$MAKE_FAVICON" ]; then
+    verify_marker "$FAVICON" favicon-custom "dsh-web-frontend"
+    if [ -f "$FAVICON" ] && ! grep -qF 'data:image/jpeg;base64' "$FAVICON"; then
+      fail "favicon-custom: favicon.svg 未嵌入 base64 图标"
+    fi
+  else
+    echo "verify: favicon-custom SKIP（镜像内无 icon 资源）"
   fi
-  # 4) vision-materialize marker must exist; original rejection must be gone
-  if [ -f "$LLM_DS" ] && ! grep -q 'materializeImages' "$LLM_DS"; then
-    echo "VERIFY FAIL: vision-materialize not applied in dsh-llm-deepseek (upstream changed?)" >&2
-    FAIL=1
-  fi
-  if [ -f "$LLM_DS" ] && grep -q 'does not support image content' "$LLM_DS"; then
-    echo "VERIFY FAIL: vision-materialize rejection still present in dsh-llm-deepseek" >&2
-    FAIL=1
-  fi
-  # 4b) vision-gate marker must exist; MODEL_DOES_NOT_SUPPORT_IMAGES must be gone
-  if [ -f "$APIPROXY" ] && ! grep -q 'vision-gate: pasted images pass through' "$APIPROXY"; then
-    echo "VERIFY FAIL: vision-gate not applied in dsh-host-apiproxy (upstream changed?)" >&2
-    FAIL=1
-  fi
-  if [ -f "$APIPROXY" ] && grep -q 'MODEL_DOES_NOT_SUPPORT_IMAGES' "$APIPROXY"; then
-    echo "VERIFY FAIL: vision-gate rejection still present in dsh-host-apiproxy" >&2
-    FAIL=1
-  fi
-  # 5) custom favicon must be embedded (icon assets present in image)
-  if [ -f /opt/dsh-icon.jpg ] && [ -f "$FAVICON" ] && ! grep -q 'data:image/jpeg;base64' "$FAVICON"; then
-    echo "VERIFY FAIL: favicon-custom not applied in dsh-web-frontend" >&2
-    FAIL=1
-  fi
-  if [ "$FAIL" = "1" ]; then
-    echo "FATAL: LAN patches could not be applied against this dsh version." >&2
-    echo "Update patch-dsh.sh in github.com/llzg/dsh-docker and re-trigger the build." >&2
-    exit 1
-  fi
-  echo "patch-verify: all LAN patch invariants OK"
 fi
+
+if [ "$FAIL" = "1" ]; then
+  echo "FATAL: LAN patches could not be applied/verified against this dsh version." >&2
+  echo "Update patch-dsh.sh in github.com/llzg/dsh-docker and re-trigger the build." >&2
+  exit 1
+fi
+[ "$STRICT" = "1" ] && echo "patch-verify: all LAN patch invariants OK"
+exit 0
