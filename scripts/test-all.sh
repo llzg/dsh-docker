@@ -43,6 +43,7 @@ run node scripts/test-version-server.js
 run node scripts/test-version-policy.js
 run bash scripts/test-dsh-safe-deploy.sh
 run bash scripts/test-nas-deploy.sh
+run bash scripts/test-migration.sh
 
 echo ""
 if [ "$fails" -eq 0 ]; then

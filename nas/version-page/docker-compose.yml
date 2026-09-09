@@ -1,0 +1,38 @@
+# 版本页（宿主 3082）：独立容器，host 网络，读实时 SSOT，渲染两条通道。
+#
+# 为什么要独立容器：
+#   旧实现把版本页塞在 dsh-proxy-12079 里跑镜像内置的 /opt/version-server.js，
+#   它既读不到工作区实时 SSOT（只有 /opt/dsh-version-ssot.json 兜底快照），
+#   又会因为镜像自带的 HEALTHCHECK 探 3080 而永远 unhealthy。
+#   独立容器 + 挂载新脚本 + --no-healthcheck 解决这两点，且与 DSH 主容器解耦。
+#
+# 用法（在 /volume1/docker/dsh-deploy/version-page 下）：
+#   DSH_SSOT_FILE=/volume1/docker/dsh-alpha5/dsh-root/nas_docker/dsh-version.json \
+#   DSH_VERSION_DATA=/volume1/docker/dsh-alpha5/dsh-data \
+#   DSH_VERSION_DSH_HOME=/data/dsh/test/0.1.2-alpha.5 \
+#   docker compose -p dsh-version up -d
+services:
+  dsh-version:
+    image: ${DSH_IMAGE:-ghcr.io/llzg/dsh-docker:0.1.3-alpha.2}
+    container_name: dsh-version
+    restart: unless-stopped
+    network_mode: host
+    # 镜像自带 HEALTHCHECK 探 3080（本容器没有 dsh web）→ 必须关掉
+    healthcheck:
+      disable: true
+    entrypoint: ["node", "/opt-vs/version-server.js"]
+    environment:
+      DSH_CHANNEL: ${DSH_CHANNEL:-alpha}
+      DSH_VERSION_PORT: "3082"
+      DSH_VERSION_SSOT: /ssot/dsh-version.json
+      # 用于读取该通道的测试/回滚状态（$DSH_HOME/.deploy/<ch>、$DSH_HOME/backups/<ch>）
+      DSH_HOME: ${DSH_VERSION_DSH_HOME:-/data/dsh}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+    volumes:
+      - ./version-server:/opt-vs:ro
+      # 实时 SSOT（必填：不挂它就会退回镜像内置快照）
+      - ${DSH_SSOT_FILE:?DSH_SSOT_FILE 必须指向工作区里的 dsh-version.json}:/ssot/dsh-version.json:ro
+      # 只读挂载该通道的数据目录（仅用于读 .deploy/backups 状态）
+      - ${DSH_VERSION_DATA:-/data/dsh}:/data/dsh:ro

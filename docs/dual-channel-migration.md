@@ -7,7 +7,20 @@
 
 ---
 
-## 0. 迁移前现状（两种起点，先确认你属于哪种）
+## 0. 迁移前现状（三种起点，先确认你属于哪种）
+
+**起点 C（2026-09-10 实测的 UGREEN 现状，最复杂）**
+
+| 组件 | 实况 |
+|---|---|
+| alpha DSH | 容器 `deepseek-harness-alpha`（0.1.3-alpha.2，bridge 172.27.0.4），`DSH_HOME=/data/dsh/test/0.1.2-alpha.5`，数据 `/volume1/docker/dsh-alpha5/` |
+| rc DSH | 容器 `dsh-rc1`（0.1.2-rc.1，bridge 172.27.0.5），`DSH_HOME=/data/dsh`，数据 `/volume1/docker/deepseek-harness/` |
+| 对外入口 | **不是端口映射**：host 网络的 `dsh-proxy`(3081→172.27.0.4:3080) 与 `dsh-proxy-rc`(3083→172.27.0.5:3080) 反代（含 cookie bootstrap / `ownsHost` 注入 / CIDR 白名单 / WS mux） |
+| 版本页 3082 | 旧实现跑在 `dsh-proxy-12079` 容器内（镜像内置 `node /opt/version-server.js`），只读得到 `/opt/dsh-version-ssot.json` 兜底快照 |
+| 实时 SSOT | `/volume1/docker/dsh-alpha5/dsh-root/nas_docker/dsh-version.json`（旧单通道格式） |
+| 遗留 | `deepseek-harness`（0.1.1-rc.2）容器已 Exited |
+
+> 起点 C 的迁移**分两阶段**（见 §8/§9）：Phase 1 零中断，Phase 2 需要维护窗口。
 
 **起点 A：单容器旧拓扑**
 
@@ -130,3 +143,48 @@ docker ps --filter name=dsh-watchdog --format '{{.Names}} {{.Status}}'
 | 回滚报"当前版本不在候选列表" | 该版本镜像 tag 已被清理，或 `.env` 里是 `<ver>-<sha>` 不可变标签 | 手动指定版本：`DSH_CHANNEL=alpha sh rollback.sh 0.1.3-alpha.2` |
 | `compose up` 报 project/卷源断言失败 | 用错了项目名或部署目录（例如在 watchdog 容器里用 `/dsh-app` 路径） | 统一用 `nas/lib.sh:compose_cmd`；watchdog 容器必须宿主同路径挂载 |
 | 端口 3083 被占 | 旧容器或其他应用占用 | 改 SSOT `channels.rc.port` 与 `.env` 的 `DSH_PORT` |
+
+## 8. 起点 C 的 Phase 1（零中断，2026-09-10 已执行）
+
+目标：不重启任何 DSH 容器，先把"版本真相 + 可视 + 通道化资产管理"落地。
+
+1. **升级实时 SSOT 为 schemaVersion 2**（先备份）：
+   `/volume1/docker/dsh-alpha5/dsh-root/nas_docker/dsh-version.json`
+   - `channels.alpha` = port 3081 / container `deepseek-harness-alpha` / dataDir `/volume1/docker/dsh-alpha5` / production `0.1.3-alpha.2`（实际运行版本）/ candidate `0.1.5-alpha.2`
+   - `channels.rc` = port 3083 / container `dsh-rc1` / dataDir `/volume1/docker/deepseek-harness` / production `0.1.2-rc.1`
+   - 旧顶层字段由 `parseSSOT` 归一化，向后兼容。
+2. **替换版本页**：停掉 `dsh-proxy-12079` 里的旧 version-server，改用独立容器
+   `dsh-version`（host 网络 + `--no-healthcheck` + 挂载新脚本与实时 SSOT），见
+   [../nas/version-page/docker-compose.yml](../nas/version-page/docker-compose.yml)。
+   验收：`/version.json` 的 `cache.ssotIsFallback=false`、`channels` 同时含 alpha/rc、
+   alpha 的目标 0.1.5-alpha.2 显示 `targetBuilt=false`（CI 从未构建成功）。
+3. **安装通道化管理资产**到 `/volume1/docker/dsh-deploy`（旧文件自动 `.bak-<ts>`），
+   并把 `dsh-deploy/dsh-version.json` 做成指向实时 SSOT 的符号链接，
+   使 `scripts/dsh-safe-deploy status --channel all` 直接读实时值。
+   宿主缺 semver → 把 `semver` 包放到 `dsh-deploy/scripts/node_modules/`。
+4. **不动**：两个 DSH 容器、两个 proxy 容器、`deepseek-harness` 遗留容器。
+
+回滚 Phase 1：
+```sh
+# SSOT
+sudo cp -p <SSOT>.bak-<ts> <SSOT>
+# 版本页：删新容器，旧版页随 dsh-proxy-12079 重启自动回来
+docker rm -f dsh-version && docker restart dsh-proxy-12079
+# 资产
+cd /volume1/docker/dsh-deploy && for f in *.bak-<ts>; do mv -f "$f" "${f%.bak-<ts>}"; done
+```
+
+## 9. 起点 C 的 Phase 2（需维护窗口，每通道约 1–2 分钟中断）
+
+把每通道改造成**独立 compose 项目**（含其 proxy），让 pin/rollback/watchdog 走统一入口：
+
+1. `nas/docker-compose.yml` 增加两处能力（尚未实施）：
+   - `DSH_HOME` 由环境变量注入（alpha 现在是 `/data/dsh/test/0.1.2-alpha.5`，不能写死 `/data/dsh`）；
+   - 可选 `proxy` 服务：`network_mode: host` + `PORT=<通道端口>` + `BACKEND=http://127.0.0.1:<内部端口>`，
+     DSH 服务把 3080 发布到 `127.0.0.1:<内部端口>`，对外仍只暴露 proxy（保留 CIDR 白名单等特性）。
+2. 每通道：`install.sh` → 停旧容器 → `switch.sh`（compose 接管）→ 健康验证。
+3. 安装 watchdog（按通道管理 compose 项目）。
+4. 观察一周后再删除遗留 `deepseek-harness` 容器与旧 `dsh-deploy` 备份。
+
+风险与回滚：容器名/项目名会变（`deepseek-harness-alpha` → `dsh-alpha`），
+旧容器在验证通过前**只停不删**；回滚 = 停新容器、`docker start <旧容器>`。
