@@ -7,7 +7,9 @@
 
 ---
 
-## 0. 迁移前现状（旧拓扑）
+## 0. 迁移前现状（两种起点，先确认你属于哪种）
+
+**起点 A：单容器旧拓扑**
 
 | 项 | 值 |
 |---|---|
@@ -16,6 +18,17 @@
 | 数据 | `/volume1/docker/deepseek-harness/dsh-data`（DSH_HOME） |
 | workspace | `/volume1/docker/deepseek-harness/dsh-root`（容器内 `/root`，含 `/root/nas_docker`） |
 | 端口 | 3081→3080、3082（版本页） |
+
+**起点 B：已经在跑两个容器（例如 alpha 3081 + rc 3083，但 compose/脚本是手写的、未纳入本仓库）**
+
+```sh
+# 先看清现状：容器名、项目名、镜像、端口、数据目录
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}'
+docker inspect <容器名> --format '{{index .Config.Labels "com.docker.compose.project"}} {{index .Config.Labels "com.docker.compose.project.working_dir"}}'
+docker inspect <容器名> --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+```
+把结果与下面第 1 节的规划表对齐；**容器名/项目名/数据目录不一致时，要么改 SSOT，要么改容器**——两者必须一致，否则
+`nas/lib.sh` 的 `validate_compose_context` 会在 pin 时直接拒绝（这是有意的防线）。
 
 ## 1. 规划
 
@@ -34,11 +47,16 @@
 # 把仓库里的 nas/ 放到 NAS 上（示例）
 #   git clone https://github.com/llzg/dsh-docker.git /volume1/docker/dsh-deploy-src
 #   cp -a /volume1/docker/dsh-deploy-src/nas /volume1/docker/dsh-deploy
+#   cp -a /volume1/docker/dsh-deploy-src/dsh-version.json /volume1/docker/dsh-deploy/   # SSOT：脚本要读
 cd /volume1/docker/dsh-deploy
 
 DSH_CHANNEL=alpha sh install.sh    # 建目录 + 装 compose/.env + watchdog + 预拉镜像
 DSH_CHANNEL=rc    sh install.sh
 ```
+
+> SSOT 位置：`nas/lib.sh` 默认读 `$DSH_SSOT`，未设置时读**脚本同目录**的 `dsh-version.json`；
+> 所以要么按上面把 SSOT 一起放过来，要么显式 `export DSH_SSOT=/path/to/dsh-version.json`。
+> 容器内的版本页另有一条查找链：`$DSH_VERSION_SSOT → /root/nas_docker/dsh-version.json → 镜像内置兜底`。
 
 `install.sh` 做的事：`mkdir -p` 通道目录 → **每次覆盖前时间戳备份** → 安装 compose（base + versionpage override）
 → 写通道身份 `.env` → 创建/更新 watchdog 守护容器（宿主同路径挂载）→ 预拉镜像 → compose 上下文自检。

@@ -66,7 +66,11 @@ async function main() {
   console.log(`ssot: ${ssotFile} primary=${ssot.primaryChannel} channels=${channelNames.join(',')}`);
 
   if (override && !channelNames.includes(policy.channelOf(override))) {
-    throw new Error(`VERSION_OVERRIDE=${override} 的通道 "${policy.channelOf(override)}" 不在 SSOT 通道列表（${channelNames.join(',')}）中`);
+    const all = Object.keys(ssot.channels);
+    const why = all.includes(policy.channelOf(override))
+      ? `（通道 "${policy.channelOf(override)}" 存在于 SSOT，但被 DSH_CHANNELS=${process.env.DSH_CHANNELS} 过滤掉了）`
+      : `（SSOT 通道：${all.join(',')}）`;
+    throw new Error(`VERSION_OVERRIDE=${override} 的通道 "${policy.channelOf(override)}" 不在本次构建的通道列表中 ${why}`);
   }
   if (override && !(sources.npm.versions || []).includes(override)) {
     throw new Error(`version "${override}" 不存在于 npm（不可安装），无法构建`);
