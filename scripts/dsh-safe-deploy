@@ -1,30 +1,35 @@
 #!/usr/bin/env bash
-# dsh-safe-deploy —— DSH 安全升级薄层。
-# 职责边界（不重复实现 Renovate/CI/docker-rollout 的能力）：
+# dsh-safe-deploy —— DSH 安全升级薄层（双通道版，契约 docs/dual-channel.md §5 / §9）
+# 职责边界（不重复实现 Renovate/CI 的能力）：
 #   * check     只读：SSOT + 策略计算（风险/通道/迁移），不接触运行时
 #   * test      数据 snapshot + 隔离测试实例（独立 TEST_DSH_HOME + 端口）
-#   * promote   门禁通过后切换生产（docker-rollout 或 compose + health gate）
-#   * rollback  恢复 OLD_IMAGE + OLD snapshot + env（幂等）
+#   * promote   门禁通过后切换生产：事务化 pin（.env.pending → 校验 → 原子 mv → up --wait）
+#               + 原子落盘 SSOT channels[ch].production（含镜像 digest 记录在 .env）
+#   * rollback  恢复 snapshot + 旧镜像（路径与 SOURCE_HOME 一致，不再硬编码 /data/dsh）
 #   * status    汇总当前/候选/回滚就绪状态
-# 并发：test/promote/rollback 通过 flock 互斥。
+#
+# 通道（所有子命令）：--channel alpha|rc|all（默认 SSOT primaryChannel）
+#   * SSOT 隔离：DSH_SSOT_<CHANNEL> 可指向每通道独立 SSOT 文件（默认共享 dsh-version.json）
+#   * 状态隔离：$STATE_DIR_BASE/<channel>/（deploy.lock、last-test-verdict、日志）
+#   * 数据隔离：DSH_SOURCE_HOME_<CHANNEL> / DSH_TEST_ROOT_<CHANNEL> / DSH_BACKUP_ROOT_<CHANNEL>
+# 并发：test/promote/rollback 通过 flock（$STATE_DIR/deploy.lock）互斥。
+# compose/pin/prev_version 复用 nas/lib.sh（唯一实现，禁止在别处重复 compose 调用）。
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SSOT="${DSH_SSOT:-$REPO_DIR/dsh-version.json}"
-LOCK_FILE="${DSH_DEPLOY_LOCK:-/tmp/dsh-safe-deploy.lock}"
-BACKUP_ROOT="${DSH_BACKUP_ROOT:-/data/dsh/backups}"
-TEST_ROOT="${DSH_TEST_ROOT:-/data/dsh/test}"
-STATE_DIR="${DSH_STATE_DIR:-/data/dsh/.deploy}"
-CONTAINER="${DSH_CONTAINER:-deepseek-harness}"
-COMPOSE_FILE="${DSH_COMPOSE_FILE:-/volume1/docker/deepseek-harness/docker-compose.yml}"
+SSOT_BASE="${DSH_SSOT:-$REPO_DIR/dsh-version.json}"
 IMAGE_BASE="${DSH_IMAGE_BASE:-ghcr.io/llzg/dsh-docker}"
-# 数据源 home（旧 rc.2 拓扑=生产 /data/dsh；新拓扑=当前主力 home，如 /data/dsh/test/0.1.2-alpha.5）
+TRUSTED_HOST="${DSH_TRUSTED_HOST:-192.168.5.17}"
 SOURCE_HOME="${DSH_SOURCE_HOME:-/data/dsh}"
-# /root 挂载源（workspace realpath 成员校验必需；rw 与生产一致）
-ROOT_SOURCE="${DSH_ROOT_SOURCE:-/volume1/docker/deepseek-harness/dsh-root}"
-TRUSTED_HOST="${DSH_TRUSTED_HOST:-192.168.5.16}"
+ORIG_ROOT_SOURCE="${DSH_ROOT_SOURCE:-}"
+# 全局（非通道）取值快照：resolve_channel 会导出 DSH_* 供 lib.sh 使用，
+# 必须用快照避免 --channel all 时上一通道的值污染下一通道
+ORIG_DEPLOY_DIR="${DSH_DEPLOY_DIR:-}"
+ORIG_CONTAINER="${DSH_CONTAINER:-}"
+ORIG_PROJECT="${DSH_PROJECT:-}"
+ORIG_PORT="${DSH_PORT:-}"
 
-# 需要 docker 的命令在无 socket 时明确失败而非静默跳过
+# ── 工具 ──────────────────────────────────────────────────────────────────
 require_docker() {
   if ! docker info >/dev/null 2>&1; then
     echo "ERROR: docker daemon 不可用（需在 NAS 宿主上执行，且容器需挂载 docker.sock）" >&2
@@ -32,37 +37,179 @@ require_docker() {
   fi
 }
 
-json_get() { node -e "const s=require('fs').readFileSync(process.argv[1],'utf8');const j=JSON.parse(s);console.log(JSON.stringify(j[process.argv[2]]??''))" "$1" "$2"; }
-
-policy_json() {
-  node "$REPO_DIR/scripts/safe-deploy-policy.js" --json --ssot "$SSOT" 2>/dev/null \
-    || node -e "
-      const p = require('$REPO_DIR/scripts/safe-deploy-policy.js');
-      const r = p.computeAll({ ssotFile: process.argv[1] });
-      console.log(JSON.stringify(r, null, 2));
-    " "$SSOT"
+json_field() { # <json> <key>
+  printf '%s' "$1" | node -e '
+    let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+      try{const j=JSON.parse(s);const v=j[process.argv[1]];
+        process.stdout.write(v==null?"":(typeof v==="object"?JSON.stringify(v):String(v)));
+      }catch(e){process.exit(1)}
+    })' "$2"
 }
 
-with_lock() {
-  local action="$1"; shift
-  local lock
-  mkdir -p "$STATE_DIR"
-  exec 9>"$LOCK_FILE"
-  if ! flock -n 9; then
-    echo "LOCKED: 另一 dsh-safe-deploy 操作进行中（$LOCK_FILE）；并发 promote/test/rollback 已阻止" >&2
-    exit 3
+resolve_lib() {
+  local c
+  for c in "${DSH_LIB_SH:-}" "$REPO_DIR/nas/lib.sh" "$REPO_DIR/../nas/lib.sh" "$REPO_DIR/lib.sh"; do
+    if [ -n "$c" ] && [ -f "$c" ]; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+LIB_SH="$(resolve_lib)" || {
+  echo "ERROR: 找不到 nas/lib.sh（设置 DSH_LIB_SH 指向它）—— compose/pin/prev_version 依赖它" >&2
+  exit 1
+}
+
+ssot_primary_channel() {
+  node -e '
+    const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));
+    process.stdout.write(String(j.primaryChannel||""));
+  ' "$SSOT_BASE" 2>/dev/null || true
+}
+
+all_channels() {
+  local out
+  out=$(node -e '
+    const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));
+    process.stdout.write(Object.keys(j.channels||{}).join("\n"));
+  ' "$SSOT_BASE" 2>/dev/null || true)
+  if [ -n "$out" ]; then printf '%s\n' "$out"; else printf 'alpha\nrc\n'; fi
+}
+
+# 解析通道：设置 CH/CH_UP/SSOT/SOURCE_HOME/TEST_ROOT/BACKUP_ROOT/STATE_DIR，
+# 导出 lib.sh 需要的环境变量并 source 之（lib_init 会按 SSOT 解析 DIR/PROJECT/CONTAINER/STATE）。
+resolve_channel() {
+  local ch="$1"
+  local ch_up ssot_var sh_var tr_var br_var sd_var ddir cvar pvar portvar
+  ch_up="$(printf '%s' "$ch" | tr 'a-z' 'A-Z')"
+  ssot_var="DSH_SSOT_$ch_up"
+  SSOT="${!ssot_var:-$SSOT_BASE}"
+
+  sh_var="DSH_SOURCE_HOME_$ch_up"
+  SOURCE_HOME="${!sh_var:-${DSH_SOURCE_HOME:-/data/dsh}}"
+  tr_var="DSH_TEST_ROOT_$ch_up"
+  TEST_ROOT="${!tr_var:-${DSH_TEST_ROOT:-$SOURCE_HOME/test}}"
+  br_var="DSH_BACKUP_ROOT_$ch_up"
+  BACKUP_ROOT="${!br_var:-${DSH_BACKUP_ROOT:-$SOURCE_HOME/backups}}"
+  sd_var="DSH_STATE_DIR_$ch_up"
+  STATE_DIR_BASE="${!sd_var:-${DSH_STATE_DIR:-$SOURCE_HOME/.deploy}}"
+  STATE_DIR="$STATE_DIR_BASE/$ch"
+  ddir="DSH_DEPLOY_DIR_$ch_up"
+  cvar="DSH_CONTAINER_$ch_up"
+  pvar="DSH_PROJECT_$ch_up"
+  portvar="DSH_PORT_$ch_up"
+  rvar="DSH_ROOT_SOURCE_$ch_up"
+
+  CH="$ch"
+  # 目录按需创建；check/status 是只读命令，创建失败不得中断（如 /data 不可写）
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  mkdir -p "$TEST_ROOT" 2>/dev/null || true
+  mkdir -p "$BACKUP_ROOT" 2>/dev/null || true
+
+  export DSH_CHANNEL="$ch"
+  export DSH_SSOT="$SSOT"
+  export DSH_DEPLOY_STATE="$STATE_DIR_BASE"
+  export DSH_DEPLOY_DIR="${!ddir:-$ORIG_DEPLOY_DIR}"
+  export DSH_CONTAINER="${!cvar:-$ORIG_CONTAINER}"
+  export DSH_PROJECT="${!pvar:-$ORIG_PROJECT}"
+  export DSH_PORT="${!portvar:-$ORIG_PORT}"
+  export DSH_LOCK_FILE="$STATE_DIR/deploy.lock"
+  export DSH_TRUSTED_HOST="$TRUSTED_HOST"
+  export DSH_IMAGE_BASE="$IMAGE_BASE"
+
+  # shellcheck disable=SC1090
+  . "$LIB_SH"
+
+  # /root 挂载源：默认取本通道 compose 目录下的 dsh-root（与 compose 的 ./dsh-root:/root 对齐）
+  ROOT_SOURCE="${!rvar:-${ORIG_ROOT_SOURCE:-$DIR/dsh-root}}"
+}
+
+# ── 策略层（契约 §5）──────────────────────────────────────────────────────
+ssot_channel_policy_json() { # <channel> —— 策略层未实现 --channel 时的兜底（仅 SSOT 可解析字段）
+  node -e '
+    const fs=require("fs");
+    const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+    const ch=process.argv[2];
+    const primary=j.primaryChannel||"alpha";
+    const c=(j.channels||{})[ch]||{};
+    const prod=c.production||(ch===primary?(j.productionChannel||j.version||""):"");
+    const cand=c.candidate||(ch===primary?(j.testCandidate||""):"");
+    process.stdout.write(JSON.stringify({
+      channel:ch, compatFallback:true,
+      currentVersion:prod, productionChannel:prod, testCandidate:cand,
+      targetChannel:"", upgradeRisk:"UNKNOWN", migrationStatus:"none",
+      dataIsolationRequired:false, candidateIsNewer:!!cand&&cand!==prod,
+      promoteBlocked:false, otherBlockers:[], pluginBlockers:[], pluginWarnings:[], pluginClass:{},
+      requiredRuntimeDependencies:j.requiredPlugins||[], optionalPlugins:j.optionalPlugins||[],
+      pluginCompat:j.pluginCompat||{}, ssotSource:j.source||"unknown", ssotUpdatedAt:j.updatedAt||null,
+      port:c.port, container:c.container, project:c.project
+    },null,2));
+  ' "$SSOT" "$1"
+}
+
+policy_json() { # <channel>
+  local ch="$1" out have
+  out=$(node "$REPO_DIR/scripts/safe-deploy-policy.js" --json --ssot "$SSOT" --channel "$ch" 2>/dev/null) || out=""
+  if [ -z "$out" ]; then
+    out=$(node -e '
+      const p=require(process.argv[1]);
+      const r=p.computeAll({ssotFile:process.argv[2]});
+      process.stdout.write(JSON.stringify(r,null,2));
+    ' "$REPO_DIR/scripts/safe-deploy-policy.js" "$SSOT" 2>/dev/null) || out=""
   fi
-  "$action" "$@"
+  [ -n "$out" ] || { echo "ERROR: 策略层无法计算（ssot=$SSOT channel=$ch）" >&2; return 1; }
+  have=$(json_field "$out" channel 2>/dev/null || true)
+  if [ -z "$have" ]; then
+    echo "WARN: safe-deploy-policy.js 未返回 channel 字段（契约 §5 尚未实现 --channel）" >&2
+    echo "WARN: 回退读取 SSOT channels[$ch] 字段（upgradeRisk=UNKNOWN，promote 门禁请人工确认）" >&2
+    out=$(ssot_channel_policy_json "$ch")
+  elif [ "$have" != "$ch" ]; then
+    echo "WARN: 策略层返回 channel=$have，与请求 channel=$ch 不一致（已按请求通道继续）" >&2
+  fi
+  printf '%s\n' "$out"
 }
 
-snapshot_dsh() {
-  local ver="$1"
-  local ts
+channel_target() { # <policy-json>
+  local t
+  t=$(json_field "$1" testCandidate 2>/dev/null || true)
+  [ "$t" = "(none)" ] && t=""
+  printf '%s' "$t"
+}
+
+# ── 命令 ──────────────────────────────────────────────────────────────────
+cmd_check() { # <channel>
+  echo "== dsh-safe-deploy check (channel=$1) =="
+  policy_json "$1"
+}
+
+cmd_status() { # <channel>
+  echo "== dsh-safe-deploy status (channel=$1) =="
+  local pj snap cur reason prev
+  pj="$(policy_json "$1")"
+  printf '%s\n' "$pj"
+  snap="$(ls -dt "$BACKUP_ROOT"/* 2>/dev/null | head -1 || true)"
+  echo "stateDir: $STATE_DIR"
+  echo "sourceHome: $SOURCE_HOME"
+  echo "composeDir: $DIR"
+  echo "project: $PROJECT container: $CONTAINER"
+  echo "latestSnapshot: ${snap:-none}"
+  if [ -n "$snap" ]; then echo "rollbackReady: yes (snapshot: $snap)"; else echo "rollbackReady: no (无 snapshot)"; fi
+  cur="$(current_version)"
+  reason="$(env_get DSH_PIN_REASON)"
+  echo "currentVersion: ${cur:-unknown} (pinReason: ${reason:-none})"
+  if [ -n "$cur" ]; then
+    if prev="$(prev_version "$cur" 2>/dev/null)"; then
+      echo "prevVersion: $prev"
+    else
+      echo "prevVersion: unavailable（当前版本不在候选列表或 GHCR 不可达）"
+    fi
+  fi
+}
+
+snapshot_dsh() { # <ver>
+  local ver="$1" ts dst
   ts="$(date +%Y%m%d-%H%M%S)"
-  local dst="$BACKUP_ROOT/${ver:-unknown}-$ts"
+  dst="$BACKUP_ROOT/${ver:-unknown}-$ts"
   mkdir -p "$dst"
   echo "snapshot: $SOURCE_HOME -> $dst" >&2
-  # 排除可重建/超大目录：node_modules、pnpm store、测试目录、历史备份
   tar -C "$SOURCE_HOME" -cf - \
       --exclude='profiles/web/node_modules' \
       --exclude='profiles/headless/node_modules' \
@@ -71,7 +218,7 @@ snapshot_dsh() {
       --exclude='backups' \
       --exclude='.deploy' \
       . 2>/dev/null | tar -C "$dst" -xf -
-  # 校验 snapshot 完整性（关键路径 + 权限位）
+  local required
   for required in profiles/web/package.json settings.yaml .credentials.yaml; do
     if [ ! -e "$dst/$required" ]; then
       echo "BLOCKED: snapshot 不完整（缺少 $dst/$required）" >&2
@@ -82,44 +229,27 @@ snapshot_dsh() {
   echo "$dst"
 }
 
-cmd_check() {
-  echo "== dsh-safe-deploy check =="
-  policy_json
-}
-
-cmd_status() {
-  echo "== dsh-safe-deploy status =="
-  policy_json
-  local pj; pj="$(policy_json)"
-  local snap="$(ls -dt "$BACKUP_ROOT"/* 2>/dev/null | head -1 || true)"
-  echo "latestSnapshot: ${snap:-none}"
-  if [ -n "$snap" ]; then echo "rollbackReady: yes (snapshot: $snap)"; else echo "rollbackReady: no (无 snapshot)"; fi
-}
-
-cmd_test() {
+cmd_test() { # <channel>
   require_docker
   local verdict_file="$STATE_DIR/last-test-verdict"
-  local pj; pj="$(policy_json)"
-  local target; target="$(echo "$pj" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).testCandidate||''))")"
-  local risk; risk="$(echo "$pj" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).upgradeRisk||''))")"
-  [ -n "$target" ] || { echo "BLOCKED: testCandidate 为空" >&2; exit 1; }
-  echo "test: target=$target risk=$risk"
+  local pj target risk snap host_dsh host_data test_home_cont test_home port cname net ok i tok cip
+  pj="$(policy_json "$CH")"
+  target="$(channel_target "$pj")"
+  risk="$(json_field "$pj" upgradeRisk || true)"
+  [ -n "$target" ] || { echo "BLOCKED: testCandidate 为空（channel=$CH）" >&2; exit 1; }
+  echo "test: channel=$CH target=$target risk=$risk sourceHome=$SOURCE_HOME testRoot=$TEST_ROOT"
 
-  local snap; snap="$(snapshot_dsh "$target")" || exit 1
-  # 容器内执行时 /data/dsh 挂自宿主 dsh-data：docker -v 的源路径需宿主视角
-  local host_dsh
-  host_dsh="$(docker inspect "$CONTAINER" --format '{{range .HostConfig.Binds}}{{println .}}{{end}}' 2>/dev/null | awk -F: '$2=="/data/dsh"{print $1; exit}')"
-  local host_data="${host_dsh:-/data/dsh}"
-  local test_home_cont="$TEST_ROOT/$target"
-  local test_home="$host_data/test/$target"
+  snap="$(snapshot_dsh "$target")" || exit 1
+  host_dsh="$(docker inspect "$CONTAINER" --format '{{range .HostConfig.Binds}}{{println .}}{{end}}' 2>/dev/null \
+      | awk -F: '$2=="/data/dsh"{print $1; exit}')"
+  host_data="${host_dsh:-$SOURCE_HOME}"
+  test_home_cont="$TEST_ROOT/$target"
+  # 容器内执行时 /data/dsh 挂自宿主 dsh-data；host 视角路径用于 -v
+  test_home="$host_data/test/$target"
   rm -rf "$test_home_cont"; mkdir -p "$test_home_cont"
-  # 用 snapshot 构建隔离 TEST_DSH_HOME（保留权限/owner/hidden/symlink）
   tar -C "$snap" -cf - . | tar -C "$test_home_cont" -xf -
-  # 恢复 profile 树外 bundle（snapshot 排除 node_modules；从数据源 home 复制——
-  # codex/claude bundle rc.8 已实测兼容 alpha 线 host；bundles 列表已排除 siliconflow，包在但不加载）
   [ -d "$SOURCE_HOME/profiles/web/node_modules" ] && cp -a "$SOURCE_HOME/profiles/web/node_modules" "$test_home_cont/profiles/web/"
   [ -d "$SOURCE_HOME/profiles/headless" ] && [ -d "$SOURCE_HOME/profiles/headless/node_modules" ] && cp -a "$SOURCE_HOME/profiles/headless/node_modules" "$test_home_cont/profiles/headless/"
-  # Codex 认证（test 专用副本，不共享生产 /root/.codex）：优先取数据源 home 内的 .codex
   if [ -d "$SOURCE_HOME/.codex" ]; then
     cp -a "$SOURCE_HOME/.codex" "$test_home_cont/.codex" && echo "CODEX_HOME 副本(源 home): $test_home_cont/.codex"
   elif [ -d /root/.codex ]; then
@@ -127,32 +257,26 @@ cmd_test() {
   fi
   echo "TEST_DSH_HOME=$test_home_cont (host: $test_home)"
 
-  local port; port="${DSH_TEST_PORT:-$(( ( RANDOM % 1000 ) + 12000 ))}"
-  local cname="${CONTAINER}-test-$$"
-  # test 容器加入生产网络（compose project 网络），使探活可直达 test IP；
-  # 数据仍完全隔离（只挂 TEST_DSH_HOME，不挂生产 DSH_HOME）。
-  local net
+  port="${DSH_TEST_PORT:-$(( ( RANDOM % 1000 ) + 12000 ))}"
+  cname="${CONTAINER}-test-$$"
   net="$(docker inspect "$CONTAINER" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null || true)"
   echo "test container: $cname on :$port (network: ${net:-default})"
   docker run -d --name "$cname" \
     -e DSH_HOME="$test_home_cont" -e DSH_TELEMETRY_DISABLED=1 \
+    -e DSH_CHANNEL="$CH" \
     -e CODEX_HOME="$test_home_cont/.codex" \
     -p "0.0.0.0:$port:3080" \
     ${net:+--network "$net"} \
     -v "$test_home:$test_home_cont" \
     -v "$ROOT_SOURCE:/root:rw" \
     "${IMAGE_BASE}:${target}" dsh --profile web --no-open --host 127.0.0.1 --trusted-host "$TRUSTED_HOST" >/dev/null
-  # DSH_TEST_KEEP=1 时保留测试容器（深度 gate/浏览器验收用），否则退出即清理
   if [ "${DSH_TEST_KEEP:-0}" != "1" ]; then
     trap 'docker rm -f "$cname" >/dev/null 2>&1 || true' EXIT
   fi
 
-  local ok=1 i tok cip
-  # 容器内执行 docker test 时：docker -p 映射在宿主 netns，本容器 curl 127.0.0.1 访问不到；
-  # 用 test 容器 IP 直连（同 bridge 网络）。
+  ok=1
   cip="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$v.IPAddress}}{{end}}' "$cname" 2>/dev/null || true)"
   for i in $(seq 1 40); do
-    # 0.1.2-alpha.3+ 默认 token 认证：从容器日志提取 token 探活（base64url 含 -_）
     tok="$(docker logs "$cname" 2>/dev/null | grep -oE 'token=[A-Za-z0-9_-]+' | head -1 | sed 's/token=//' || true)"
     if { [ -n "$tok" ] && [ -n "$cip" ] && curl -sf "http://$cip:3080/?token=$tok" >/dev/null 2>&1; } \
        || { [ -n "$cip" ] && curl -sf "http://$cip:3080/" >/dev/null 2>&1; }; then
@@ -160,81 +284,191 @@ cmd_test() {
     fi
     sleep 5
   done
-  if [ "$ok" -ne 0 ]; then echo "FAIL: test instance 未就绪"; echo "TEST_VERDICT=FAIL" | tee "$verdict_file"; exit 1; fi
+  if [ "$ok" -ne 0 ]; then
+    echo "FAIL: test instance 未就绪"
+    echo "TEST_VERDICT=FAIL" | tee "$verdict_file"
+    exit 1
+  fi
   echo "TEST_VERDICT=PASS" | tee "$verdict_file"
   echo "MANUAL_CHECK_REQUIRED: mobile_vpn_reconnect, real_provider_chat, plugin_business_behavior"
 }
 
-cmd_promote() {
-  require_docker
-  local pj; pj="$(policy_json)"
-  local target; target="$(echo "$pj" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).testCandidate||''))")"
-  local risk; risk="$(echo "$pj" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).upgradeRisk||''))")"
-  local verdict="$(cat "$STATE_DIR/last-test-verdict" 2>/dev/null || echo NOT_RUN)"
-
-  [ "$verdict" = "TEST_VERDICT=PASS" ] || { echo "BLOCKED: test 未 PASS（$verdict）" >&2; exit 1; }
-  case "$risk" in HIGH|BLOCKED) echo "BLOCKED: risk=$risk 需人工审批（--force 可覆盖 HIGH）"; [ "${1:-}" = "--force" ] || exit 1;; esac
-  echo "promote: $target (risk=$risk)"
-  local digest; digest="$(docker inspect --format '{{.Image}}' "$CONTAINER" 2>/dev/null || echo old-image)"
-  echo "old image digest: $digest"
-
-  if docker rollout "$CONTAINER" 2>/dev/null; then
-    echo "deploy: docker rollout $CONTAINER"
-  else
-    echo "deploy: docker-rollout 不可用，回退 compose + health gate"
-    ( cd "$(dirname "$COMPOSE_FILE")" && DSH_IMAGE="$IMAGE_BASE:$target" docker compose -f "$COMPOSE_FILE" up -d --force-recreate )
-  fi
-  # 更新 SSOT：productionChannel/version = target
-  node -e "
-    const fs=require('fs');const f=process.argv[1];
-    const j=JSON.parse(fs.readFileSync(f,'utf8'));
-    j.productionChannel=j.version=process.argv[2];
-    j.updatedAt=new Date().toISOString(); j.source='promote';
-    fs.writeFileSync(f, JSON.stringify(j,null,2)+'\n');
-  " "$SSOT" "$target"
-  echo "promote done: production=$target"
+# 原子落盘 SSOT：channels[<ch>].production = <ver>（primaryChannel 同时镜像到顶层兼容字段）
+ssot_set_production() { # <channel> <version>
+  node -e '
+    const fs=require("fs");
+    const f=process.argv[1], ch=process.argv[2], v=process.argv[3];
+    const j=JSON.parse(fs.readFileSync(f,"utf8"));
+    j.schemaVersion=j.schemaVersion||2;
+    j.channels=j.channels||{};
+    j.channels[ch]=Object.assign({}, j.channels[ch], {production:v});
+    j.updatedAt=new Date().toISOString();
+    j.source="promote";
+    const primary=j.primaryChannel||"alpha";
+    if(ch===primary){ j.version=v; j.productionChannel=v; }
+    const tmp=f+".tmp."+process.pid;
+    fs.writeFileSync(tmp, JSON.stringify(j,null,2)+"\n");
+    fs.renameSync(tmp,f);
+    process.stdout.write(JSON.stringify({channel:ch,production:v,primary:primary}));
+  ' "$SSOT" "$1" "$2"
 }
 
-cmd_rollback() {
+promote_locked() { # <target> [force]
+  local target="$1" force="${2:-}" risk digest old_digest
+  local pj verdict
+  pj="$(policy_json "$CH")"
+  risk="$(json_field "$pj" upgradeRisk || true)"
+  verdict="$(cat "$STATE_DIR/last-test-verdict" 2>/dev/null || echo NOT_RUN)"
+
+  [ "$verdict" = "TEST_VERDICT=PASS" ] || { echo "BLOCKED: test 未 PASS（$verdict）" >&2; exit 1; }
+  case "$risk" in
+    HIGH|BLOCKED|UNKNOWN|"")
+      echo "BLOCKED: risk=${risk:-UNKNOWN} 需人工审批（--force 可覆盖 HIGH/UNKNOWN）"
+      [ "$force" = "--force" ] || exit 1
+      ;;
+  esac
+  echo "promote: channel=$CH target=$target (risk=$risk)"
+
+  old_digest="$(image_digest "$IMAGE_BASE:$(current_version)")"
+  echo "old image digest: ${old_digest:-unknown}"
+
+  # 事务化 pin（nas/lib.sh：.env.pending → project/卷源断言 → 原子 mv → up --wait/健康轮询）
+  # reason=manual：promote 是人工决策，watchdog 不得自动回滚它
+  if ! docker pull "$IMAGE_BASE:$target" >/dev/null 2>&1; then
+    echo "ERROR: 镜像拉取失败 $IMAGE_BASE:$target（.env 未改动）" >&2
+    exit 1
+  fi
+  digest="$(image_digest "$IMAGE_BASE:$target")"
+  pin_version_locked "$target" manual "$digest" || { echo "ERROR: pin 失败（已还原旧 .env）" >&2; exit 1; }
+  echo "pin: $DIR/.env -> $IMAGE_BASE:$target (digest=${digest:-unknown})"
+
+  # 原子更新 SSOT 对应通道 production
+  local res
+  res="$(ssot_set_production "$CH" "$target")" || { echo "ERROR: SSOT 更新失败（容器已 pin 到 $target，请人工修 SSOT）" >&2; exit 1; }
+  echo "ssot: $res"
+  echo "promote done: channel=$CH production=$target digest=${digest:-unknown}"
+}
+
+cmd_promote() { # <channel> [--force]
   require_docker
-  local snap="$(ls -dt "$BACKUP_ROOT"/* 2>/dev/null | head -1 || true)"
-  [ -n "$snap" ] || { echo "BLOCKED: 无可用 snapshot" >&2; exit 1; }
-  echo "rollback: 恢复 snapshot $snap"
-  # 1) 恢复旧镜像（来自 snapshot 目录名中的版本，或 DSH_ROLLBACK_IMAGE）
-  local ver="${DSH_ROLLBACK_VERSION:-$(basename "$snap" | sed 's/-[0-9-]*$//')}"
-  local img="${DSH_ROLLBACK_IMAGE:-$IMAGE_BASE:$ver}"
-  echo "  image: $img"
-  docker pull "$img" >/dev/null 2>&1 || echo "  WARN: 镜像拉取失败（可能已在本地）"
-  # 2) 恢复数据：先移动当前数据到 .pre-rollback-<ts>，再解包 snapshot
-  local ts="$(date +%Y%m%d-%H%M%S)"
-  [ -d /data/dsh ] && mv /data/dsh "/data/dsh.pre-rollback-$ts" 2>/dev/null || true
-  mkdir -p /data/dsh
-  tar -C "$snap" -cf - . | tar -C /data/dsh -xf -
-  # 3) 切换镜像（compose pin）
-  ( cd "$(dirname "$COMPOSE_FILE")" && printf 'DSH_IMAGE=%s:%s\n' "$IMAGE_BASE" "$ver" > .env && DSH_IMAGE="$IMAGE_BASE:$ver" docker compose -f "$COMPOSE_FILE" up -d --force-recreate )
-  echo "ROLLBACK_VERDICT=done (image=$img data=$snap)"
-  echo "回滚后验证: docker ps / curl -f http://127.0.0.1:3080/ / session/credentials/health"
+  local ch="$1" force="${2:-}" target
+  target="$(channel_target "$(policy_json "$ch")")"
+  [ -n "$target" ] || { echo "BLOCKED: testCandidate 为空（channel=$ch）" >&2; exit 1; }
+  promote_locked "$target" "$force"
+}
+
+rollback_locked() { # <channel>
+  local snap ver img ts moved
+  snap="$(ls -dt "$BACKUP_ROOT"/* 2>/dev/null | head -1 || true)"
+  [ -n "$snap" ] || { echo "BLOCKED: 无可用 snapshot（$BACKUP_ROOT）" >&2; exit 1; }
+  ver="${DSH_ROLLBACK_VERSION:-$(basename "$snap" | sed 's/-[0-9-]*$//')}"
+  img="${DSH_ROLLBACK_IMAGE:-$IMAGE_BASE:$ver}"
+  echo "rollback: channel=$CH snapshot=$snap image=$img sourceHome=$SOURCE_HOME"
+  local cur_ver cmp
+  cur_ver="$(current_version)"
+  if [ -n "$cur_ver" ] && [ "$ver" != "$cur_ver" ]; then
+    if cmp="$(semver_cmp "$ver" "$cur_ver" 2>/dev/null)"; then
+      [ "$cmp" = "1" ] && echo "WARN: snapshot 版本 $ver 高于当前 $cur_ver —— 这是前进而非回退，请确认是否预期" >&2
+    fi
+  fi
+
+  # 1) 恢复数据到 SOURCE_HOME（不再硬编码 /data/dsh —— 与 snapshot 的来源对称）
+  ts="$(date +%Y%m%d-%H%M%S)"
+  moved=""
+  if [ -d "$SOURCE_HOME" ]; then
+    if mv "$SOURCE_HOME" "$SOURCE_HOME.pre-rollback-$ts" 2>/dev/null; then
+      moved="$SOURCE_HOME.pre-rollback-$ts"
+      # snapshot 可能就在 SOURCE_HOME 内（BACKUP_ROOT 默认 $SOURCE_HOME/backups）：跟随移动
+      case "$snap" in
+        "$SOURCE_HOME"/*) snap="$moved/${snap#"$SOURCE_HOME"/}" ;;
+      esac
+    fi
+  fi
+  mkdir -p "$SOURCE_HOME"
+  tar -C "$snap" -cf - . | tar -C "$SOURCE_HOME" -xf -
+  echo "  data restored: $snap -> $SOURCE_HOME (previous: ${moved:-in-place, mv skipped})"
+
+  # 2) 事务化 pin 回旧镜像（校验 project/卷源；失败自动还原旧 .env）
+  if ! pin_version_locked "$ver" manual; then
+    echo "ERROR: 回滚 pin 失败（.env 已还原；数据已恢复，请人工核对）" >&2
+    exit 1
+  fi
+  echo "ROLLBACK_VERDICT=done (channel=$CH image=$img data=$snap)"
+  echo "回滚后验证: docker ps / curl -f http://127.0.0.1:${PORT}/ / session/credentials/health"
+}
+
+cmd_rollback() { # <channel>
+  require_docker
+  rollback_locked
 }
 
 usage() {
   cat <<EOF
-dsh-safe-deploy <command> [args]
+dsh-safe-deploy <command> [--channel alpha|rc|all] [args]
 
 commands:
   check                 只读输出升级状态（版本/通道/风险/迁移/隔离要求）
   test                  snapshot + 隔离测试实例（独立 TEST_DSH_HOME/端口）
-  promote [--force]     门禁通过后切换生产（prerelease 需显式 --force）
+  promote [--force]     门禁通过后事务化 pin + 原子更新 SSOT production（prerelease 需 --force）
   rollback              恢复最近 snapshot + 旧镜像（幂等）
-  status                汇总状态 + 最近 snapshot + rollbackReady
+  status                汇总状态 + 最近 snapshot + rollbackReady + 当前 pin
+
+--channel 默认取 SSOT primaryChannel；check/status 支持 all（逐通道输出）；
+test/promote/rollback 必须指定单一通道（避免跨通道误写）。
+状态目录：\$DSH_STATE_DIR/<channel>/；日志：\$STATE/<channel>-{rollback,watchdog}.log
 EOF
 }
 
-[ $# -ge 1 ] || { usage; exit 1; }
-case "$1" in
-  check)   cmd_check ;;
-  status)  cmd_status ;;
-  test)    with_lock cmd_test ;;
-  promote) with_lock cmd_promote "${2:-}" ;;
-  rollback) with_lock cmd_rollback ;;
+# ── 参数解析 ──────────────────────────────────────────────────────────────
+CH_OPT=""
+FORCE=""
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --channel)   CH_OPT="${2:-}"; shift 2 || true ;;
+    --channel=*) CH_OPT="${1#*=}"; shift ;;
+    --force)     FORCE="--force"; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+CMD="${POSITIONAL[0]:-}"
+[ -n "$CMD" ] || { usage; exit 1; }
+
+if [ -z "$CH_OPT" ]; then
+  CH_OPT="$(ssot_primary_channel)"
+  [ -n "$CH_OPT" ] || CH_OPT="alpha"
+fi
+
+case "$CH_OPT" in
+  alpha|beta|rc|stable) CHANNELS=("$CH_OPT") ;;
+  all) mapfile -t CHANNELS < <(all_channels) ;;
+  *) echo "ERROR: 非法 --channel '$CH_OPT'（alpha|rc|all）" >&2; exit 1 ;;
+esac
+
+case "$CMD" in
+  check|status)
+    for ch in "${CHANNELS[@]}"; do
+      resolve_channel "$ch"
+      if [ "$CMD" = check ]; then cmd_check "$ch"; else cmd_status "$ch"; fi
+      echo
+    done
+    ;;
+  test)
+    [ "${#CHANNELS[@]}" -eq 1 ] || { echo "ERROR: test 必须指定单一 --channel（收到 ${#CHANNELS[@]} 个）" >&2; exit 1; }
+    resolve_channel "${CHANNELS[0]}"
+    with_lock cmd_test "${CHANNELS[0]}"
+    ;;
+  promote)
+    [ "${#CHANNELS[@]}" -eq 1 ] || { echo "ERROR: promote 必须指定单一 --channel（收到 ${#CHANNELS[@]} 个）" >&2; exit 1; }
+    resolve_channel "${CHANNELS[0]}"
+    with_lock cmd_promote "${CHANNELS[0]}" "$FORCE"
+    ;;
+  rollback)
+    [ "${#CHANNELS[@]}" -eq 1 ] || { echo "ERROR: rollback 必须指定单一 --channel（收到 ${#CHANNELS[@]} 个）" >&2; exit 1; }
+    resolve_channel "${CHANNELS[0]}"
+    with_lock cmd_rollback "${CHANNELS[0]}"
+    ;;
   *) usage; exit 1 ;;
 esac

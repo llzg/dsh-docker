@@ -1,18 +1,43 @@
+# DSH 双通道部署 compose（契约：docs/dual-channel.md §2 / §6 / §9）
+#
+# 每通道一个 compose 项目：项目名 = DSH_PROJECT，容器名 = DSH_CONTAINER。
+# ⚠ 所有调用必须走 nas/lib.sh 的 compose_cmd()：
+#     docker compose -p "$DSH_PROJECT" --project-directory "$DIR" -f "$DIR/docker-compose.yml"
+#   否则 compose 会用挂载目录名推断 project name（历史上把项目解析成 dsh-app、
+#   把卷源解析成 /dsh-app/dsh-data 的 P0 事故），并在 pin 时被 validate_compose_context 拒绝。
+#
+# 可选 override（compose_cmd 自动按存在性追加 -f）：
+#   docker-compose.versionpage.yml  DSH_VERSION_PORT != 0 时挂版本页端口（alpha=3082）
+#   docker-compose.igpu.yml         Intel 核显直通（由 apply-igpu.sh 生成；base 不硬依赖）
+name: ${DSH_PROJECT:-dsh-alpha}
+
 services:
-  deepseek-harness:
+  dsh:
     # DSH 版本更新机制（2026-09 起）：
     #   Renovate(发现/SSOT) → CI(immutable build) → dsh-safe-deploy(隔离测试+promote+rollback)
     # DSH 已退出 Watchtower 自动替换（label 禁用）；watchtower 仅保留给无状态/低风险容器。
-    # 回滚：dsh-safe-deploy rollback（恢复旧 image + snapshot + env），不依赖 tag 覆盖。
-    image: ${DSH_IMAGE:-ghcr.io/llzg/dsh-docker:0.1.1-rc.2}
-    container_name: deepseek-harness
+    # 回滚：dsh-safe-deploy rollback / nas/rollback.sh（恢复旧 image + snapshot + .env 钉住）。
+    # ⚠ 必填、无默认值：latest 只由 stable 通道发布（实测停在 0.1.1-rc.2），
+    # 用 ${DSH_IMAGE:-…:latest} 会让漏配 .env 的场景静默降级到旧版本。
+    # 缺 DSH_IMAGE 时 compose config/up 直接报错，而不是悄悄跑旧版本。
+    image: "${DSH_IMAGE:?DSH_IMAGE 未设置：请先运行 install.sh 生成 .env}"
+    container_name: ${DSH_CONTAINER:-dsh-alpha}
     restart: unless-stopped
     ports:
-      - "3081:3080"
-      - "3082:3082"
+      - "${DSH_PORT:-3081}:3080"
     environment:
       - DSH_HOME=/data/dsh
+      - DSH_CHANNEL=${DSH_CHANNEL:-alpha}
       - DSH_TELEMETRY_DISABLED=1
+      # --trusted-host 不再硬编码在 Dockerfile CMD（契约 §6）
+      - DSH_TRUSTED_HOST=${DSH_TRUSTED_HOST:-192.168.5.17}
+      # 0 = 不启动容器内版本页（rc 由 alpha 容器统一渲染两条通道，契约 §6）
+      - DSH_VERSION_PORT=${DSH_VERSION_PORT:-3082}
+      # SSOT 文件绝对路径（优先级最高；空则走容器内默认查找顺序）。
+      # ⚠ 填宿主路径时必须额外挂载；推荐 /root/nas_docker/dsh-version.json
+      #   （已由 ./dsh-root:/root 挂载，命中宿主实时 SSOT）。
+      - DSH_VERSION_SSOT=${DSH_VERSION_SSOT:-}
+      - DSH_PIN_REASON=${DSH_PIN_REASON:-}
     volumes:
       - ./dsh-data:/data/dsh
       # 持久化 /root（含 DSH 工作区 /root/nas_docker）：
@@ -23,21 +48,19 @@ services:
       # 使 Codex/DSH 能 inspect/exec 生产容器（docker exec preflight 等）。
       # 安全边界：docker.sock == host root-equivalent；只挂给可信 agent，
       # DSH UI 禁止公网匿名访问。应用后需重建容器：
-      #   docker compose up -d --force-recreate deepseek-harness
+      #   nas/lib.sh compose_cmd up -d --force-recreate
       - /var/run/docker.sock:/var/run/docker.sock
       # GitHub SSH（可选）：宿主存在 GitHub deploy key 时启用只读挂载。
       # ⚠ 若宿主路径不存在，docker compose up 会失败——先确认宿主 key 路径。
       # - /root/.ssh:/root/.ssh:ro
       # - /home/lzg/.ssh:/root/.ssh:ro
-    # Intel 核显直通（Iris Xe，加速本地视觉模型的图像编码）：
-    # 宿主需已加载 i915 驱动（绿联 x86 NAS 默认有）。应用后需重建容器生效：
-    #   docker compose up -d --force-recreate deepseek-harness
-    # 无此设备时容器内仍可运行，视觉推理退回纯 CPU。
-    devices:
-      - /dev/dri:/dev/dri
     labels:
       - "org.opencontainers.image.title=DeepSeek Harness Web (dsh)"
       - "org.opencontainers.image.description=DeepSeek Harness web UI — auto-built from npm release, controlled promote via dsh-safe-deploy"
       # 关键：DSH 退出 Watchtower 自动更新（防未经验证的跨版本替换）。
       # watchtower 仍可管理其他无状态容器；只有此服务被排除。
       - "com.centurylinklabs.watchtower.enable=false"
+    # 日志轮转（P2）：json-file 默认无上限，长跑会撑满 NAS 根分区
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

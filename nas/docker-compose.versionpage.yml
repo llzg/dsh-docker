@@ -1,0 +1,13 @@
+# 版本页端口 override（可选，仅 DSH_VERSION_PORT != 0 的通道需要，契约 §6）
+#
+# alpha 通道：DSH_VERSION_PORT=3082 → 挂 3082:3082（版本页同时渲染 alpha + rc）。
+# rc 通道：DSH_VERSION_PORT=0 → compose_cmd 不会追加本文件（容器内不启版本页）。
+#
+# 单独手动使用：
+#   docker compose -p dsh-alpha --project-directory /volume1/docker/dsh-alpha \
+#     -f /volume1/docker/dsh-alpha/docker-compose.yml \
+#     -f /volume1/docker/dsh-alpha/docker-compose.versionpage.yml up -d
+services:
+  dsh:
+    ports:
+      - "${DSH_VERSION_PORT:-3082}:${DSH_VERSION_PORT:-3082}"
