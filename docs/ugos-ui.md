@@ -25,7 +25,7 @@
 ## 4. 更新在 UI 中的表现
 
 - DSH 容器**不再由 watchtower 更新**（`com.centurylinklabs.watchtower.enable=false`）；新版本由 `dsh-safe-deploy promote --channel <ch>` 切换。
-- 回滚钉住时镜像列显示被钉住的版本，直到 `resume-auto-update.sh --channel <ch>` 恢复（恢复到该通道 SSOT 的 `production`，而不是 `latest`）。
+- 回滚钉住时镜像列显示被钉住的版本，直到 `DSH_CHANNEL=<ch> sh resume-auto-update.sh` 恢复（恢复到该通道 SSOT 的 `production`，而不是 `latest`）。
 - 版本页 <http://<NAS-IP>:3082/> 可看到两条通道的当前/候选/风险/测试/回滚状态，以及「推荐构建目标是否已在 GHCR 上发布」「最近一次 CI 结论」。
 
 > 提示：UGOS 的 Docker 视图直接读取 docker daemon 状态，无需任何额外配置；容器/镜像/项目三个视图会自动同步。
