@@ -55,6 +55,21 @@ function fetchJson(url, { headers = {}, timeoutMs = REQ_TIMEOUT_MS } = {}) {
   });
 }
 
+// ── 通道 ────────────────────────────────────────────────────────────────────
+// 通道由 semver prerelease 段判定：0.1.3-alpha.2 → alpha；0.1.2-rc.1 → rc；
+// 0.1.2 → stable；其他未知 prerelease → unknown。全仓库唯一实现，勿在别处重复。
+const CHANNELS = ['stable', 'rc', 'beta', 'alpha'];
+
+function channelOf(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  if (!s) return 'unknown';
+  if (s.includes('-rc.')) return 'rc';
+  if (s.includes('-beta')) return 'beta';
+  if (s.includes('-alpha')) return 'alpha';
+  if (s.includes('-')) return 'unknown';
+  return 'stable';
+}
+
 // 版本字符串规范化：'dsh-v0.1.1-rc.1' / 'v1.0.0' → semver 合法串
 function normalizeVersion(v) {
   if (!v || typeof v !== 'string') return null;
@@ -162,6 +177,57 @@ function computeTarget(sources) {
   return { target, candidates: valid, installable, newestUpstream, waitingForNpm };
 }
 
+// ── 按通道解析构建目标（双通道核心）────────────────────────────────────────
+// 与 computeTarget 的区别：候选集包含 npm 全量 versions（它们天然可安装），
+// 因此每个通道都能独立拿到"该通道内最高可安装版本"，不会被其他通道压过。
+// 返回 { channel, target, newestUpstream, waitingForNpm, candidates[], installable[] }
+function computeChannelTarget(sources, channel) {
+  const sv = semver();
+  const versions = (sources.npm && sources.npm.versions) || [];
+  const versionSet = new Set(versions);
+
+  const raw = [
+    sources.github && sources.github.release && sources.github.release.value,
+    sources.github && sources.github.tag && sources.github.tag.value,
+    sources.npm && sources.npm.latest && sources.npm.latest.value,
+    sources.npm && sources.npm.next && sources.npm.next.value,
+    ...versions,
+  ];
+
+  const seen = new Set();
+  const candidates = [];
+  for (const c of raw) {
+    const v = normalizeVersion(c);
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    let valid = null;
+    try { valid = sv.valid(v); } catch { valid = null; }
+    if (!valid) continue;
+    if (channel !== 'all' && channelOf(valid) !== channel) continue;
+    candidates.push(valid);
+  }
+
+  const installable = candidates.filter((v) => versionSet.has(v));
+  const target = sv.rsort(installable)[0] || null;
+  const newestUpstream = sv.rsort(candidates)[0] || null;
+  const waitingForNpm = newestUpstream !== null && target !== newestUpstream;
+
+  return { channel, target, newestUpstream, waitingForNpm, candidates, installable };
+}
+
+// 一次算全部通道 + 兼容顶层的"跨通道最高可安装版本"
+function computeTargets(sources) {
+  const channels = {};
+  for (const ch of CHANNELS) channels[ch] = computeChannelTarget(sources, ch);
+  const legacy = computeTarget(sources);
+  return {
+    channels,
+    target: legacy.target,
+    newestUpstream: legacy.newestUpstream,
+    waitingForNpm: legacy.waitingForNpm,
+  };
+}
+
 let _semver = null;
 function semver() {
   if (_semver) return _semver;
@@ -182,4 +248,4 @@ function semver() {
   throw new Error('semver 库不可用（镜像/CI 未安装 semver）');
 }
 
-module.exports = { fetchAllSources, fetchGitHub, fetchNpm, computeTarget, normalizeVersion, semver, UPSTREAM_REPO, NPM_PKG };
+module.exports = { fetchAllSources, fetchGitHub, fetchNpm, fetchJson, computeTarget, computeTargets, computeChannelTarget, channelOf, CHANNELS, normalizeVersion, semver, UPSTREAM_REPO, NPM_PKG };

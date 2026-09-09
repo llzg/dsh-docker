@@ -8,27 +8,55 @@
   "repositories": ["llzg/dsh-docker"],
   "regexManagers": [
     {
+      "description": "双通道 SSOT：只自动跟随 alpha 通道的候选版本（rc 通道候选由人工在 promote 时维护；构建目标本身由 CI 按通道自动解析，不依赖此字段）",
       "fileMatch": ["^dsh-version\\.json$"],
       "matchStrings": [
-        "\"testCandidate\"\\s*:\\s*\"(?<currentValue>[^\"]+)\""
+        "\"alpha\"\\s*:\\s*\\{[^}]*?\"candidate\"\\s*:\\s*\"(?<currentValue>[^\"]+)\""
       ],
       "depNameTemplate": "@deepseek-ai/dsh",
       "datasourceTemplate": "npm",
       "packageNameTemplate": "@deepseek-ai/dsh"
+    },
+    {
+      "description": "Dockerfile：uv 固定版本（github releases）",
+      "fileMatch": ["^Dockerfile$"],
+      "matchStrings": ["ARG UV_VERSION=(?<currentValue>[0-9.]+)"],
+      "depNameTemplate": "astral-sh/uv",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "description": "Dockerfile：semver 固定版本（npm）",
+      "fileMatch": ["^Dockerfile$"],
+      "matchStrings": ["ARG SEMVER_VERSION=(?<currentValue>[0-9.]+)"],
+      "depNameTemplate": "semver",
+      "datasourceTemplate": "npm"
     }
   ],
   "packageRules": [
     {
+      "description": "上游 dsh 版本线（含 prerelease）",
       "matchDatasources": ["npm"],
       "matchPackageNames": ["@deepseek-ai/dsh"],
       "groupName": "dsh upstream",
       "prerelease": "non-zero",
       "separateMajorMinor": true,
       "separateMinorPatch": true
+    },
+    {
+      "description": "基础镜像固定 digest（供应链）",
+      "matchManagers": ["dockerfile"],
+      "pinDigests": true,
+      "groupName": "base image digests"
+    },
+    {
+      "description": "GitHub Actions 固定 commit SHA（供应链）",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true,
+      "groupName": "github actions"
     }
   ],
   "schedule": ["every weekend"],
   "branchConcurrentLimit": 1,
   "prConcurrentLimit": 1,
-  "enabledManagers": ["regex", "npm"]
+  "enabledManagers": ["regex", "npm", "dockerfile", "github-actions"]
 }

@@ -31,6 +31,27 @@ while [ "$i" -lt 40 ]; do
   i=$((i + 1))
   if probe; then
     echo "SMOKE OK (attempt $i)"
+    # 版本页（3082）也必须在真实镜像里能起来：容器内自探，不依赖宿主端口映射
+    # DSH_VERSION_PORT=0 的通道（如 rc）跳过；查不到 semver 时只告警不阻塞。
+    vp=$(docker exec "$NAME" sh -c 'printf %s "${DSH_VERSION_PORT:-3082}"' 2>/dev/null || echo 3082)
+    if [ "$vp" != "0" ]; then
+      vok=0
+      j=0
+      while [ "$j" -lt 10 ]; do
+        j=$((j + 1))
+        if docker exec "$NAME" node -e "fetch('http://127.0.0.1:${vp}/version.json').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then
+          vok=1
+          break
+        fi
+        sleep 2
+      done
+      if [ "$vok" = "1" ]; then
+        echo "SMOKE OK: version page :${vp} 可用"
+      else
+        echo "SMOKE WARN: 版本页 :${vp} 未就绪（检查 /opt/node_modules/semver 与 version-server.js）" >&2
+        docker exec "$NAME" sh -c 'tail -20 "${DSH_HOME:-/data/dsh}/logs/version-server.log" 2>/dev/null' >&2 || true
+      fi
+    fi
     exit 0
   fi
   sleep 5

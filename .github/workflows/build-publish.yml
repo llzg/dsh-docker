@@ -1,19 +1,24 @@
 name: build-publish
 
-# 触发方式（二选一 + 手动）：
-#  1) schedule —— 每 30 分钟轮询 npm 的 @deepseek-ai/dsh dist-tag "latest"，
-#     发现新版自动构建并推送到 GHCR（上游 deepseek-harness 无 GitHub Release，
-#     实际发布通道是 npm，故用 npm 轮询）
-#  2) workflow_dispatch —— 手动触发，可显式指定版本
-#  3) push —— Dockerfile / 补丁 / 脚本变更时重建（重发 same-version 标签，
-#     NAS watchtower 会感知 digest 变化并更新）
+# 双通道构建（见 docs/dual-channel.md §8）
+#   1) schedule  —— 每 30 分钟解析各通道构建目标；**仅当该版本尚未存在于 GHCR** 才构建
+#      （旧逻辑用 latest label 判收敛，而 prerelease 永不打 latest → 每 30 分钟白重建一次）
+#   2) workflow_dispatch —— 可指定版本 / 只构建某通道
+#   3) push —— Dockerfile / 补丁 / 脚本 / SSOT / 本工作流变更时强制重建各通道目标
+#
+# 收敛判定：scripts/check-new-version.js 用 GHCR tag 列表判断"该版本是否已构建"。
+# 构建状态：每通道产出 build-status-<channel>.json → record-status 汇总回写 build-status.json。
 on:
   schedule:
     - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       version:
-        description: '可选：显式指定要构建的 @deepseek-ai/dsh 版本（默认 npm latest）'
+        description: '可选：显式指定 @deepseek-ai/dsh 版本（须存在于 npm；只对与其版本段匹配的通道生效）'
+        required: false
+        type: string
+      channel:
+        description: '可选：只构建该通道（alpha / rc；留空=全部）'
         required: false
         type: string
   push:
@@ -24,9 +29,11 @@ on:
       - entrypoint.sh
       - profiles/**
       - scripts/**
+      - dsh-version.json
+      - .github/workflows/build-publish.yml
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 concurrency:
@@ -34,85 +41,183 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-publish:
+  resolve:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    outputs:
+      matrix: ${{ steps.version.outputs.matrix }}
+      any_build: ${{ steps.version.outputs.any_build }}
+      decisions: ${{ steps.version.outputs.decisions }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Resolve version
-        id: version
+      # 固定版本依赖（不要用 latest：CI 结果必须可复现）
+      - name: Install deps (pinned)
+        run: npm install --no-save --no-audit --no-fund semver@7.6.3
+
+      - name: Policy tests (offline-safe unit tests)
         run: |
-          npm install --no-save --no-audit --no-fund semver >/dev/null 2>&1 || true
-          node scripts/check-new-version.js
+          node --check scripts/version-policy.js
+          node --check scripts/safe-deploy-policy.js
+          node --check scripts/version-server.js
+          node --check scripts/check-new-version.js
+          node scripts/test-dual-channel.js
+          node scripts/test-version-server.js
+          node scripts/test-version-policy.js
+
+      - name: Resolve build matrix
+        id: version
+        run: node scripts/check-new-version.js
         env:
           VERSION_OVERRIDE: ${{ github.event.inputs.version }}
+          DSH_CHANNELS: ${{ github.event.inputs.channel }}
           FORCE: ${{ github.event_name == 'push' && '1' || '' }}
           GHCR_REPO: ${{ github.repository_owner }}/dsh-docker
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: No new version to build
-        if: steps.version.outputs.version == ''
-        run: echo "::notice::no new dsh version (npm=${{ steps.version.outputs.npm_version }}, last=${{ steps.version.outputs.last_published }})"
+      - name: Nothing to build
+        if: steps.version.outputs.any_build != '1'
+        run: echo "::notice::no channel needs a build (decisions=${{ steps.version.outputs.decisions }})"
+
+  build-publish:
+    needs: resolve
+    if: needs.resolve.outputs.any_build == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Login to GHCR
-        if: steps.version.outputs.version != ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        if: steps.version.outputs.version != ''
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      # 计算镜像 tag 集：prerelease（alpha/beta/rc）不打 latest，
-      # 防止 watchtower/任何 latest 消费者自动把 prerelease 部署到生产；
-      # stable 全量打（latest 仅 stable 或显式 promote 流程）。
+      # prerelease（alpha/beta/rc）不打 latest，防止任何 latest 消费者把预发布版部署到生产；
+      # stable 追加 latest。回滚一律用不可变 <version>-<sha> 或 <version>。
       - name: Compute image tags
-        if: steps.version.outputs.version != ''
         id: tags
         run: |
           BASE="ghcr.io/${{ github.repository_owner }}/dsh-docker"
-          V="${{ steps.version.outputs.version }}"
+          V="${{ matrix.version }}"
           SHA="${{ github.sha }}"
           {
             echo "IMAGE_TAGS<<__DSH_TAGS__"
             echo "${BASE}:${V}-${SHA}"
             echo "${BASE}:${V}"
-            if [ "${{ steps.version.outputs.is_prerelease }}" != "1" ]; then
+            if [ "${{ matrix.is_prerelease }}" != "1" ]; then
               echo "${BASE}:latest"
             fi
             echo "__DSH_TAGS__"
           } >> "$GITHUB_ENV"
-          if [ "${{ steps.version.outputs.is_prerelease }}" = "1" ]; then
-            echo "prerelease: 仅 immutable + version tag（不打 latest）"
-          else
-            echo "stable: immutable + version + latest"
-          fi
+          echo "channel=${{ matrix.channel }} version=$V prerelease=${{ matrix.is_prerelease }}"
 
-      # 先构建到本地 daemon 做冒烟测试；通过后再推送，
-      # 保证坏镜像永远不会进入 latest（构建期回滚保护）。
+      # 先构建到本地 daemon 做冒烟测试；通过后才推送（坏镜像不进 registry）
       - name: Build image (local, for smoke test)
-        if: steps.version.outputs.version != ''
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           load: true
           push: false
           tags: ${{ env.IMAGE_TAGS }}
           build-args: |
-            DSH_VERSION=${{ steps.version.outputs.version }}
+            DSH_VERSION=${{ matrix.version }}
             GIT_REVISION=${{ github.sha }}
+            DSH_CHANNEL=${{ matrix.channel }}
 
-      - name: Smoke test (web UI /health)
-        if: steps.version.outputs.version != ''
-        run: ./scripts/smoke-test.sh ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ steps.version.outputs.version }}-${{ github.sha }}
+      - name: Smoke test (web UI)
+        run: ./scripts/smoke-test.sh ghcr.io/${{ github.repository_owner }}/dsh-docker:${{ matrix.version }}-${{ github.sha }}
 
       - name: Push to GHCR
-        if: steps.version.outputs.version != ''
         run: |
-          echo "$IMAGE_TAGS" | while IFS= read -r t; do [ -n "$t" ] && docker push "$t"; done
+          set -euo pipefail
+          echo "$IMAGE_TAGS" | while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            echo "push $t"
+            docker push "$t"
+          done
+
+      - name: Write build status
+        if: always()
+        run: |
+          V='${{ matrix.version }}'
+          C='${{ matrix.channel }}'
+          JOB='${{ job.status }}'
+          SHA='${{ github.sha }}'
+          RUN_URL='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          mkdir -p .status
+          node -e '
+            const fs=require("fs");
+            const [ch,ver,job,sha,url]=process.argv.slice(1);
+            const out={channel:ch,version:ver,conclusion:job,headSha:sha,runUrl:url,updatedAt:new Date().toISOString()};
+            fs.writeFileSync(`.status/build-status-${ch}.json`, JSON.stringify(out,null,2)+"\n");
+            console.log(JSON.stringify(out));
+          ' "$C" "$V" "$JOB" "$SHA" "$RUN_URL"
+
+      - name: Upload build status
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-status-${{ matrix.channel }}
+          path: .status/build-status-*.json
+          retention-days: 14
+          if-no-files-found: warn
+
+  record-status:
+    needs: [resolve, build-publish]
+    if: always() && needs.resolve.outputs.any_build == '1'
+    runs-on: ubuntu-latest
+    steps:
+      # 显式 checkout 默认分支（而不是触发 SHA 的 detached HEAD），否则回写会推到游离提交
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Download build status artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: build-status-*
+          merge-multiple: true
+          path: .status
+
+      - name: Merge into build-status.json
+        run: |
+          node -e '
+            const fs=require("fs"), path=require("path");
+            const file="build-status.json";
+            let cur={schemaVersion:1,channels:{}};
+            try{ cur=JSON.parse(fs.readFileSync(file,"utf8")); }catch{}
+            cur.schemaVersion=1; cur.channels=cur.channels||{};
+            let n=0;
+            for(const f of fs.readdirSync(".status").filter(f=>f.endsWith(".json"))){
+              const j=JSON.parse(fs.readFileSync(path.join(".status",f),"utf8"));
+              cur.channels[j.channel]=j; n++;
+            }
+            cur.updatedAt=new Date().toISOString();
+            fs.writeFileSync(file, JSON.stringify(cur,null,2)+"\n");
+            console.log(`merged ${n} channel status`);
+          '
+
+      - name: Commit build status
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build-status.json
+          if git diff --cached --quiet; then
+            echo "build-status.json 无变化"
+            exit 0
+          fi
+          git commit -m "chore(build-status): update [skip ci]"
+          # 期间 main 可能已被其他提交推进 → rebase 后再推；被分支保护拦住时只告警（不影响镜像发布）
+          if ! { git pull --rebase --autostash && git push; }; then
+            echo "::warning::build-status.json 回写失败（可能是分支保护或并发提交），不影响镜像发布"
+          fi

@@ -5,8 +5,20 @@
 .llama.cpp/
 .vulkan-headers/
 
+# 视觉缓存（含图片 OCR 文本 / 模型回答，可能含敏感内容）——绝不入库
+.vision-cache/
+
 # Python 缓存
 __pycache__/
 
 # 其他本地临时产物
 *.log
+*.tgz
+
+# 本地测试依赖
+node_modules/
+
+# NAS 侧凭据/钉住文件（由部署脚本生成，不入库）
+nas/.env
+nas/.env.*
+!nas/.env.example

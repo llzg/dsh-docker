@@ -1,109 +1,117 @@
-# dsh-docker —— DeepSeek Harness 智能体自动构建 / 自动更新 / 回滚
+# dsh-docker —— DeepSeek Harness 双通道自构建 / 安全升级 / 回滚
 
-让绿联 NAS 上自构建的 `deepseek-harness` 智能体（dsh web UI）实现：
+在绿联 NAS 上并行维护两条 DeepSeek Harness（dsh）版本线：
 
-> **GitHub（上游 npm）发布新版本 → 自动构建 → 自动更新 → 失败自动/手动回滚 → 绿联 NAS UI 正常显示**
+| 通道 | 版本段 | 宿主端口 | 容器 / compose 项目 | 数据目录 |
+|---|---|---|---|---|
+| `alpha` | `-alpha.N` | 3081 | `dsh-alpha` | `/volume1/docker/dsh-alpha` |
+| `rc` | `-rc.N` | 3083 | `dsh-rc` | `/volume1/docker/dsh-rc` |
+
+版本状态页：<http://<NAS-IP>:3082/>（由 alpha 容器统一渲染**两条通道**）。
+
+> 设计契约（字段、API、环境变量、验收标准）见 [docs/dual-channel.md](docs/dual-channel.md)。
+> 升级流程与安全边界见 [docs/safe-upgrade-architecture.md](docs/safe-upgrade-architecture.md)。
 
 ## 架构一览
 
 ```
-npm dist-tag latest ──(30min 轮询)──► GitHub Actions（本仓库）
-                                        │ 构建（含 LAN 补丁 STRICT 校验）
-                                        │ 冒烟测试（/health）→ 通过才推送
-                                        ▼
-                                 ghcr.io/llzg/dsh-docker:{版本} + latest
-                                        │
-NAS watchtower（已有）──5min 轮询──► 拉取并重建 deepseek-harness
-                                        │
-                HEALTHCHECK 失败 ──► NAS watchdog 自动回滚到上一版本
-                手动：rollback.sh / resume-auto-update.sh
+上游（npm @deepseek-ai/dsh + GitHub Release/Tag）
+        │  每 30 分钟解析「每个通道各自」的构建目标
+        ▼
+GitHub Actions（本仓库，矩阵：alpha / rc）
+   ├─ 收敛判定：目标版本是否已存在于 GHCR tag 列表 → 已存在则跳过
+   │            （旧逻辑用 latest label 判定，prerelease 永不打 latest → 每 30 分钟白重建）
+   ├─ docker build（DSH_VERSION / GIT_REVISION / DSH_CHANNEL）+ STRICT 补丁校验
+   ├─ 冒烟测试（dsh web 探活）→ 通过才 push
+   └─ push：<version>-<sha>（不可变）、<version>；stable 才追加 latest
+        │  build-status-<channel>.json → 汇总回写 build-status.json
+        ▼
+ghcr.io/llzg/dsh-docker:<version>
+        │  每通道一个 compose 项目（显式 -p / --project-directory；不依赖 watchtower）
+        ▼
+NAS：dsh-alpha(3081) / dsh-rc(3083)   ←── dsh-safe-deploy check/test/promote/rollback
+        │
+        └─ watchdog（每 5 分钟）：容器不健康且**刚部署** → 自动回滚上一版本并钉住
 ```
+
+**关键语义**
+
+- 自动**构建**是自动的；自动**上线**是**不**做的——上生产只走 `dsh-safe-deploy promote`（隔离测试 PASS + 非 BLOCKED）。
+- DSH 容器**不使用 watchtower**（`com.centurylinklabs.watchtower.enable=false`），避免未验证的跨版本替换。
+- `latest` 标签**不是回滚依据**，也不再是自动更新的指针：只有 stable 通道会打 `latest`；回滚一律用不可变 `<version>-<sha>` 或 `<version>`。
+- 每条通道有独立的 SSOT `production` / `candidate`；插件兼容性字段是全局的。
 
 ## 目录结构
 
 ```
 .
-├── Dockerfile                 # 版本参数化 + STRICT 补丁校验 + HEALTHCHECK + OCI 标签
-├── patch-dsh.sh               # LAN 补丁（STRICT=1 时验证不变量，失败即构建失败）
-├── entrypoint.sh              # 入口（初始化 profile 补丁）
+├── Dockerfile                     # 版本/通道参数化 + STRICT 补丁校验 + HEALTHCHECK + OCI 标签
+├── patch-dsh.sh                   # LAN 补丁（锚点预检 + marker 正向校验，失败即构建失败）
+├── entrypoint.sh                  # 入口：profile 初始化 + 版本页守护进程
+├── dsh-version.json               # SSOT（schemaVersion 2：channels.alpha / channels.rc）
+├── build-status.json              # CI 回写的各通道最近一次构建结论（自动生成）
 ├── profiles/web/cordis.patch.yml
-├── CURRENT_VERSION            # 最近一次已发布版本（由 CI 回写）
 ├── .github/workflows/build-publish.yml
 ├── scripts/
-│   ├── check-new-version.js   # npm dist-tag 解析 / 版本比对
-│   └── smoke-test.sh          # 构建后冒烟测试
-└── nas/                       # NAS 侧部署资产
-    ├── docker-compose.yml     # 新 compose（GHCR 镜像 + 回滚钉住支持）
-    ├── install.sh             # 一次性部署（幂等）
-    ├── switch.sh              # 切换容器到 GHCR 镜像（重启一次）
-    ├── rollback.sh            # 一键回滚（默认上一版本，可指定版本）
-    ├── resume-auto-update.sh  # 恢复自动更新
-    ├── watchdog.sh            # 健康检查自动回滚守护（watchdog 容器内 cron 每 5 分钟）
-    └── lib.sh                 # 共享函数库
+│   ├── version-policy.js          # 上游来源查询 + 通道识别 + 每通道目标解析
+│   ├── safe-deploy-policy.js      # SSOT 归一化 + 风险/迁移/插件策略（单通道 & 全通道）
+│   ├── check-new-version.js       # CI：解析各通道构建矩阵 + GHCR 收敛判定
+│   ├── version-server.js          # 3082 版本页（双通道 + 构建状态 + 强制刷新）
+│   ├── dsh-safe-deploy            # 安全升级薄层（check/test/promote/rollback/status，按通道）
+│   ├── smoke-test.sh              # 构建后冒烟测试
+│   ├── test-dual-channel.js       # 双通道离线单测（CI 必跑）
+│   └── test-version-policy.js     # 版本检测策略测试
+└── nas/                           # NAS 侧部署资产（每通道一个 compose 项目）
+    ├── docker-compose.yml         # 通道参数化（DSH_CHANNEL/DSH_PORT/DSH_DATA_DIR…）
+    ├── .env.example               # 每通道 .env 模板
+    ├── install.sh                 # 一次性部署（幂等，覆盖前必定备份）
+    ├── switch.sh                  # 切换到指定镜像/版本
+    ├── rollback.sh                # 一键回滚（semver 选版，可指定版本）
+    ├── resume-auto-update.sh      # 恢复到该通道 SSOT 的 production（不是 latest）
+    ├── watchdog.sh                # 健康自动回滚守护（容器内 cron 每 5 分钟）
+    ├── watchdog-container.sh      # 守护容器（宿主同路径挂载 + 显式项目名）
+    ├── apply-igpu.sh              # 可选：核显直通（profile）
+    └── lib.sh                     # 共享函数库（compose_cmd / pin_version / prev_version …）
 ```
 
-## 工作原理
+## 日常操作
 
-### 自动构建（GitHub Actions）
-- **npm 轮询**：每 30 分钟查 `@deepseek-ai/dsh` 的 dist-tag `latest`（上游 deepseek-harness 无 GitHub Release，npm 才是发布通道）；与 `CURRENT_VERSION` 不同则构建。
-- **手动触发**：仓库 Actions 页 → `build-publish` → Run workflow（可填指定版本）。
-- **补丁/构建文件变更**：push 到 main 触发重建（重新发布同版本号标签，watchtower 感知 digest 变化更新）。
-- 流程：`解析版本 → docker build（DSH_VERSION/GIT_REVISION 参数）→ 冒烟测试 → 通过才 push GHCR（版本标签 + latest）→ 回写 CURRENT_VERSION`。**构建失败/冒烟失败 = 不发布**，NAS 永远停在最后一个好版本。
-
-### 自动更新（NAS watchtower，已存在）
-- watchtower 每 5 分钟检查所有容器的 registry 镜像；`ghcr.io/llzg/dsh-docker:latest` 有变化即拉取重建 `deepseek-harness`（`./dsh-data` 卷不变，会话/数据持续）。
-
-### 回滚（三层保护）
-1. **构建期**：`patch-dsh.sh` 以 `STRICT=1` 运行，LAN 补丁不变量不满足 → 构建失败，坏镜像进不了 GHCR。
-2. **部署期自动**：镜像内置 HEALTHCHECK；NAS watchdog 守护容器（每 5 分钟）检测到连续 3 次（约 15 分钟）不健康、且镜像是刚更新（构建 ≤3h）→ 自动拉取上一版本、钉住并重建。回滚后自动更新暂停（防 watchtower 拉回坏版本）。
-3. **手动**：`rollback.sh`（默认回上一版本 / `rollback.sh 0.1.0-rc.5` 指定版本）；`resume-auto-update.sh` 恢复自动更新。
-
-### 绿联 NAS UI 显示
-- 容器 `deepseek-harness` 继续以 compose「项目」形式显示；镜像名变为 `ghcr.io/llzg/dsh-docker:latest`，镜像列表可见带版本号的标签（如 `0.1.0-rc.6`），OCI 标签含版本/提交信息。详见 [docs/ugos-ui.md](docs/ugos-ui.md)。
-
-## 使用手册
-
-### 首次部署（NAS，一次性）
 ```sh
-# 1) 把 nas/ 目录放到 NAS（例）：
-#    scp -r nas/ lzg@192.168.5.16:/volume1/docker/dsh-deploy/
+# 只读评估（默认 primary 通道；也可 --channel rc / --channel all）
+scripts/dsh-safe-deploy check
+scripts/dsh-safe-deploy status --channel all
 
-# 2) 安装（备份旧 compose、装新 compose、建 watchdog 守护容器、预拉镜像）：
-sh /volume1/docker/dsh-deploy/install.sh
+# 隔离测试（snapshot → 独立 TEST_DSH_HOME + 随机端口容器 + smoke）
+scripts/dsh-safe-deploy test --channel alpha
 
-# 3) 切换容器到 GHCR 镜像（会重启 deepseek-harness 一次，约 1 分钟）：
-sh /volume1/docker/dsh-deploy/switch.sh
+# 门禁 promote（test 未 PASS 一律拒绝；HIGH 风险需显式 --force）
+scripts/dsh-safe-deploy promote --channel alpha [--force]
+
+# 回滚（恢复最近 snapshot + 上一版本镜像；幂等）
+scripts/dsh-safe-deploy rollback --channel alpha
+
+# NAS 侧脚本用 DSH_CHANNEL 环境变量指定通道（默认取 SSOT primaryChannel）
+DSH_CHANNEL=rc sh /volume1/docker/dsh-deploy/rollback.sh          # 回滚到上一版本
+DSH_CHANNEL=rc sh /volume1/docker/dsh-deploy/rollback.sh 0.1.2-rc.1  # 回滚到指定版本
+DSH_CHANNEL=rc sh /volume1/docker/dsh-deploy/resume-auto-update.sh   # 恢复到该通道 SSOT production
 ```
 
-### 日常操作
-```sh
-# 手动回滚到上一版本：
-sh /volume1/docker/dsh-deploy/rollback.sh
-# 或指定版本：
-sh /volume1/docker/dsh-deploy/rollback.sh 0.1.0-rc.5
-# 恢复自动更新：
-sh /volume1/docker/dsh-deploy/resume-auto-update.sh
-# 回滚/守护日志：
-tail -f /volume1/docker/dsh-deploy/state/rollback.log
-tail -f /volume1/docker/dsh-deploy/state/watchdog.log
-```
-
-### 手动触发构建
-GitHub → llzg/dsh-docker → Actions → **build-publish** → Run workflow（可选填版本号）。
+日志：`/volume1/docker/dsh-deploy/state/<channel>/<channel>-{rollback,watchdog}.log`
 
 ## 运维要点
 
-- **上游改代码导致补丁失效**：构建会失败并在日志给出明确提示（`VERIFY FAIL … update patch-dsh.sh`）。更新 `patch-dsh.sh` 后 push 到 main 即可重发。
-- **NAS 侧凭据**：watchtower 已在用 `/home/lzg/.docker/config.json`（GHCR 凭据）拉私有/公共包；本仓库脚本优先复用该凭据，包本身设为 public，无凭据也能匿名拉取。
-- **数据安全**：容器重建只换镜像，`/volume1/docker/deepseek-harness/dsh-data`（DSH_HOME、会话、配置）全程持久化。
-- **上游无 Release 的说明**：deepseek-ai/deepseek-harness 仓库没有 GitHub Releases/tags，正式发布即 npm publish；因此本方案以 npm dist-tag 轮询作为"GitHub 发布新版本"的检测方式。
+- **上游改代码导致补丁失效**：构建会**失败**并给出 `VERIFY FAIL: anchor missing …`；更新 `patch-dsh.sh` 后 push 到 main 即可重发。补丁通过后会写入 `dsh-docker-patch:<name>` marker，STRICT 校验 marker 必须存在（旧版"原始模式已消失"的校验在锚点失配时恒真，会静默放行）。
+- **版本页读的是实时 SSOT**：命中镜像内置快照时页面会显式告警（`ssotIsFallback`）。容器内查找顺序 `$DSH_VERSION_SSOT → /root/nas_docker/dsh-version.json → /opt/dsh-version-ssot.json`。
+- **构建状态**：版本页每通道显示「推荐构建目标 / 目标镜像是否已发布 / 最近一次 CI 结论」，可直接看出"npm 有版本但镜像没构建成功"。
+- **数据安全**：容器重建只换镜像；每通道的 `DSH_HOME`（会话、配置、凭据）独立持久化。promote/rollback 前 `dsh-safe-deploy` 会 snapshot，回滚是"镜像 + 数据 + env"三件套一起回。
+- **NAS 侧凭据**：包为 public，匿名可拉；脚本优先复用 `/home/lzg/.docker/config.json`（可用 `DOCKER_CONFIG` 覆盖）。
+- **不再使用 watchtower 自动更新**：旧 README 的 watchtower/latest 链路已废弃（watchtower 只管理其他无状态容器）。
 
 ## 本地识图（可选组件）
 
-dsh 智能体/命令行可用的本地"看图"工具：Qwen2.5-VL-3B 纯 CPU 推理，
-支持图片描述、问答、中英文 OCR，图片不离开本机。安装与用法见 [docs/vision.md](docs/vision.md)。
+dsh 智能体/命令行可用的本地"看图"工具：Qwen2.5-VL-3B 纯 CPU 推理，支持图片描述、问答、中英文 OCR，图片不离开本机。安装与用法见 [docs/vision.md](docs/vision.md)。
 
 ```sh
 bash scripts/vision-setup.sh    # 一次性安装（约 8GB）
-scripts/see.sh 图片.jpg --question "这张图里有什么？"
+scripts/see.sh 图片.jpg --question "这张图里有什么？"   # 注意：默认是 OCR，问答需 --mode vision
 ```

@@ -1,5 +1,10 @@
 # 构建流程审计报告 —— DeepSeek Harness 智能体（deepseek-harness 容器）
 
+> ⚠️ **历史文档（2026-08-16）**：当时是单通道 + watchtower 自动更新拓扑，已不再适用。
+> 现行架构见 [docs/dual-channel.md](docs/dual-channel.md)（双通道契约）与
+> [docs/safe-upgrade-architecture.md](docs/safe-upgrade-architecture.md)（升级流程）。
+> 本文保留作为问题清单与设计动机的原始记录。
+
 审计时间：2026-08-16　|　审计对象：绿联 NAS（192.168.5.16，UGOS Pro / DXP6800PRO，Docker 29.4.3）上自构建的 `deepseek-harness` 容器（本智能体运行环境）
 
 ---
