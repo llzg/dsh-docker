@@ -154,19 +154,29 @@ jobs:
       #   homelab-builder（对方的 remote driver@tcp://127.0.0.1:1234）→ dsh-builder → 新建
       - name: Select Buildx builder
         run: |
-          set -euo pipefail
-          B="${DSH_BUILDER:-}"
-          for cand in $B homelab-builder dsh-builder; do
+          # 选择策略（实测 2026-09-10）：
+          #   1) vars.DSH_BUILDER（显式指定优先）
+          #   2) default —— docker driver：镜像直接落在 dockerd 镜像库，**省掉 1.4GB 的 export/load**
+          #   3) homelab-builder —— 常驻 BuildKit（缓存持久，但 remote driver 需要 --load 导出）
+          # 关键：builder 不可用（例如 BuildKit 端点挂了）必须能降级，不能把 job 判失败
+          #      —— 之前就是 `inspect --bootstrap` 非 0 + set -e 直接把构建步骤干掉了。
+          set -uo pipefail
+          chosen=""
+          for cand in ${DSH_BUILDER:-} default homelab-builder; do
             [ -n "$cand" ] || continue
-            if docker buildx inspect "$cand" >/dev/null 2>&1; then
-              docker buildx use "$cand"
-              echo "using existing builder: $cand"
-              docker buildx inspect --bootstrap | head -4
-              exit 0
+            if docker buildx inspect "$cand" >/dev/null 2>&1 && docker buildx inspect --bootstrap "$cand" >/dev/null 2>&1; then
+              docker buildx use "$cand" && chosen="$cand" && break
             fi
+            echo "::warning::builder '$cand' 不可用（inspect/bootstrap 失败），尝试下一个"
           done
-          docker buildx create --name dsh-builder --driver docker-container --bootstrap --use >/dev/null
-          echo "created builder: dsh-builder"
+          if [ -z "$chosen" ]; then
+            echo "::warning::没有可用 builder，新建 dsh-builder（docker-container）"
+            docker buildx create --name dsh-builder --driver docker-container --bootstrap --use >/dev/null 2>&1 || true
+            chosen="dsh-builder"
+          fi
+          echo "selected builder: $chosen"
+          echo "DSH_SELECTED_BUILDER=$chosen" >> "$GITHUB_ENV"
+          docker buildx inspect "$chosen" 2>&1 | grep -E 'Name|Driver|Status|Platforms' | head -6 || true
         env:
           DSH_BUILDER: ${{ vars.DSH_BUILDER }}
 
