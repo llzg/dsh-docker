@@ -262,14 +262,21 @@ NEW_IMAGE=192.168.5.35:5050/llzg/dsh-docker:0.1.5-alpha.2 RESCUE_PATCH=0 \
 
 **模式 B（推荐，保留 proxy 的 CIDR 白名单 + 令牌注入）** 的关键变量：
 
-| 变量 | 值 | 说明 |
-|---|---|---|
-| `DSH_BIND_IP` | `127.0.0.1` | dsh 容器只绑回环，宿主端口留给 proxy |
-| `DSH_PUBLISH_PORT` | `3080` | dsh 容器 → 宿主回环 3080（**必须与 `DSH_PORT` 分开**，否则和 proxy 抢端口） |
-| `DSH_PORT` | `3081` / `3083` | proxy 对外端口 |
-| `DSH_INTERNAL_PORT` | `3080` | proxy 的 `BACKEND=http://127.0.0.1:<这个>` |
-| `DSH_PROXY_CONTAINER` | `dsh-proxy` / `dsh-proxy-rc` | proxy 容器名 |
-| `DSH_VERSION_PORT` | `0` | 通道容器不起版本页（3082 由 `dsh-version` 统一提供） |
+| 变量 | alpha | rc | 说明 |
+|---|---|---|---|
+| `DSH_BIND_IP` | `127.0.0.1` | `127.0.0.1` | dsh 容器只绑回环，宿主端口留给 proxy |
+| `DSH_PUBLISH_PORT` | `13081` | `13083` | dsh 容器 → 宿主回环端口 |
+| `DSH_INTERNAL_PORT` | `13081` | `13083` | proxy 的 `BACKEND=http://127.0.0.1:<这个>` |
+| `DSH_PORT` | `3081` | `3083` | proxy 对外端口 |
+| `DSH_PROXY_CONTAINER` | `dsh-proxy` | `dsh-proxy-rc` | proxy 容器名 |
+| `DSH_VERSION_PORT` | `0` | `0` | 通道容器不起版本页（3082 由 `dsh-version` 统一提供） |
+
+> ⚠ **回环端口必须每通道不同**（这条是踩过才写下的，2026-09-10 实测事故）：
+> 手册初版让两个通道都用 `3080` → 先起 rc 的 compose 项目占住了 `127.0.0.1:3080`，
+> 再起 alpha 时 `Bind for 127.0.0.1:3080 failed: port is already allocated`，**alpha 容器根本没起来**；
+> 更糟的是 alpha 的 proxy 已经启动，它回代 `127.0.0.1:3080` → **3081 端口上服务的是 rc 实例**。
+> 教训有两层：(1) 每通道独立回环端口；(2) 只验 "HTTP 200" 会漏判 —— 200 也可能来自**别的通道**。
+
 
 **彩排结论（隔离项目 dsh-rehearsal，端口 3181→3180，空工作区）**：
 `dsh` 与 `proxy` 两个服务都 healthy，`http://127.0.0.1:3181/?token=…` 返回 **200**
@@ -295,15 +302,26 @@ docker stop dsh-proxy-rc dsh-rc1
 docker compose -p dsh-rc --project-directory /volume1/docker/deepseek-harness \
   -f /volume1/docker/deepseek-harness/docker-compose.yml --profile proxy up -d --wait
 
-# 4) 验证：3083 应返回 200；容器名、绑定的 IP、数据目录都要和以前一致
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3083/
-sh check-image-drift.sh rc
+# 4) 验证：**不能只看 HTTP 200** —— 200 也可能来自另一个通道。逐项核身份（下面是 rc 的例子）：
+docker exec dsh-rc1 cat /opt/dsh-build.json               # channel 必须是 rc
+docker port dsh-rc1                                        # 必须独占 127.0.0.1:13083
+docker inspect dsh-proxy-rc --format '{{range .Config.Env}}{{println .}}{{end}}' | grep BACKEND  # 必须=http://127.0.0.1:13083
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3083/     # 200
+sh check-image-drift.sh rc                                 # 运行镜像与 tag 一致
 
 # 回滚（任一步不通过）：停 compose 项目，恢复手写容器
 docker compose -p dsh-rc --project-directory /volume1/docker/deepseek-harness \
   -f /volume1/docker/deepseek-harness/docker-compose.yml --profile proxy down
+docker rename dsh-rc1.pre-compose-<ts> dsh-rc1
+docker rename dsh-proxy-rc.pre-compose-<ts> dsh-proxy-rc
 docker start dsh-rc1 dsh-proxy-rc
 ```
+
+**2026-09-10 执行结果**：两个通道均已由 compose 接管（项目 `dsh-alpha` / `dsh-rc`），
+容器名保持不变（`deepseek-harness-alpha` / `dsh-rc1` / `dsh-proxy` / `dsh-proxy-rc`），
+数据目录与工作区完全沿用（alpha 的 `/root/nas_docker` 与 SSOT 都在），
+alpha 仍挂 `docker.sock`、rc 不挂。回滚点：`*.pre-compose-20260910-184531`（rc）、
+`*.pre-compose-20260910-184611`（alpha）。
 
 **切换前必须敲定的两个决定**（都影响生产行为，别默认）：
 

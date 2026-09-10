@@ -115,6 +115,37 @@ for k in 'opencontainers.image.version' 'opencontainers.image.revision' 'opencon
   if grep -q "$k" "$DF"; then ok "LABEL $k 仍在"; else bad "LABEL $k 丢失"; fi
 done
 
+# ── workflow push 触发路径必须覆盖 Dockerfile 的所有 COPY 源 ──────────────────
+# 为什么：漏一个 COPY 源 = "改了文件但镜像不重建"。实测缺口：assets/ 曾不在 paths 里，
+# 改 dsh-icon.jpg 不会触发重建，favicon 补丁用的是旧图标。
+copies=$(grep -E '^COPY ' "$DF" | awk '{print $2}' | grep -v '^--' | sort -u)
+if [ -f "$WF" ]; then
+  wpaths=$(awk '/^  push:/{f=1} f&&/^    paths:/{p=1;next} p&&/^permissions:/{exit} p&&/^      - /{gsub(/^      - /,"");print}' "$WF")
+  [ -n "$wpaths" ] || wpaths=$(grep -E '^      - ' "$WF" | sed 's/^      - //')
+  miss=""
+  # ⚠ 必须禁用路径展开：未加引号的 `profiles/**` 会被 shell 展开成 `profiles/web`，
+  #   于是 glob 条目永远匹配不上（实测踩过，测试自己误报了一个缺口）。
+  set -f
+  for src in $copies; do
+    ok_src=0
+    for wp in $wpaths; do
+      [ "$wp" = "$src" ] && ok_src=1 && break
+      case "$wp" in
+        */'**') d="${wp%/**}"; case "$src" in "$d"/*) ok_src=1; break ;; esac ;;
+      esac
+    done
+    [ "$ok_src" = "1" ] || miss="$miss $src"
+  done
+  set +f
+  if [ -z "$miss" ]; then
+    ok "workflow push 触发路径覆盖全部 COPY 源（$(echo "$copies" | wc -l | tr -d ' ') 个）"
+  else
+    bad "workflow paths 漏了 COPY 源：$miss（改了这些文件不会触发镜像重建）"
+  fi
+else
+  bad "找不到 $WF（无法校验触发路径）"
+fi
+
 # ── workflow 的构建代理参数 ──────────────────────────────────────────────────
 if [ -f "$WF" ]; then
   grep -q 'HTTP_PROXY=${{ vars.DSH_HTTP_PROXY }}' "$WF" \

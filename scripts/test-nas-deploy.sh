@@ -478,17 +478,24 @@ if [ -n "$REAL_DOCKER" ] && "$REAL_DOCKER" compose version >/dev/null 2>&1; then
   OUT=$(env -u DSH_IMAGE "$REAL_DOCKER" compose -p dsh-alpha --project-directory "$REAL" \
         -f "$REAL/docker-compose.yml" config 2>&1); RC=$?
   OUT2=$(DSH_IMAGE=ghcr.io/llzg/dsh-docker:0.1.2-alpha.5 DSH_PROJECT=dsh-alpha DSH_CONTAINER=dsh-alpha \
+         DSH_PUBLISH_PORT=3081 \
          "$REAL_DOCKER" compose -p dsh-alpha --project-directory "$REAL" -f "$REAL/docker-compose.yml" config 2>&1); RC2=$?
+  # DSH_PUBLISH_PORT 是**新增的必填项**（proxy 反代模式下 dsh 服务与 proxy 会抢同一个宿主端口，
+  # 必须把"容器发布到宿主哪个端口"独立出来）—— 缺它要能明确报错，而不是静默绑错端口。
+  OUT3=$(DSH_IMAGE=ghcr.io/llzg/dsh-docker:0.1.2-alpha.5 DSH_PROJECT=dsh-alpha DSH_CONTAINER=dsh-alpha \
+         "$REAL_DOCKER" compose -p dsh-alpha --project-directory "$REAL" -f "$REAL/docker-compose.yml" config 2>&1); RC3=$?
   OK=1
   [ "$RC" -ne 0 ] || OK=0
   has "$OUT" "required variable DSH_IMAGE" || OK=0
   [ "$RC2" -eq 0 ] || OK=0
+  [ "$RC3" -ne 0 ] || OK=0
+  has "$OUT3" "required variable DSH_PUBLISH_PORT" || OK=0
   has "$OUT2" "name: dsh-alpha" || OK=0
   has "$OUT2" "source: $REAL/dsh-data" || OK=0
   has "$OUT2" "driver: json-file" || OK=0
   has "$OUT2" "max-size: 10m" || OK=0
   has "$OUT2" "max-file:" || OK=0
-  t REAL-compose "真实 compose config：缺 DSH_IMAGE 报错 + 日志轮转 + 卷源在项目目录下" "$OK" "rc_noimg=$RC rc_ok=$RC2"
+  t REAL-compose "真实 compose config：缺 DSH_IMAGE/DSH_PUBLISH_PORT 报错 + 日志轮转 + 卷源在项目目录下" "$OK" "rc_noimg=$RC rc_ok=$RC2 rc_noport=$RC3"
 else
   echo "SKIP  REAL-compose 真实 docker compose 不可用（跳过真实 config 校验）"
 fi

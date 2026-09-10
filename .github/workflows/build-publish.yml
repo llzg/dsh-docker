@@ -28,11 +28,16 @@ on:
         default: false
   push:
     branches: [main]
+    # ⚠ 这份列表必须覆盖 Dockerfile 里**所有 COPY 源**：漏一个就会出现"改了文件但镜像不重建"
+    #   （实测缺口：assets/dsh-icon.jpg 曾被漏掉 —— 改图标不会触发重建，favicon 补丁用的是旧图标）。
+    #   scripts/test-dockerfile-layers.sh 会逐条比对 Dockerfile 的 COPY 源与这份列表，漏了直接测试失败。
+    #   文档（docs/**）、nas/** 不在列表里：改它们不该重建镜像（避免同版本 tag 被无谓重推 → 生产漂移）。
     paths:
       - Dockerfile
       - patch-dsh.sh
       - entrypoint.sh
       - profiles/**
+      - assets/**
       - scripts/**
       - dsh-version.json
       - .github/workflows/build-publish.yml

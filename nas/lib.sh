@@ -460,10 +460,15 @@ prev_version() { # <current>
 }
 
 # ── compose 调用（唯一入口）───────────────────────────────────────────────
-# 显式 -p / --project-directory / -f；可选 override：versionpage（DSH_VERSION_PORT!=0）、igpu。
+# 显式 -p / --project-directory / -f；可选 override（按目录里是否存在同名文件自动追加）：
+#   docker-compose.docker-sock.yml  宿主 docker.sock 挂载（host root 等价！只有需要的通道才放）
+#   versionpage（DSH_VERSION_PORT!=0）、igpu。
 compose_cmd() {
   if [ -f "$DIR/docker-compose.igpu.yml" ]; then
     set -- -f "$DIR/docker-compose.igpu.yml" "$@"
+  fi
+  if [ -f "$DIR/docker-compose.docker-sock.yml" ]; then
+    set -- -f "$DIR/docker-compose.docker-sock.yml" "$@"
   fi
   if [ -f "$DIR/docker-compose.versionpage.yml" ] && [ "${VERSION_PORT:-0}" != "0" ]; then
     set -- -f "$DIR/docker-compose.versionpage.yml" "$@"

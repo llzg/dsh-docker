@@ -1,0 +1,17 @@
+# 可选 override：把宿主 Docker socket 挂进 dsh 容器（**仅需要的通道才放这个文件**）。
+#
+# 背景与安全边界：
+#   docker.sock == host root 等价权限。当前生产里 alpha 容器挂了它（让 DSH/Codex 能
+#   inspect/exec 生产容器做 preflight），rc 容器**没有**挂。Phase 2 把 compose 作为基座后，
+#   这份差异不能靠"基座统一挂"来抹平 —— 那等于悄悄给 rc 提权。
+#
+# 用法（compose_cmd 会按目录里是否存在这个文件自动追加 -f，见 nas/lib.sh）：
+#   需要 socket 的通道目录（例如 /volume1/docker/dsh-alpha5/）放一份；
+#   不需要的通道目录（例如 /volume1/docker/deepseek-harness/）不放。
+#
+#   校验：docker compose -p <proj> --project-directory <dir> -f docker-compose.docker-sock.yml \
+#           -f <dir>/docker-compose.yml config | grep docker.sock
+services:
+  dsh:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

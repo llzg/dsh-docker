@@ -51,18 +51,25 @@ services:
       #   （已由 ./dsh-root:/root 挂载，命中宿主实时 SSOT）。
       - DSH_VERSION_SSOT=${DSH_VERSION_SSOT:-}
       - DSH_PIN_REASON=${DSH_PIN_REASON:-}
+      # ── 出网代理（与当前手写容器保持一致）──────────────────────────────
+      # ⚠ 不能漏：宿主上 GitHub 直连是**卡死**的（实测 25s 超时 0 字节），而 DSH 工作区
+      #   里的插件安装/pnpm 会拉 GitHub。NO_PROXY 必须包含内网段与 api.deepseek.com
+      #   （LLM 调用走直连，走代理会明显变慢）。
+      - HTTP_PROXY=${DSH_HTTP_PROXY:-}
+      - HTTPS_PROXY=${DSH_HTTP_PROXY:-}
+      - http_proxy=${DSH_HTTP_PROXY:-}
+      - https_proxy=${DSH_HTTP_PROXY:-}
+      - NO_PROXY=${DSH_NO_PROXY:-localhost,127.0.0.1,minio,invoice-minio,invoice-redis,192.168.5.0/24,api.deepseek.com,172.27.0.0/16}
+      - no_proxy=${DSH_NO_PROXY:-localhost,127.0.0.1,minio,invoice-minio,invoice-redis,192.168.5.0/24,api.deepseek.com,172.27.0.0/16}
     volumes:
       - ./dsh-data:/data/dsh
       # 持久化 /root（含 DSH 工作区 /root/nas_docker）：
       # 容器重建时若工作区目录不存在，bash 工具的 spawn cwd 失效会导致
       # 所有命令报 "spawn <cmd> ENOENT"（2026-08-16 事故根因），挂载后根治。
       - ./dsh-root:/root
-      # ── Phase 5 go-live（2026-08-26）：宿主 Docker socket 挂入 DSH ──
-      # 使 Codex/DSH 能 inspect/exec 生产容器（docker exec preflight 等）。
-      # 安全边界：docker.sock == host root-equivalent；只挂给可信 agent，
-      # DSH UI 禁止公网匿名访问。应用后需重建容器：
-      #   nas/lib.sh compose_cmd up -d --force-recreate
-      - /var/run/docker.sock:/var/run/docker.sock
+      # 宿主 Docker socket **不在基座里**（见文件尾注释）：它等价于 host root 权限，
+      # 只有确实需要的通道才挂 —— 由 docker-compose.docker-sock.yml 这个可选 override 提供
+      # （alpha 目录放它、rc 目录不放，保持"rc 无 docker.sock"的现状）。
       # GitHub SSH（可选）：宿主存在 GitHub deploy key 时启用只读挂载。
       # ⚠ 若宿主路径不存在，docker compose up 会失败——先确认宿主 key 路径。
       # - /root/.ssh:/root/.ssh:ro
