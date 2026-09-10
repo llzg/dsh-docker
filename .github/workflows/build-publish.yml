@@ -189,23 +189,24 @@ jobs:
           JOB='${{ job.status }}'
           SHA='${{ github.sha }}'
           RUN_URL='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-          mkdir -p .status
           node -e '
             const fs=require("fs");
             const [ch,ver,job,sha,url]=process.argv.slice(1);
             const out={channel:ch,version:ver,conclusion:job,headSha:sha,runUrl:url,updatedAt:new Date().toISOString()};
-            fs.writeFileSync(`.status/build-status-${ch}.json`, JSON.stringify(out,null,2)+"\n");
-            console.log(JSON.stringify(out));
+            const file=`build-status-${ch}.json`;   // 写在工作区根目录，避免子目录/glob 失配
+            fs.writeFileSync(file, JSON.stringify(out,null,2)+"\n");
+            console.log("wrote", file, JSON.stringify(out));
           ' "$C" "$V" "$JOB" "$SHA" "$RUN_URL"
+          ls -la build-status-*.json
 
       - name: Upload build status
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: build-status-${{ matrix.channel }}
-          path: .status/build-status-*.json
+          path: build-status-*.json
           retention-days: 14
-          if-no-files-found: warn
+          if-no-files-found: error
 
   record-status:
     needs: [resolve, build-publish]
@@ -233,14 +234,19 @@ jobs:
             let cur={schemaVersion:1,channels:{}};
             try{ cur=JSON.parse(fs.readFileSync(file,"utf8")); }catch{}
             cur.schemaVersion=1; cur.channels=cur.channels||{};
+            // 目录/文件缺失不能算失败：构建失败时可能没有状态产物，
+            // 这只是"没东西可记"，不应把整个 run 判红（原来是 readdirSync 抛异常）。
+            let files=[];
+            try{ files=fs.readdirSync(".").filter(f=>/^build-status-.*\.json$/.test(f)); }catch{}
+            if(!files.length){ console.log("::warning::没有 build-status-*.json 产物（构建可能在写状态前就失败），跳过合并"); process.exit(0); }
             let n=0;
-            for(const f of fs.readdirSync(".status").filter(f=>f.endsWith(".json"))){
-              const j=JSON.parse(fs.readFileSync(path.join(".status",f),"utf8"));
-              cur.channels[j.channel]=j; n++;
+            for(const f of files){
+              const j=JSON.parse(fs.readFileSync(path.join(".",f),"utf8"));
+              if(j && j.channel){ cur.channels[j.channel]=j; n++; }
             }
             cur.updatedAt=new Date().toISOString();
             fs.writeFileSync(file, JSON.stringify(cur,null,2)+"\n");
-            console.log(`merged ${n} channel status`);
+            console.log("merged "+n+" channel status");
           '
 
       - name: Commit build status

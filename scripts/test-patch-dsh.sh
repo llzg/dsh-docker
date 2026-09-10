@@ -43,6 +43,13 @@ with open(idx, "w", encoding="utf-8") as fh:
     fh.write("function isTrustedApiRequest(request, this.trustedHosts) { return trustedHosts.length > 0; }\n")
 with open(os.path.join(base, "dsh-client-connection", "lib", "client.js"), "w", encoding="utf-8") as fh:
     fh.write("window.__ModuleLoader__.load({ id: 'x' });\n")
+# settings 主包：含锚点（现实里 0.1.5-alpha.2 只有它还有这个判定）
+os.makedirs(os.path.join(base, "dsh-client-ui-settings", "lib"), exist_ok=True)
+with open(os.path.join(base, "dsh-client-ui-settings", "lib", "client.js"), "w", encoding="utf-8") as fh:
+    fh.write("const persistence = ctx.remote.$host.isLoopback ? \"host\" : \"memory\";\n")
+os.makedirs(os.path.join(base, "dsh-client-ui-settings-models", "lib"), exist_ok=True)
+with open(os.path.join(base, "dsh-client-ui-settings-models", "lib", "client.js"), "w", encoding="utf-8") as fh:
+    fh.write("// 该包在 0.1.5-alpha.2 已无 host/memory 判定（合法 N/A）\n")
 print("锚点已抽出，行数:", anchor.count("\n") + 1)
 PY
 [ -s "$TMP/base/dsh-client-connection/lib/index.js" ] && P=1 || P=0
@@ -87,6 +94,23 @@ cp "$TMP/base/dsh-client-connection/lib/client.js" "$TMP/nomarker/dsh-client-con
 DSH_PATCH_BASE="$TMP/nomarker" STRICT=1 DSH_ICON=/nonexistent bash "$PATCH" > "$TMP/nm.log" 2>&1; RC=$?
 grep -q 'marker missing for token-pinning' "$TMP/nm.log" && P=1 || P=0
 t P11 "反向：marker 丢失 → 校验失败" "$P" "rc=$RC"
+
+# ── 7) 语义：某个 settings 包没有锚点 = 合法 N/A（不能 FAIL）─────────────
+printf '%s' "$OUT" | grep -q 'SKIP settings-host-mode: dsh-client-ui-settings-models' && P=1 || P=0
+t P12 "无锚点的 settings 包记为 SKIP（合法 N/A），不误报失败" "$P"
+
+# ── 8) 语义：三个 settings 包全都没有锚点 = 上游重写 → 必须 FAIL ──────────
+mkdir -p "$TMP/noanchor/dsh-client-connection/lib"
+python3 - "$TMP/pristine.js" "$TMP/noanchor/dsh-client-connection/lib/index.js" <<'PY'
+import sys
+open(sys.argv[2], 'w', encoding='utf-8').write(open(sys.argv[1], encoding='utf-8').read())
+PY
+cp "$TMP/base/dsh-client-connection/lib/client.js" "$TMP/noanchor/dsh-client-connection/lib/client.js"
+mkdir -p "$TMP/noanchor/dsh-client-ui-settings/lib"
+printf 'const x = 1; // 无 host/memory 判定\n' > "$TMP/noanchor/dsh-client-ui-settings/lib/client.js"
+DSH_PATCH_BASE="$TMP/noanchor" STRICT=1 DSH_ICON=/nonexistent bash "$PATCH" > "$TMP/na.log" 2>&1; RC=$?
+grep -q '三个 settings 包都没有锚点' "$TMP/na.log" && P=1 || P=0
+t P13 "全部 settings 包无锚点 → FAIL（防上游静默重写）" "$P" "rc=$RC"
 
 echo
 echo "----------------------------------------"

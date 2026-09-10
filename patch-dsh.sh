@@ -32,9 +32,14 @@ has_marker() { [ -f "$1" ] && grep -qF "$MARKER:$2" "$1"; }
 #    锚点变更史（已核对 npm 包 lib/client.js）：
 #      0.1.0-rc.6 / 0.1.1-rc.1        : connection.isLoopback ? "host" : "memory"   （旧文本，兼容）
 #      >= 0.1.2-alpha.2（当前上游）   : ctx.remote.$host.isLoopback ? "host" : "memory"
-#    两者任一命中都必须替换为强制 "host" 并写 marker；两者都不在且无 marker → FAIL。
+#    语义（2026-09-10 修正）：上游把该逻辑收敛到了部分包，**不是每个包都有锚点**。
+#      - 0.1.5-alpha.2 实测：dsh-client-ui-settings 有锚点；-models 已完全移除该判定；
+#        -general 改成用 isLoopback 选 documentController（不再有 "host"/"memory" 三元）。
+#      因此"某个包没有锚点"是**合法不适用**（SKIP），不能 FAIL；但必须守住更强的全局不变量：
+#      **至少有一个包真的被打上补丁**，否则说明上游改了写法/移除了功能 → FAIL（防静默失效）。
 ANCHOR_HOST_NEW='ctx.remote.$host.isLoopback ? "host" : "memory"'
 ANCHOR_HOST_OLD='connection.isLoopback ? "host" : "memory"'
+SETTINGS_PATCHED=0
 for pkg in dsh-client-ui-settings dsh-client-ui-settings-models dsh-client-ui-settings-general; do
   f="$BASE/$pkg/lib/client.js"
   if [ ! -f "$f" ]; then
@@ -43,6 +48,7 @@ for pkg in dsh-client-ui-settings dsh-client-ui-settings-models dsh-client-ui-se
   fi
   if has_marker "$f" settings-host-mode; then
     echo "settings-host-mode: already patched (marker present) in $pkg"
+    SETTINGS_PATCHED=1
     continue
   fi
   if grep -qF "$ANCHOR_HOST_NEW" "$f"; then
@@ -52,11 +58,15 @@ for pkg in dsh-client-ui-settings dsh-client-ui-settings-models dsh-client-ui-se
     sed -i 's/connection\.isLoopback ? "host" : "memory"/"host"/g' "$f"
     echo "settings-host-mode: patched $pkg (legacy anchor)"
   else
-    fail "anchor missing settings-host-mode: 既无新锚点 '$ANCHOR_HOST_NEW' 也无旧锚点 '$ANCHOR_HOST_OLD'，且无 marker: $f"
+    echo "SKIP settings-host-mode: $pkg 已无 \"host\"/\"memory\" 持久化判定（上游改了实现），patch 不适用: $f"
     continue
   fi
   write_marker "$f" settings-host-mode
+  SETTINGS_PATCHED=1
 done
+if [ "$SETTINGS_PATCHED" != "1" ]; then
+  fail "settings-host-mode: 三个 settings 包都没有锚点也没有 marker —— 上游已重写该逻辑，必须更新 patch-dsh.sh（防静默失效）"
+fi
 
 # 2) crypto.randomUUID polyfill: in a non-secure context (plain HTTP over a LAN IP)
 #    browsers omit crypto.randomUUID; provide a UUIDv4 fallback via getRandomValues.
@@ -324,8 +334,19 @@ verify_marker() { # file marker-name label
   fi
 }
 if [ "$STRICT" = "1" ]; then
+  # settings：某个包没有锚点是**合法不适用**（上游把逻辑收敛了），
+  #   但"锚点还在、补丁却没打上"必须 FAIL（这正是旧版静默失效的形态）。
   for pkg in dsh-client-ui-settings dsh-client-ui-settings-models dsh-client-ui-settings-general; do
-    verify_marker "$BASE/$pkg/lib/client.js" settings-host-mode "$pkg"
+    f="$BASE/$pkg/lib/client.js"
+    if [ ! -f "$f" ]; then
+      echo "verify: settings-host-mode SKIP（目标不存在，patch 不适用）: $pkg"
+    elif has_marker "$f" settings-host-mode; then
+      echo "verify: settings-host-mode OK ($pkg)"
+    elif grep -qF "$ANCHOR_HOST_NEW" "$f" || grep -qF "$ANCHOR_HOST_OLD" "$f"; then
+      fail "marker missing for settings-host-mode in $pkg（锚点仍在但补丁未生效）: $f"
+    else
+      echo "verify: settings-host-mode N/A（$pkg 已无该判定，上游实现变更）"
+    fi
   done
   for pkg in dsh-client-connection dsh-client-ui-conversation; do
     verify_marker "$BASE/$pkg/lib/client.js" randomuuid-polyfill "$pkg"
