@@ -258,3 +258,61 @@ NEW_IMAGE=192.168.5.35:5050/llzg/dsh-docker:0.1.5-alpha.2 RESCUE_PATCH=0 \
 > dsh-proxy 占用而起不来。所以切换顺序必须是"先起 proxy profile 并确认回代可用，
 > 再停掉手写的 proxy 容器"，或者先用 `DSH_BIND_IP=127.0.0.1` 让 dsh 容器让出宿主端口。
 
+### 9.1 切换手册（2026-09-10 已在隔离项目里彩排通过）
+
+**模式 B（推荐，保留 proxy 的 CIDR 白名单 + 令牌注入）** 的关键变量：
+
+| 变量 | 值 | 说明 |
+|---|---|---|
+| `DSH_BIND_IP` | `127.0.0.1` | dsh 容器只绑回环，宿主端口留给 proxy |
+| `DSH_PUBLISH_PORT` | `3080` | dsh 容器 → 宿主回环 3080（**必须与 `DSH_PORT` 分开**，否则和 proxy 抢端口） |
+| `DSH_PORT` | `3081` / `3083` | proxy 对外端口 |
+| `DSH_INTERNAL_PORT` | `3080` | proxy 的 `BACKEND=http://127.0.0.1:<这个>` |
+| `DSH_PROXY_CONTAINER` | `dsh-proxy` / `dsh-proxy-rc` | proxy 容器名 |
+| `DSH_VERSION_PORT` | `0` | 通道容器不起版本页（3082 由 `dsh-version` 统一提供） |
+
+**彩排结论（隔离项目 dsh-rehearsal，端口 3181→3180，空工作区）**：
+`dsh` 与 `proxy` 两个服务都 healthy，`http://127.0.0.1:3181/?token=…` 返回 **200**
+（27786 字节，标题 `DeepSeek Harness`），proxy 日志可见 `303 → 200` 的令牌注入链路。
+即：compose 化的 dsh+proxy 组合是**可用**的，不是纸面方案。
+
+切换步骤（每通道 1–2 分钟中断；先在 rc 上做，再动 alpha）：
+
+```sh
+# 0) 前置：通道目录要有 compose 文件与 .env（本仓库 nas/docker-compose.yml + 上表变量）
+#    已为两个通道生成：/volume1/docker/dsh-alpha5/.env、/volume1/docker/deepseek-harness/.env
+cp /volume1/docker/dsh-deploy/nas-docker-compose.yml.new /volume1/docker/dsh-rc/docker-compose.yml
+
+# 1) 先校验（不创建任何容器）——config 输出的端口/挂载/env 必须与手写容器逐项一致
+cd /volume1/docker/dsh-deploy
+docker compose -p dsh-rc --project-directory /volume1/docker/deepseek-harness \
+  -f /volume1/docker/deepseek-harness/docker-compose.yml --profile proxy config
+
+# 2) 停旧的手写容器（只停不删 = 回滚点；proxy 必须停，否则端口被占）
+docker stop dsh-proxy-rc dsh-rc1
+
+# 3) 起 compose 项目（--wait 会等两个服务 healthcheck 通过）
+docker compose -p dsh-rc --project-directory /volume1/docker/deepseek-harness \
+  -f /volume1/docker/deepseek-harness/docker-compose.yml --profile proxy up -d --wait
+
+# 4) 验证：3083 应返回 200；容器名、绑定的 IP、数据目录都要和以前一致
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3083/
+sh check-image-drift.sh rc
+
+# 回滚（任一步不通过）：停 compose 项目，恢复手写容器
+docker compose -p dsh-rc --project-directory /volume1/docker/deepseek-harness \
+  -f /volume1/docker/deepseek-harness/docker-compose.yml --profile proxy down
+docker start dsh-rc1 dsh-proxy-rc
+```
+
+**切换前必须敲定的两个决定**（都影响生产行为，别默认）：
+
+1. **rc 是否也挂 `docker.sock`**：当前手写的 rc 容器**没有**挂（只有 alpha 挂），
+   而 compose 基座里是统一挂的 —— 直接切换等于给 rc 容器开了 host root 等价权限。
+   要保持现状就得给 rc 一个不挂 socket 的 override，或把 socket 那行也做成可选 override。
+2. **容器名保不保**：保持 `deepseek-harness-alpha` / `dsh-rc1` 可以不动 SSOT 与
+   `check-image-drift.sh` 的映射（上面 .env 就是这么写的）；若要按 §9 改成
+   `dsh-alpha` / `dsh-rc`，必须同步改 `dsh-version.json` 的 `channels.<ch>.container`，
+   否则版本页与漂移检查会找不到容器。
+
+

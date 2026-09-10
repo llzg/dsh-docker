@@ -24,11 +24,14 @@ services:
     container_name: ${DSH_CONTAINER:-dsh-alpha}
     restart: unless-stopped
     ports:
-      # 两种对外模式（Phase 2 准备）：
-      #   A) 直接发端口（默认）：DSH_BIND_IP=0.0.0.0 → 宿主 0.0.0.0:3081
-      #   B) proxy 反代模式：DSH_BIND_IP=127.0.0.1 + 起 proxy 服务（profiles: proxy）
-      #      对外只由 host 网络的 proxy 暴露 DSH_PORT，保留 CIDR 白名单/令牌注入等特性。
-      - "${DSH_BIND_IP:-0.0.0.0}:${DSH_PORT:-3081}:3080"
+      # 两种对外模式（Phase 2）：
+      #   A) 直接发端口（默认）：DSH_BIND_IP=0.0.0.0 + DSH_PUBLISH_PORT=3081
+      #   B) proxy 反代模式：DSH_BIND_IP=127.0.0.1 + DSH_PUBLISH_PORT=3080（回环）
+      #      + 起 proxy 服务（--profile proxy）：proxy 用 host 网络对外监听 DSH_PORT=3081，
+      #      回代 BACKEND=http://127.0.0.1:3080，保留 CIDR 白名单/令牌注入等特性。
+      # ⚠ 两个端口必须分开写：proxy 模式如果 dsh 服务也发 DSH_PORT，会和 proxy 抢同一个
+      #   宿主端口，compose up 直接失败（bind: address already in use）。
+      - "${DSH_BIND_IP:-0.0.0.0}:${DSH_PUBLISH_PORT:?DSH_PUBLISH_PORT 未设置：直发模式填 DSH_PORT(如 3081)，proxy 模式填 3080（回环）}:3080"
     environment:
       # ⚠ 不能写死 /data/dsh：alpha 通道的真实 DSH_HOME 是 /data/dsh/test/0.1.2-alpha.5
       #   （历史 pin 的工作区路径），写死会让 alpha 换了工作区、设置/插件全部"消失"。
