@@ -323,6 +323,36 @@ docker start dsh-rc1 dsh-proxy-rc
 alpha 仍挂 `docker.sock`、rc 不挂。回滚点：`*.pre-compose-20260910-184531`（rc）、
 `*.pre-compose-20260910-184611`（alpha）。
 
+### 9.2 Phase 2 之后：重建/对齐/回滚都走 compose（`recreate-dsh.py` 不再适用）
+
+`recreate-dsh.py` 是给"docker run 起的手写容器"用的（克隆配置、抢救可写层补丁、保留救援容器）。
+Phase 2 之后容器归 compose 管，再用它会出现两套管理方式打架。正确姿势：
+
+```sh
+# 1) 对齐"同版本 tag 被重推"的最新构建
+docker pull 192.168.5.35:5050/llzg/dsh-docker:<通道版本>
+cd /volume1/docker/dsh-alpha5 && docker compose -p dsh-alpha \
+  --project-directory /volume1/docker/dsh-alpha5 \
+  -f docker-compose.docker-sock.yml -f docker-compose.yml --profile proxy up -d --wait
+
+# 2) 校验（身份 + 漂移，不要只看 200）
+docker exec deepseek-harness-alpha cat /opt/dsh-build.json
+sh /volume1/docker/dsh-deploy/check-image-drift.sh
+
+# 3) 终极兜底：回滚到迁移前的手写容器（回滚点仍在）
+docker compose -p dsh-alpha --project-directory /volume1/docker/dsh-alpha5 \
+  -f docker-compose.docker-sock.yml -f docker-compose.yml --profile proxy down
+docker rename deepseek-harness-alpha.pre-compose-20260910-184611 deepseek-harness-alpha
+docker rename dsh-proxy.pre-compose-20260910-184611 dsh-proxy
+docker start deepseek-harness-alpha dsh-proxy
+```
+
+> **漂移是预期现象，不是故障**：CI 用同一版本号重建会重推同一个 tag，运行中的容器于是
+> 比 tag "落后一次构建"（同版本、行为一致）。workflow 的 `paths:` 过滤已把**文档/nas 改动**
+> 排除在重建之外 —— 只有真正影响镜像的改动（Dockerfile / 补丁 / 脚本 / SSOT / 资产）
+> 才会产生漂移。想彻底消除就改为按 digest 部署。
+
+
 **切换前必须敲定的两个决定**（都影响生产行为，别默认）：
 
 1. **rc 是否也挂 `docker.sock`**：当前手写的 rc 容器**没有**挂（只有 alpha 挂），
