@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "channels": {
+    "alpha": {
+      "channel": "alpha",
+      "version": "0.1.5-alpha.2",
+      "conclusion": "success",
+      "headSha": "bf3495fdd6f92429f0ee6b5c4971edf6ed68042c",
+      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/34443978965",
+      "updatedAt": "2026-09-10T06:12:16.151Z"
+    },
+    "rc": {
+      "channel": "rc",
+      "version": "0.1.5-rc.1",
+      "conclusion": "success",
+      "headSha": "bf3495fdd6f92429f0ee6b5c4971edf6ed68042c",
+      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/34443978965",
+      "updatedAt": "2026-09-10T06:12:16.070Z"
+    }
+  },
+  "updatedAt": "2026-09-10T06:12:27.811Z"
+}
