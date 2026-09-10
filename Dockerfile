@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # DeepSeek Harness Web — auto-build image (GitHub Actions → GHCR → NAS watchtower)
 #
 # Pure source build from the official npm release channel:
