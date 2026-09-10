@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # DeepSeek Harness Web — auto-build image (GitHub Actions → GHCR → NAS watchtower)
 #
 # Pure source build from the official npm release channel:
@@ -5,6 +6,8 @@
 #   dist-tag "latest"); there are no GitHub Releases/tags upstream.
 #
 # Build args:
+#   BASE_IMAGE    基础镜像（默认 Docker Hub；可指向内网拉取缓存，如
+#                 192.168.5.35:5051/library/node:22-bookworm-slim，避免每次走公网）
 #   DSH_VERSION   npm version to install (e.g. 0.1.3-alpha.2); default = npm dist-tag latest
 #   DSH_CHANNEL   双通道契约（docs/dual-channel.md §2/§6）的通道名 alpha|rc|stable
 #                 → OCI label org.opencontainers.image.channel + /opt/dsh-build.json
@@ -17,8 +20,9 @@
 
 ARG DSH_VERSION=0.1.3-alpha.2
 ARG DSH_CHANNEL=alpha
+ARG BASE_IMAGE=node:22-bookworm-slim
 
-FROM node:22-bookworm-slim AS base
+FROM ${BASE_IMAGE} AS base
 
 ARG DSH_VERSION
 ARG DSH_CHANNEL=alpha
@@ -36,14 +40,20 @@ LABEL org.opencontainers.image.channel="${DSH_CHANNEL}"
 # Build toolchain for native modules (e.g. node-pty) if prebuilds are unavailable.
 # Vulkan 依赖：llama.cpp GGML_VULKAN 编译需要 glslc + 头文件（libvulkan-dev 自带）；
 # mesa-vulkan-drivers 提供 Intel Iris Xe 的 Vulkan ICD（运行时，配合 /dev/dri 直通）。
-RUN apt-get update \
+# cache mount：apt 的包缓存与索引跨构建保留。sharing=locked 避免并行矩阵构建互踩。
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates curl \
         libvulkan-dev libvulkan1 mesa-vulkan-drivers glslc glslang-tools spirv-tools spirv-headers \
     && rm -rf /var/lib/apt/lists/*
 
 # Official DeepSeek Harness CLI (npm registry, published by DeepSeek).
 # Version is parametric: the CI workflow resolves it from the npm dist-tag.
-RUN npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs "@deepseek-ai/dsh@${DSH_VERSION}"
+# npm 缓存挂载：dsh 依赖树有数百个包，仅版本号变化时靠缓存复用 tarball，
+# 避免每次都从公网重下（这是本地构建从 ~100s 降到十几秒的关键之一）。
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs "@deepseek-ai/dsh@${DSH_VERSION}"
 
 # pnpm（Profile 插件管理器依赖）：`dsh plugin` 是 pnpm 转发器，没有 pnpm 时
 # `dsh plugin --profile web add ...` 直接 exit 127（实测）。用 Node 自带
@@ -59,7 +69,8 @@ RUN corepack enable \
 # 供应链：固定版本安装（Astral 官方按版本路径分发 install.sh），不用 latest；
 # 升级 uv 改 ARG UV_VERSION 即可。
 ARG UV_VERSION=0.8.15
-RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | env UV_INSTALL_DIR=/usr/local/bin sh \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | env UV_INSTALL_DIR=/usr/local/bin sh \
     && uv --version
 
 ENV DSH_HOME=/data/dsh
@@ -108,7 +119,8 @@ RUN node -e "const fs=require('fs');const meta={dshVersion:process.env.DSH_VERSI
     cat /opt/dsh-build.json
 # semver（版本检测/版本页共用，随镜像持久）——固定版本号，避免重建漂移
 ARG SEMVER_VERSION=7.6.3
-RUN cd /opt && npm init -y >/dev/null 2>&1 && npm install --no-audit --no-fund "semver@${SEMVER_VERSION}" 2>&1 | tail -1
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    cd /opt && npm init -y >/dev/null 2>&1 && npm install --no-audit --no-fund "semver@${SEMVER_VERSION}" 2>&1 | tail -1
 COPY scripts/version-policy.js /opt/version-policy.js
 COPY scripts/safe-deploy-policy.js /opt/safe-deploy-policy.js
 COPY scripts/registry.js /opt/registry.js

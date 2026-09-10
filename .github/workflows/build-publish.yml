@@ -47,6 +47,8 @@ concurrency:
 #   vars.DSH_REGISTRIES      收敛判定/版本页查询的仓库列表（逗号分隔）；默认 GHCR
 #   secrets.DSH_REGISTRY_USER / DSH_REGISTRY_PASSWORD   私有 registry 凭据
 env:
+  # 自建 runner 上的 BuildKit 本地层缓存目录（持久盘，跨构建复用）
+  DSH_CACHE_DIR: ${{ vars.DSH_CACHE_DIR || '/volume1/docker/buildx-cache/dsh-docker' }}
   HTTP_PROXY: ${{ vars.DSH_HTTP_PROXY }}
   HTTPS_PROXY: ${{ vars.DSH_HTTP_PROXY }}
   NO_PROXY: localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,.local
@@ -61,9 +63,19 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      # 固定版本依赖（不要用 latest：CI 结果必须可复现）
-      - name: Install deps (pinned)
-        run: npm install --no-save --no-audit --no-fund semver@7.6.3
+      # 固定版本依赖（不要用 latest：CI 结果必须可复现）。
+      # ⚠ 不用 npm：自建 runner（UGREEN）是 Debian 精简 node，没有 npm。
+      # 直接取 npm registry 的 tarball 解到 node_modules，GitHub 托管 runner 与自建 runner 通用。
+      - name: Install deps (pinned, npm-free)
+        run: |
+          set -euo pipefail
+          mkdir -p node_modules
+          curl -sSfL -o /tmp/semver.tgz "https://registry.npmjs.org/semver/-/semver-7.6.3.tgz"
+          rm -rf /tmp/semver-pkg && mkdir -p /tmp/semver-pkg
+          tar -xzf /tmp/semver.tgz -C /tmp/semver-pkg
+          rm -rf node_modules/semver
+          mv /tmp/semver-pkg/package node_modules/semver
+          node -e "console.log('semver', require('semver').valid('0.1.5-rc.1'))"
 
       - name: Policy tests (offline-safe unit tests)
         run: |
@@ -118,16 +130,37 @@ jobs:
 
       # 私有 registry（可选）：vars.DSH_PRIVATE_IMAGE 形如 192.168.5.35:5050/llzg/dsh-docker。
       # 注意：http(无 TLS) 的 registry 需要 runner 的 daemon 配 insecure-registries。
+      # 私有 registry（可选）：registry 主机名单独用 vars.DSH_PRIVATE_REGISTRY（不要塞整条镜像路径）。
+      # continue-on-error：自建 runner 上宿主往往已经 docker login（~/.docker/config.json），
+      # 没有配 secret 时不应把 job 判失败。
       - name: Login to private registry
-        if: vars.DSH_PRIVATE_IMAGE != ''
+        if: vars.DSH_PRIVATE_REGISTRY != ''
+        continue-on-error: true
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
-          registry: ${{ vars.DSH_PRIVATE_IMAGE }}
+          registry: ${{ vars.DSH_PRIVATE_REGISTRY }}
           username: ${{ secrets.DSH_REGISTRY_USER }}
           password: ${{ secrets.DSH_REGISTRY_PASSWORD }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      # 优先复用常驻 BuildKit（自建 runner 上持久层缓存，省掉每次 ~15s 的 bootstrap）：
+      #   homelab-builder（对方的 remote driver@tcp://127.0.0.1:1234）→ dsh-builder → 新建
+      - name: Select Buildx builder
+        run: |
+          set -euo pipefail
+          B="${DSH_BUILDER:-}"
+          for cand in $B homelab-builder dsh-builder; do
+            [ -n "$cand" ] || continue
+            if docker buildx inspect "$cand" >/dev/null 2>&1; then
+              docker buildx use "$cand"
+              echo "using existing builder: $cand"
+              docker buildx inspect --bootstrap | head -4
+              exit 0
+            fi
+          done
+          docker buildx create --name dsh-builder --driver docker-container --bootstrap --use >/dev/null
+          echo "created builder: dsh-builder"
+        env:
+          DSH_BUILDER: ${{ vars.DSH_BUILDER }}
 
       # prerelease（alpha/beta/rc）不打 latest，防止任何 latest 消费者把预发布版部署到生产；
       # stable 追加 latest。回滚一律用不可变 <version>-<sha> 或 <version>。
@@ -164,10 +197,14 @@ jobs:
           load: true
           push: false
           tags: ${{ env.IMAGE_TAGS }}
+          # 层缓存：自建 runner 用本地目录（快、无需认证）；托管 runner 无持久盘 → 跳过
+          cache-from: ${{ runner.environment == 'self-hosted' && format('type=local,src={0}/{1}', env.DSH_CACHE_DIR, matrix.channel) || '' }}
+          cache-to: ${{ runner.environment == 'self-hosted' && format('type=local,dest={0}/{1},mode=max', env.DSH_CACHE_DIR, matrix.channel) || '' }}
           build-args: |
             DSH_VERSION=${{ matrix.version }}
             GIT_REVISION=${{ github.sha }}
             DSH_CHANNEL=${{ matrix.channel }}
+            BASE_IMAGE=${{ vars.DSH_BASE_IMAGE || 'node:22-bookworm-slim' }}
 
       - name: Smoke test (web UI)
         run: ./scripts/smoke-test.sh "$GHCR_SMOKE_TAG"
