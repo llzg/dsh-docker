@@ -453,3 +453,61 @@ zstd -dc session.v2.jsonl.zstd | docker exec -i <容器> node /tmp/validate-rela
 > 排查小坑（踩过两次）：用 `sudo cp` 把会话文件拷到 /tmp 后**必须 chmod 644**，
 > 否则以普通用户跑 `zstd -dc` 会 Permission denied，脚本拿到空输入 → 假阴性"全部 OK"。
 > 另外 `execFileSync` 读几十 MB 的解压内容要显式给 `maxBuffer`（默认 1MB 会直接抛错）。
+
+### 9.5 升级后"切换模型报错"：旧工作区的 agent preset 不满足新 schema（2026-09-10 实测）
+
+**症状**：在 rc 通道（3083）切换模型报错；HTTP 全是 200、容器日志无报错、模型目录正常。
+把服务端返回体打出来才看到真正的错误（**RPC 用 200 带错误体**）：
+
+```
+resume failed for session "session-…": RemoteError: agent-presets: preset "code-subagents"
+failed to mount: failed to apply loader entry persona (@deepseek-ai/dsh-persona):
+invalid config: - $.prefix missing required value (at prefix)
+(/data/dsh/.agent-presets/code-subagents/agent.cordis.yml)
+```
+
+**根因**：DSH 0.1.5 的 `dsh-persona` 把 persona 配置改成了 `prefix`（必填）+ `suffix`，
+而 rc 工作区里的 `code-subagents` preset 是**旧版本写的**，只有 `persona.config.text`：
+
+```yaml
+# 旧（rc，会挂载失败）        # 新（alpha / 镜像自带 standard preset，正确）
+config:                        config:
+  text: >-                       prefix: >-
+    You are a coding agent …       You are a coding agent …
+                                   suffix: Your working directory is {{cwd}}.
+```
+
+**为什么切模型会撞上它**：切换模型要先 **resume 会话**，而 resume 要挂载该会话的 preset →
+preset 挂载失败 → 整个请求失败。所以它不只影响"切模型"，**继续对话、恢复旧会话同样会失败**
+（rc 通道当时所有用这个 preset 的会话都受影响）。
+
+**诊断手法（不用浏览器，直接打 RPC）**：DSH 的 Web API 是 RPC 信封，路径即端点、错误在响应体里，
+所以光看 HTTP 状态码会把问题漏掉：
+
+```sh
+H='Host: 192.168.5.16:3083'      # 必须带用户实际访问的 Host（见 §9.3）
+# 1) 模型目录（看 provider 加载是否正常）
+curl -s -X POST -H "$H" -H 'content-type: application/json' \
+  -d '{"type":"client-request","rpcId":"p1","method":"session/modelCatalog","payload":{"args":{}}}' \
+  http://127.0.0.1:3083/api/session/modelCatalog
+# 2) 复现"切模型"：args 里必须是 {request:{…}}（少了会被判 arguments-invalid）
+curl -s -X POST -H "$H" -H 'content-type: application/json' \
+  -d '{"type":"client-request","rpcId":"p2","method":"session/selectModel","payload":{"args":{"request":{"sessionId":"<sid>","provider":"deepseek-official","model":"deepseek-v4-flash"}}}}' \
+  http://127.0.0.1:3083/api/session/selectModel
+# 成功: {"result":{"ok":true,...}}   失败: {"result":{"ok":false,"error":{"code":…,"message":…}}}
+```
+
+**修法**：把工作区 preset 的 `persona.config.text` 改成 `prefix`（+ `suffix`），与镜像自带
+`standard` preset 或另一通道已验证可用的那份保持一致：
+
+```sh
+# 备份到工作区**之外**，改完立即用上面的 selectModel 复测（成功即 ok:true）
+cp <工作区>/.agent-presets/code-subagents/agent.cordis.yml <备份目录>/agent.cordis.yml.bak-$(date +%Y%m%d-%H%M%S)
+```
+
+本次实测：rc 修好后 `selectModel` 对 `deepseek-official` 与 `xiaomi-token-plan-cn` 都返回 `ok:true`，
+容器日志不再出现 resume failed。alpha 那份 preset 早先已有 `prefix`，所以 3081 一直正常。
+
+> 与 §9.4 是同一类问题的两个面：**升级后，旧工作区的数据（会话文件、agent preset）都要满足
+> 新版本的 schema 才能用**。区别是 §9.4 坏的是历史会话读取，这里坏的是 preset 挂载（影响面更大：
+> 该 preset 下的所有会话都无法 resume）。升级大版本前值得先做一遍这两项体检。
