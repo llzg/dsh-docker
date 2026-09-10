@@ -224,7 +224,7 @@ jobs:
         with:
           pattern: build-status-*
           merge-multiple: true
-          path: .status
+          path: .   # 与"写状态"步骤一致（都在工作区根目录），否则合并找不到文件
 
       - name: Merge into build-status.json
         run: |
@@ -255,6 +255,11 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 没产物时合并步骤会跳过（不写文件）→ 这里必须能安全退出，不能因 pathspec 报错
+          if [ ! -f build-status.json ]; then
+            echo "::warning::build-status.json 不存在（本次没有状态产物），跳过回写"
+            exit 0
+          fi
           git add build-status.json
           if git diff --cached --quiet; then
             echo "build-status.json 无变化"
