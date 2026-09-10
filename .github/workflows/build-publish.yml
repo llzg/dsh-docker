@@ -52,8 +52,6 @@ concurrency:
 #   vars.DSH_REGISTRIES      收敛判定/版本页查询的仓库列表（逗号分隔）；默认 GHCR
 #   secrets.DSH_REGISTRY_USER / DSH_REGISTRY_PASSWORD   私有 registry 凭据
 env:
-  # 自建 runner 上的 BuildKit 本地层缓存目录（持久盘，跨构建复用）
-  DSH_CACHE_DIR: ${{ vars.DSH_CACHE_DIR || '/volume1/docker/buildx-cache/dsh-docker' }}
   HTTP_PROXY: ${{ vars.DSH_HTTP_PROXY }}
   HTTPS_PROXY: ${{ vars.DSH_HTTP_PROXY }}
   NO_PROXY: localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,.local
@@ -180,15 +178,11 @@ jobs:
           fi
           echo "selected builder: $chosen"
           echo "DSH_SELECTED_BUILDER=$chosen" >> "$GITHUB_ENV"
-          DRIVER=$(docker buildx inspect --format '{{.Driver}}' "$chosen" 2>/dev/null || echo unknown)
-          echo "driver: $DRIVER"
-          # docker driver 不支持 cache 导出（会直接报 'Cache export is not supported for the docker driver'），
-          # 但它自己的层缓存本来就持久 → 这种情况不传 cache-from/to。
-          if [ "$DRIVER" = "docker" ]; then
-            echo "DSH_CACHE_EXPORT=0" >> "$GITHUB_ENV"
-          else
-            echo "DSH_CACHE_EXPORT=1" >> "$GITHUB_ENV"
-          fi
+          # 说明：不再传 cache-from/cache-to。自建 runner 上三种 builder 的层缓存本来就是持久的
+          #   default(docker driver)  → dockerd 内部 BuildKit 缓存（持久）
+          #   homelab-builder/buildx_buildkit_* → 各自 volume（持久）
+          # 而 docker driver 明确不支持 cache 导出（'Cache export is not supported for the docker driver'）；
+          # cache-from/to 只在"跨 builder 搬运缓存/临时 CI"场景才需要。
           docker buildx inspect "$chosen" 2>&1 | grep -E 'Name|Driver|Status|Platforms' | head -6 || true
         env:
           DSH_BUILDER: ${{ vars.DSH_BUILDER }}
@@ -235,9 +229,7 @@ jobs:
           load: true
           push: false
           tags: ${{ env.IMAGE_TAGS }}
-          # 层缓存：自建 runner 用本地目录（快、无需认证）；托管 runner 无持久盘 → 跳过
-          cache-from: ${{ env.DSH_CACHE_EXPORT == '1' && runner.environment == 'self-hosted' && format('type=local,src={0}/{1}', env.DSH_CACHE_DIR, matrix.channel) || '' }}
-          cache-to: ${{ env.DSH_CACHE_EXPORT == '1' && runner.environment == 'self-hosted' && format('type=local,dest={0}/{1},mode=max', env.DSH_CACHE_DIR, matrix.channel) || '' }}
+          # 层缓存走 builder 自身的持久缓存（见 Select Buildx builder 的说明），此处不传 cache-from/to
           build-args: |
             DSH_VERSION=${{ matrix.version }}
             GIT_REVISION=${{ github.sha }}
