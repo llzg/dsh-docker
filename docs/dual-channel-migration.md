@@ -237,6 +237,40 @@ NEW_IMAGE=192.168.5.35:5050/llzg/dsh-docker:0.1.5-alpha.2 RESCUE_PATCH=0 \
    必须先把名字改回来再重试）。
 
 
+### 9.3 ⚠ `--trusted-host` 必须覆盖"用户实际输入的地址"（2026-09-10 真实事故）
+
+DSH 的 `/api/*`（含 WebSocket `/api/remote.mux`）有一道**按请求 Host 匹配**的浏览器信任围栏；
+而 `dsh-proxy` 会**保留客户端的 Host** 转发（不改成 backend host）。因此：
+
+- `GET /` 仍能 200（页面打得开）；
+- 但 Host 不在 `--trusted-host` 列表里时，`/api/*` 与 WebSocket 全部 **403** →
+  界面表现为 **"一直重连" / "无法加载 Agent 预设（transport failure ... HTTP 403）"**。
+
+本次事故：把容器 CMD 从写死的 `--trusted-host 192.168.5.16` 改成 env 驱动的 `192.168.5.17`
+（误以为 .16 是过期值），而用户实际是用 **192.168.5.16** 访问 → 全线 403。
+`--trusted-host` 是 **`<authority...>` 变参**，所以正确做法是**把所有入口地址都列上**：
+
+```sh
+# .env（空格分隔多个地址；compose 的 command 对 $DSH_TRUSTED_HOST 故意不加引号，
+#        让多值展开成多个 --trusted-host）
+DSH_TRUSTED_HOST="192.168.5.16 192.168.5.17"
+```
+
+不用浏览器就能复现围栏（403 = 不受信；415/200 = 已过围栏，415 只是缺 body/content-type）：
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Host: 192.168.5.16:3081' \
+  -H 'content-type: application/json' -d '{}' http://127.0.0.1:3081/api/agentPresets/list
+# WebSocket：应看到 101 Switching Protocols
+curl -s -i -m 6 -H 'Host: 192.168.5.16:3081' -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  http://127.0.0.1:3081/api/remote.mux | head -1
+```
+
+**只验 `GET /` 返回 200 不足以证明链路可用** —— 与 §9.1 的"回环端口撞车"是同一类教训：
+状态码 200 不能证明"这条路真的通对了"。凡是经 proxy 的改动，验收都要包含
+`/api/*` 与 WebSocket 两项。
+
 ## 9. 起点 C 的 Phase 2（需维护窗口，每通道约 1–2 分钟中断）把每通道改造成**独立 compose 项目**（含其 proxy），让 pin/rollback/watchdog 走统一入口：
 
 1. `nas/docker-compose.yml` 增加两处能力（**2026-09-10 已实现并 `docker compose config` 验证**）：
