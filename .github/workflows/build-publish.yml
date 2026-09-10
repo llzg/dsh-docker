@@ -142,6 +142,13 @@ jobs:
       # 私有 registry（可选）：registry 主机名单独用 vars.DSH_PRIVATE_REGISTRY（不要塞整条镜像路径）。
       # continue-on-error：自建 runner 上宿主往往已经 docker login（~/.docker/config.json），
       # 没有配 secret 时不应把 job 判失败。
+      #
+      # ⚠ logout: false 是必须的（2026-09-10 实测事故）：
+      #   docker/login-action 默认在 post 步骤执行 `docker logout`，会把该 registry 的条目
+      #   从 **宿主** ~/.docker/config.json 里删掉。于是每次 CI 跑完，生产侧 `docker pull
+      #   192.168.5.35:5050/...` 就报 "no basic auth credentials"（版本页查询同样受影响）。
+      #   生产拉取路径依赖这份凭据，所以这里不清除；GHCR 的登录仍在 post 步骤登出（临时 token
+      #   不该留在宿主上）。
       - name: Login to private registry
         # secrets 不能直接写在 if 里 → 先落到 job 级 env 再判断；宿主已 docker login 时无需本步
         if: vars.DSH_PRIVATE_REGISTRY != '' && env.DSH_REGISTRY_USER != ''
@@ -151,6 +158,7 @@ jobs:
           registry: ${{ vars.DSH_PRIVATE_REGISTRY }}
           username: ${{ secrets.DSH_REGISTRY_USER }}
           password: ${{ secrets.DSH_REGISTRY_PASSWORD }}
+          logout: false
 
       # 优先复用常驻 BuildKit（自建 runner 上持久层缓存，省掉每次 ~15s 的 bootstrap）：
       #   homelab-builder（对方的 remote driver@tcp://127.0.0.1:1234）→ dsh-builder → 新建

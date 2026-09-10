@@ -208,6 +208,34 @@ python3 recreate-dsh.py apply <container>          # 执行：抢救补丁 → �
 python3 recreate-dsh.py rollback <container>       # 一键回滚到被保留的旧容器
 ```
 旧容器命名为 `<name>.pre-noproxy-<ts>`（只停不删），确认稳定后再手工 `docker rm`。
+（可能存在多代救援容器 → `rollback` 按 CreatedAt **取最近一代**，不会滚错版本。）
+
+### 版本升级（2026-09-10 实战验证：0.1.3-alpha.2/0.1.2-rc.1 → 0.1.5-alpha.2/0.1.5-rc.1）
+
+```sh
+cd /volume1/docker/dsh-deploy
+# 换镜像升级：NEW_IMAGE 指定新 tag；RESCUE_PATCH=0 表示信任新镜像内置补丁
+NEW_IMAGE=192.168.5.35:5050/llzg/dsh-docker:0.1.5-alpha.2 RESCUE_PATCH=0 \
+  python3 recreate-dsh.py apply deepseek-harness-alpha
+```
+
+四个开关（都是环境变量，缺省保持旧行为）：
+
+| 变量 | 作用 |
+|---|---|
+| `NEW_IMAGE` | 用指定镜像替换原镜像（**版本升级用它**）；不设 = 原地重建同一镜像 |
+| `RESCUE_PATCH=0` | 跳过"从旧容器可写层抢救 `/opt/patch-dsh.sh`"。**跨版本升级必须设 0**：旧补丁是照旧版本 `node_modules` 写的，注入到新版本会打错补丁。新镜像构建时已 STRICT 应用全部补丁（镜像内可验 `dsh-docker-patch:*` marker） |
+| `ENV_SET` / `ENV_SET_<N>` | 新增/覆盖容器环境变量，如 `ENV_SET='DSH_VERSION_PORT=0'`；含逗号的值用 `ENV_SET_1='DSH_REGISTRIES=a,b'` |
+| `HEALTH_CMD` | 覆盖探活命令（仅用于修正本就写错的探活，如 dsh-proxy 的探活误指 3080） |
+
+两条实战教训：
+
+1. **克隆容器时不要克隆 `org.opencontainers.image.*` 标签**（工具已改为跳过）：
+   那是旧镜像的版本/commit 元数据，换镜像后会变成假信息（版本页/排障会读到错的 version）。
+2. **`--no-healthcheck` 与 `--health-*` 互斥**（工具已修）：同时输出会直接导致
+   `docker run` 失败、新容器建不起来（版本页容器就这么踩过一次，旧容器已被改名停掉 →
+   必须先把名字改回来再重试）。
+
 
 ## 9. 起点 C 的 Phase 2（需维护窗口，每通道约 1–2 分钟中断）把每通道改造成**独立 compose 项目**（含其 proxy），让 pin/rollback/watchdog 走统一入口：
 

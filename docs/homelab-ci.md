@@ -133,6 +133,38 @@ apt/uv/npm 之前会**直接测试失败**。
 
 ## 3. NAS 侧从私有 registry 拉取（可选）
 
+### 3.0 部署侧切到内网 registry（2026-09-10 已落地）
+
+宿主 UGREEN 上的生产栈现在**全部从 `192.168.5.35:5050/llzg/dsh-docker` 拉取**（GHCR 仍双推，作为异地备份）。
+
+- **部署配置**：`/volume1/docker/dsh-deploy/.env`（只放白名单键；`dsh-safe-deploy` 会读它）：
+
+  ```sh
+  DSH_IMAGE_BASE=192.168.5.35:5050/llzg/dsh-docker
+  DSH_REGISTRIES=ghcr.io/llzg/dsh-docker,192.168.5.35:5050/llzg/dsh-docker
+  DSH_REGISTRY_USER=ci-deploy
+  DSH_REGISTRY_PASSWORD=***
+  ```
+
+  `dsh-safe-deploy` 只解析**白名单键**（`DSH_IMAGE_BASE` / `DSH_REGISTRIES` / `DSH_REGISTRY_*`），
+  不做整文件 `source` —— 避免 `.env` 里混进 `PATH`/`DSH_HOME` 之类的变量静默改变部署行为。
+  已有同名环境变量时以环境变量为准（命令行显式指定优先）。
+
+- **⚠ CI 不能登出私有 registry**：`docker/login-action` 默认在 post 步骤 `docker logout`，
+  会把该 registry 的条目从**宿主** `~/.docker/config.json` 删掉 → 之后生产 `docker pull`
+  报 `no basic auth credentials`（这正是 2026-09-10 反复出现、且"手工 login 后过一会儿又失效"
+  的原因）。workflow 里该步已加 `logout: false`；GHCR 的登录仍在 post 步骤登出。
+
+- **版本页同时展示两个 registry 的构建状态**：给 `dsh-version` 容器传
+  `DSH_REGISTRIES` + `DSH_REGISTRY_USER/PASSWORD`。注意全局凭据会被一起发给 ghcr.io → 403，
+  所以 `scripts/registry.js` 现在**带凭据失败时匿名回退重试**（ghcr 公开包匿名可读，
+  内网 registry 用凭据），两边的 tag 列表都能正常列出。
+
+- **⚠ 宿主网络容器会抢版本页端口**：`dsh-proxy`/`dsh-proxy-rc` 用 `network_mode: host`，
+  若它们的 `DSH_VERSION_PORT` 不是 `0`，entrypoint 会在**宿主机**上另起一个镜像内置的
+  版本页（旧代码），把 3082 占掉 → 真正的 `dsh-version` 绑不上 3082 而反复重启
+  （现象：页面显示的是旧版单通道页面）。现在两个 proxy 容器都显式设 `DSH_VERSION_PORT=0`。
+
 ```sh
 # 1) 宿主允许 http registry（若用 192.168.5.35:5050 这种无 TLS 的地址）
 sudo vi /etc/docker/daemon.json

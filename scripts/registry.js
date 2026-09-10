@@ -110,13 +110,22 @@ async function listTags(ref, opts = {}) {
   const schemes = forced ? [forced] : (registry === 'ghcr.io' ? ['https'] : ['https', 'http']);
 
   if (registry === 'ghcr.io') {
-    const t = await ghcrToken(repository, auth);
+    let used = !!auth;
+    let t = await ghcrToken(repository, auth);
+    // 全局凭据（DSH_REGISTRY_USER/PASSWORD）是给**内网私有 registry** 的，但它是全局的，
+    // 会被一起发给 ghcr.io → 403（实测：版本页同时查 5050 与 ghcr 时 ghcr 项报
+    // "ghcr token: HTTP 403（需要凭据）"）。因此带凭据失败时**回退匿名**再试一次：
+    // ghcr 上的公开包匿名可读，凭据只对私有包有意义。
+    if (t.error && auth) {
+      t = await ghcrToken(repository, null);
+      if (!t.error) used = false;
+    }
     if (t.error) return { status: 'error', registry, repository, scheme: 'https', tags: [], error: `ghcr token: ${t.error}` };
     const res = await getJson(`https://ghcr.io/v2/${repository}/tags/list?n=1000`, { Authorization: `Bearer ${t.token}` });
     if (res.error || !res.data || !Array.isArray(res.data.tags)) {
       return { status: 'error', registry, repository, scheme: 'https', tags: [], error: res.error || 'tags 列表不可读' };
     }
-    return { status: 'ok', registry, repository, scheme: 'https', authUsed: !!auth, tags: res.data.tags, error: null };
+    return { status: 'ok', registry, repository, scheme: 'https', authUsed: used, tags: res.data.tags, error: null };
   }
 
   const errors = [];
@@ -129,8 +138,20 @@ async function listTags(ref, opts = {}) {
       const tags = Array.isArray(res.data.tags) ? res.data.tags : [];
       return { status: 'ok', registry, repository, scheme, authUsed: !!auth, tags, error: null };
     }
-    errors.push(`${scheme}: ${res.error}`);
+    errors.push(`${scheme}${auth ? '(带凭据)' : ''}: ${res.error}`);
     // 401/403 在 http 上不会变好（除非是 scheme 问题），但 https→http 探测仍值得继续
+  }
+  // 兜底：带全局凭据访问**公开** registry 会被 401/403 挡掉（凭据是给内网私有 registry 的，
+  // 却是全局环境变量）→ 再匿名试一遍，只有在 "原来就没带凭据" 时才跳过。
+  if (auth) {
+    for (const scheme of schemes) {
+      const res = await getJson(`${scheme}://${registry}/v2/${repository}/tags/list?n=1000`, {});
+      if (!res.error && res.data && typeof res.data === 'object') {
+        const tags = Array.isArray(res.data.tags) ? res.data.tags : [];
+        return { status: 'ok', registry, repository, scheme, authUsed: false, tags, error: null };
+      }
+      errors.push(`${scheme}(匿名回退): ${res.error}`);
+    }
   }
   return { status: 'error', registry, repository, scheme: schemes.join('→'), tags: [], error: errors.join('; ') };
 }

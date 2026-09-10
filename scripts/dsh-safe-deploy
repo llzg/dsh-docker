@@ -17,6 +17,24 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ── 部署侧配置：$REPO_DIR/.env（可选）──────────────────────────────────────────
+# 只认**白名单键**，不做整文件 source —— .env 里混进别的变量（PATH/DSH_HOME/…）
+# 会静默改变脚本行为，白名单解析既满足"把镜像源切到内网 registry"，又不会误伤。
+# 已有同名环境变量时以环境变量为准（命令行显式指定优先）。
+if [ -f "$REPO_DIR/.env" ]; then
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in ''|\#*) continue ;; esac
+    _key="${_line%%=*}"; _val="${_line#*=}"
+    case "$_key" in
+      DSH_IMAGE_BASE|DSH_REGISTRIES|DSH_REGISTRY_USER|DSH_REGISTRY_PASSWORD|DSH_REGISTRY_SCHEME|DSH_REGISTRY_TIMEOUT)
+        if [ -z "$(printenv "$_key" || true)" ]; then export "$_key=$_val"; fi
+        ;;
+    esac
+  done < "$REPO_DIR/.env"
+  unset _line _key _val
+fi
+
 SSOT_BASE="${DSH_SSOT:-$REPO_DIR/dsh-version.json}"
 IMAGE_BASE="${DSH_IMAGE_BASE:-ghcr.io/llzg/dsh-docker}"
 TRUSTED_HOST="${DSH_TRUSTED_HOST:-192.168.5.17}"
