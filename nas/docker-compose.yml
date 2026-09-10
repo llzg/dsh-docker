@@ -23,6 +23,9 @@ services:
     image: "${DSH_IMAGE:?DSH_IMAGE 未设置：请先运行 install.sh 生成 .env}"
     container_name: ${DSH_CONTAINER:-dsh-alpha}
     restart: unless-stopped
+    # 与镜像默认 CMD 等价，但 **$DSH_TRUSTED_HOST 不加引号** → 支持空格分隔的多个受信地址
+    # （DSH 的 --trusted-host 是 <authority...> 变参）。
+    command: ["sh", "-c", "exec dsh --profile web --trusted-host $DSH_TRUSTED_HOST --no-open"]
     ports:
       # 两种对外模式（Phase 2）：
       #   A) 直接发端口（默认）：DSH_BIND_IP=0.0.0.0 + DSH_PUBLISH_PORT=3081
@@ -39,7 +42,13 @@ services:
       - DSH_CHANNEL=${DSH_CHANNEL:-alpha}
       - DSH_TELEMETRY_DISABLED=1
       # --trusted-host 不再硬编码在 Dockerfile CMD（契约 §6）
-      - DSH_TRUSTED_HOST=${DSH_TRUSTED_HOST:-192.168.5.17}
+      # ⚠ 可以放多个 authority（空格分隔）：DSH 的 /api 浏览器信任围栏按请求的 **Host** 匹配，
+      #   而 proxy 会**保留客户端 Host** 转发 —— 用户用哪个地址访问，那个地址就必须在列表里。
+      #   实测事故（2026-09-10）：容器只信任 192.168.5.17，而用户浏览器用 192.168.5.16 访问 →
+      #   `GET /` 能打开、但 `/api/*` 与 WebSocket(`/api/remote.mux`) 全部 403，
+      #   界面表现为"一直重连 / 无法加载 Agent 预设"。改回/补齐 .16 即可。
+      #   注意下面 command 里对这个变量**故意不加引号**，让空格分隔的多值展开成多个 --trusted-host。
+      - DSH_TRUSTED_HOST=${DSH_TRUSTED_HOST:-192.168.5.16 192.168.5.17}
       # ⚠ 用 host 网络跑 proxy 的容器必须显式设 0：0 之外的取值会让 entrypoint 在
       #   **宿主机**上另起一个镜像内置的版本页，把 3082 抢掉（实测：真正的 dsh-version
       #   因此绑不上端口而反复重启，页面显示的是旧代码渲染的单通道页）。
