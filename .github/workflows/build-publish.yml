@@ -120,6 +120,9 @@ jobs:
     if: needs.resolve.outputs.any_build == '1'
     runs-on: ${{ fromJSON(vars.DSH_RUNNER || '"ubuntu-latest"') }}
     timeout-minutes: 40
+    env:
+      # 供 if 条件判断使用（secrets 不能直接出现在 if 中）
+      DSH_REGISTRY_USER: ${{ secrets.DSH_REGISTRY_USER }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
@@ -142,7 +145,8 @@ jobs:
       # continue-on-error：自建 runner 上宿主往往已经 docker login（~/.docker/config.json），
       # 没有配 secret 时不应把 job 判失败。
       - name: Login to private registry
-        if: vars.DSH_PRIVATE_REGISTRY != ''
+        # secrets 不能直接写在 if 里 → 先落到 job 级 env 再判断；宿主已 docker login 时无需本步
+        if: vars.DSH_PRIVATE_REGISTRY != '' && env.DSH_REGISTRY_USER != ''
         continue-on-error: true
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -176,6 +180,15 @@ jobs:
           fi
           echo "selected builder: $chosen"
           echo "DSH_SELECTED_BUILDER=$chosen" >> "$GITHUB_ENV"
+          DRIVER=$(docker buildx inspect --format '{{.Driver}}' "$chosen" 2>/dev/null || echo unknown)
+          echo "driver: $DRIVER"
+          # docker driver 不支持 cache 导出（会直接报 'Cache export is not supported for the docker driver'），
+          # 但它自己的层缓存本来就持久 → 这种情况不传 cache-from/to。
+          if [ "$DRIVER" = "docker" ]; then
+            echo "DSH_CACHE_EXPORT=0" >> "$GITHUB_ENV"
+          else
+            echo "DSH_CACHE_EXPORT=1" >> "$GITHUB_ENV"
+          fi
           docker buildx inspect "$chosen" 2>&1 | grep -E 'Name|Driver|Status|Platforms' | head -6 || true
         env:
           DSH_BUILDER: ${{ vars.DSH_BUILDER }}
@@ -223,8 +236,8 @@ jobs:
           push: false
           tags: ${{ env.IMAGE_TAGS }}
           # 层缓存：自建 runner 用本地目录（快、无需认证）；托管 runner 无持久盘 → 跳过
-          cache-from: ${{ runner.environment == 'self-hosted' && format('type=local,src={0}/{1}', env.DSH_CACHE_DIR, matrix.channel) || '' }}
-          cache-to: ${{ runner.environment == 'self-hosted' && format('type=local,dest={0}/{1},mode=max', env.DSH_CACHE_DIR, matrix.channel) || '' }}
+          cache-from: ${{ env.DSH_CACHE_EXPORT == '1' && runner.environment == 'self-hosted' && format('type=local,src={0}/{1}', env.DSH_CACHE_DIR, matrix.channel) || '' }}
+          cache-to: ${{ env.DSH_CACHE_EXPORT == '1' && runner.environment == 'self-hosted' && format('type=local,dest={0}/{1},mode=max', env.DSH_CACHE_DIR, matrix.channel) || '' }}
           build-args: |
             DSH_VERSION=${{ matrix.version }}
             GIT_REVISION=${{ github.sha }}
