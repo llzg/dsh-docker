@@ -174,9 +174,42 @@ docker rm -f dsh-version && docker restart dsh-proxy-12079
 cd /volume1/docker/dsh-deploy && for f in *.bak-<ts>; do mv -f "$f" "${f%.bak-<ts>}"; done
 ```
 
-## 9. 起点 C 的 Phase 2（需维护窗口，每通道约 1–2 分钟中断）
 
-把每通道改造成**独立 compose 项目**（含其 proxy），让 pin/rollback/watchdog 走统一入口：
+## 8b. ⚠️ 重建容器的两个坑（2026-09-10 实测踩到，代价：3081 短时 401）
+
+生产容器把**状态存在可写层**里，重建就会丢。重建任何 dsh 容器前必须做这两件事，
+否则会出现"容器起来了、UI 却 401 / 永远 unhealthy"。
+
+### 坑 1：`/opt/patch-dsh.sh` 被替换过（含 token-pinning）
+- 现象：重建后 DSH 生成了**新的 launch token**（日志 `dsh web: ...?token=<新>`），
+  而 host 网络的 `dsh-proxy` 仍用旧的 `BOOTSTRAP_TOKEN` 去 bootstrap → **3081 返回 401**。
+- 原因：镜像自带的 `/opt/patch-dsh.sh` **没有** token-pinning；运行中的容器里它是
+  **可写层**里被 workspace 版本覆盖过的（`md5` 与 `<workspace>/nas_docker/patch-dsh.sh` 相同）。
+  token-pinning 让 DSH 认 `DSH_LAUNCH_TOKEN`，从而与 proxy 的 `BOOTSTRAP_TOKEN` 对齐。
+- 正确做法（`nas/recreate-dsh.py` 已自动做）：
+  1. 停旧容器前 `docker cp <old>:/opt/patch-dsh.sh <host>` 抢救出来；
+  2. 起新容器后 `docker cp <host-file> <new>:/opt/patch-dsh.sh`；
+  3. `docker restart <new>`，让 entrypoint 重新应用补丁；
+  4. 校验 `docker logs <new> | grep -o 'token=...' | tail -1` 与 proxy 的 `BOOTSTRAP_TOKEN` **一致**。
+
+### 坑 2：HEALTHCHECK 被改成了 TCP 探活
+- 现象：重建后容器永远 `unhealthy`。
+- 原因：镜像自带的 HEALTHCHECK 用 `fetch('http://127.0.0.1:3080/')` 判 `r.ok`，
+  而 DSH 0.1.2-alpha.3+ 起 `"/"` 无 token 返回 **401** → 恒失败；生产容器在创建时用
+  `--health-cmd` 覆盖成了 `net.connect(3080)`（TCP 通即健康）。
+- 正确做法：克隆容器时必须一并克隆 `Config.Healthcheck`（`recreate-dsh.py` 已实现）；
+  仓库 `Dockerfile` 的 HEALTHCHECK 也已改为 TCP 探活。
+
+### 重建的正确姿势（工具已就绪）
+```sh
+# 在 /volume1/docker/dsh-deploy 下
+python3 recreate-dsh.py plan  <container>          # 只读计划（密钥脱敏，含 healthcheck）
+python3 recreate-dsh.py apply <container>          # 执行：抢救补丁 → 改名保留旧容器 → 停 → 起 → 注入补丁 → 重启
+python3 recreate-dsh.py rollback <container>       # 一键回滚到被保留的旧容器
+```
+旧容器命名为 `<name>.pre-noproxy-<ts>`（只停不删），确认稳定后再手工 `docker rm`。
+
+## 9. 起点 C 的 Phase 2（需维护窗口，每通道约 1–2 分钟中断）把每通道改造成**独立 compose 项目**（含其 proxy），让 pin/rollback/watchdog 走统一入口：
 
 1. `nas/docker-compose.yml` 增加两处能力（尚未实施）：
    - `DSH_HOME` 由环境变量注入（alpha 现在是 `/data/dsh/test/0.1.2-alpha.5`，不能写死 `/data/dsh`）；

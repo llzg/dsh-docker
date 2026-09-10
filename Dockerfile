@@ -120,7 +120,11 @@ RUN node --check /opt/version-policy.js && node --check /opt/safe-deploy-policy.
     && chmod +x /opt/version-server.js
 
 # Healthcheck used both by the NAS watchdog (auto-rollback) and docker itself.
-# 探 3080（dsh web UI）；版本页 3082 的存活由 entrypoint 的守护循环负责（契约 §6）。
-# 0.1.1-rc.1 起未知路径返回 404（不再回退 SPA），故探活根路径 "/"。
+# ⚠ 必须用 **TCP 探活**，不能用 HTTP 200 探活：
+#   DSH 0.1.2-alpha.3 起 web 默认启用 launch token 鉴权，未带 token 的 "/" 返回 401，
+#   于是 fetch(...).then(r=>r.ok) 恒为 false → 容器永远 unhealthy
+#   （2026-09-10 在 UGREEN 生产上实测：旧容器正是因为被改成了 TCP 探活才 healthy；
+#     按镜像自带的 HTTP 探活重建后立刻变 unhealthy）。
+# 版本页 3082 的存活由 entrypoint 的守护循环负责（契约 §6）。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD node -e "fetch('http://127.0.0.1:3080/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+    CMD node -e "const s=require('net').connect(3080,'127.0.0.1');s.on('connect',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1))"
