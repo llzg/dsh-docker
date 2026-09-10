@@ -262,6 +262,54 @@ else
   fi
 fi
 
+# 6) token-pinning：DSH 默认每次进程启动用 randomBytes 生成新的 launch token，
+#    于是容器重启后 host 网络的代理层（dsh-proxy 用 BOOTSTRAP_TOKEN bootstrap）必须重建，
+#    否则 UI 直接 401。让 DSH 认 env DSH_LAUNCH_TOKEN（base64url 43 字符）即可固定 token。
+#    ⚠ 来源说明：这段补丁此前**只存在于生产容器的可写层**（/opt/patch-dsh.sh 被 workspace
+#    版本覆盖过），不在仓库里 —— 2026-09-10 重建容器时因此丢了它、导致 3081 短时 401。
+#    现移植回仓库，并纳入 marker 正向校验。
+TOKEN_FILE="$BASE/dsh-client-connection/lib/index.js"
+python3 - "$TOKEN_FILE" <<'PY' || fail "token-pinning: python 补丁未完成（见上，上游结构已变）"
+import os, sys
+f = sys.argv[1]
+if not os.path.exists(f):
+    print("SKIP token-pinning: 目标不存在（上游移除 dsh-client-connection，patch 不适用）:", f)
+    sys.exit(0)
+
+def need(cond, what):
+    """锚点预检：失败即打印 VERIFY FAIL 并以 exit 3 结束。"""
+    if not cond:
+        print("VERIFY FAIL: anchor missing token-pinning:", what, file=sys.stderr)
+        sys.exit(3)
+
+src = open(f, encoding="utf-8").read()
+if "dsh-docker-patch:token-pinning" in src:
+    print("token-pinning: already patched (marker present)")
+    sys.exit(0)
+old_fn = '''function processLaunchToken(owner) {
+	const existing = PROCESS_LAUNCH_TOKENS.get(owner);
+	if (existing !== void 0) return existing;
+	const created = encodeBase64Url(randomBytes(SECRET_BYTES));
+	PROCESS_LAUNCH_TOKENS.set(owner, created);
+	return created;
+}'''
+new_fn = '''function processLaunchToken(owner) {
+	const existing = PROCESS_LAUNCH_TOKENS.get(owner);
+	if (existing !== void 0) return existing;
+	// dsh-docker-patch:token-pinning
+	// honor DSH_LAUNCH_TOKEN so host-network proxies (dsh-proxy) survive backend
+	// restarts without recreating their bootstrap cookie state.
+	const pinned = process.env.DSH_LAUNCH_TOKEN;
+	const created = pinned !== void 0 && pinned !== "" ? pinned : encodeBase64Url(randomBytes(SECRET_BYTES));
+	PROCESS_LAUNCH_TOKENS.set(owner, created);
+	return created;
+}'''
+need(old_fn in src, "processLaunchToken pattern not found (upstream changed?)")
+src = src.replace(old_fn, new_fn)
+open(f, "w", encoding="utf-8").write(src)
+print("token-pinning: patched dsh-client-connection")
+PY
+
 # ── STRICT verification（构建期正向校验：marker 必须存在）──────────────────
 # 契约 §10：正向校验 marker，替代旧的“原始模式必须消失”（锚点失配时恒真）。
 verify_marker() { # file marker-name label
@@ -286,6 +334,8 @@ if [ "$STRICT" = "1" ]; then
   verify_marker "$CONN_INDEX" privileged-loopback "dsh-client-connection"
   verify_marker "$LLM_DS" vision-materialize "dsh-llm-deepseek"
   verify_marker "$APIPROXY" vision-gate "dsh-host-apiproxy"
+  # token-pinning 与图标无关，必须在条件块之外
+  verify_marker "$TOKEN_FILE" token-pinning "dsh-client-connection"
   if [ -f "$ICON" ] && [ -f "$MAKE_FAVICON" ]; then
     verify_marker "$FAVICON" favicon-custom "dsh-web-frontend"
     if [ -f "$FAVICON" ] && ! grep -qF 'data:image/jpeg;base64' "$FAVICON"; then

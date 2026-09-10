@@ -76,6 +76,7 @@ jobs:
           node scripts/test-dual-channel.js
           node scripts/test-version-server.js
           node scripts/test-version-policy.js
+          bash scripts/test-patch-dsh.sh
         env:
           # 测试里会真实查询 GitHub（匿名限额 60/h）→ 用 token 避免限流把 CI 判红
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
