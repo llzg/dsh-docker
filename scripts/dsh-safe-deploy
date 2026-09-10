@@ -196,6 +196,67 @@ channel_target() { # <policy-json>
 cmd_check() { # <channel>
   echo "== dsh-safe-deploy check (channel=$1) =="
   policy_json "$1"
+  preflight_workspace "$1"
+}
+
+# 升级前的工作区体检（nas/preflight-workspace.js）：
+#   拦的是"旧数据在新版本下会炸"的两类问题 —— ① agent preset 用了旧 schema
+#   （persona 缺 prefix）→ 该 preset 下所有会话无法 resume（表现为"切模型报错"）；
+#   ② 会话产物分帧/轮次有问题 → 单条历史打不开，甚至整个 DSH 起不来。
+#   两类都不在 HTTP 状态码与容器日志里体现，只能提前静态体检。
+# 默认**只告警不改判**（不影响 check 既有语义）；要让它阻塞升级就设 DSH_PREFLIGHT_STRICT=1。
+preflight_workspace() { # <channel>
+  local pf out rc mode home
+  pf="$REPO_DIR/nas/preflight-workspace.js"
+  [ -f "$pf" ] || pf="$REPO_DIR/../nas/preflight-workspace.js"
+  [ -f "$pf" ] || return 0
+  command -v node >/dev/null 2>&1 || return 0
+
+  # 执行位置：优先**容器内**（以 root 读工作区，且路径就是 DSH 自己的 DSH_HOME）。
+  # 容器里没有 zstd CLI，所以把宿主这份二进制拷进去 —— 实测宿主 zstd v1.5.4 在 debian
+  # 容器里可直接运行、且能正确解多帧会话（node:zlib 只解第一帧，会假报干净）。
+  mode="host"
+  if docker inspect "$CONTAINER" >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
+    if docker cp "$(command -v zstd)" "$CONTAINER:/tmp/dsh-preflight-zstd" >/dev/null 2>&1 \
+       && docker cp "$pf" "$CONTAINER:/tmp/dsh-preflight.js" >/dev/null 2>&1; then
+      mode="container"
+    fi
+  fi
+
+  echo ""
+  if [ "$mode" = "container" ]; then
+    echo "--- 工作区体检（容器内 $CONTAINER，DSH_HOME=$SOURCE_HOME）---"
+    out="$(docker exec -e DSH_ZSTD_BIN=/tmp/dsh-preflight-zstd "$CONTAINER" \
+             node /tmp/dsh-preflight.js --home "$SOURCE_HOME" --max-report 5 2>&1)"; rc=$?
+    docker exec "$CONTAINER" rm -f /tmp/dsh-preflight-zstd /tmp/dsh-preflight.js >/dev/null 2>&1 || true
+  else
+    # 宿主回退：容器内路径映射到卷源（/data/dsh → $DIR/dsh-data），需要能读到工作区
+    case "$SOURCE_HOME" in
+      /data/dsh)   home="$DIR/dsh-data" ;;
+      /data/dsh/*) home="$DIR/dsh-data/${SOURCE_HOME#/data/dsh/}" ;;
+      *)           home="$SOURCE_HOME" ;;
+    esac
+    if [ ! -d "$home" ]; then
+      echo "--- 工作区体检：跳过（宿主路径不存在且无法进容器: $home）---"
+      return 0
+    fi
+    echo "--- 工作区体检（宿主路径=$home；以非 root 跑可能因权限假报干净）---"
+    out="$(node "$pf" --home "$home" --max-report 5 2>&1)"; rc=$?
+  fi
+
+  printf '%s\n' "$out"
+  if [ "$rc" -eq 0 ]; then
+    echo "preflight: ok"
+    return 0
+  fi
+  echo ""
+  echo "! preflight: 发现升级阻塞项（上面 P*/S*/E* 条目）——这些数据在新版本下会报错，"
+  echo "  建议先按提示处理（nas/repair-session-turns.js 修会话；preset 的 persona 补 prefix）再升级。"
+  if [ "${DSH_PREFLIGHT_STRICT:-0}" = "1" ]; then
+    echo "ERROR: DSH_PREFLIGHT_STRICT=1 且体检未通过，check 判失败" >&2
+    return 1
+  fi
+  return 0
 }
 
 cmd_status() { # <channel>
@@ -425,7 +486,8 @@ usage() {
 dsh-safe-deploy <command> [--channel alpha|rc|all] [args]
 
 commands:
-  check                 只读输出升级状态（版本/通道/风险/迁移/隔离要求）
+  check                 只读输出升级状态（版本/通道/风险/迁移/隔离要求）+ 工作区体检
+                        （preset schema / 会话分帧与轮次；DSH_PREFLIGHT_STRICT=1 可让它阻塞）
   test                  snapshot + 隔离测试实例（独立 TEST_DSH_HOME/端口）
   promote [--force]     门禁通过后事务化 pin + 原子更新 SSOT production（prerelease 需 --force）
   rollback              恢复最近 snapshot + 旧镜像（幂等）

@@ -511,3 +511,46 @@ cp <工作区>/.agent-presets/code-subagents/agent.cordis.yml <备份目录>/age
 > 与 §9.4 是同一类问题的两个面：**升级后，旧工作区的数据（会话文件、agent preset）都要满足
 > 新版本的 schema 才能用**。区别是 §9.4 坏的是历史会话读取，这里坏的是 preset 挂载（影响面更大：
 > 该 preset 下的所有会话都无法 resume）。升级大版本前值得先做一遍这两项体检。
+
+### 9.6 升级前体检：`nas/preflight-workspace.js`（一次跑完，拦住 §9.4/§9.5 两类问题）
+
+§9.4（旧会话迁移被拒）与 §9.5（preset 挂不上导致切模型/继续对话报错）都属于
+**旧工作区数据不满足新版本 schema**，而且都**不体现在 HTTP 状态码与容器日志里**。
+`dsh-safe-deploy check` 现在会自动带上这个体检：
+
+```sh
+cd /volume1/docker/dsh-deploy
+bash scripts/dsh-safe-deploy check --channel rc        # 只告警，不改判
+DSH_PREFLIGHT_STRICT=1 bash scripts/dsh-safe-deploy check --channel rc   # 有阻塞项则判失败
+```
+
+也可以单独跑（**必须在能读到工作区的身份下跑**）：
+
+```sh
+# 推荐：容器内（root + 路径就是 DSH 的 DSH_HOME；容器里没有 zstd CLI，把宿主这份拷进去）
+docker cp /usr/bin/zstd <容器>:/tmp/dsh-zstd
+docker cp nas/preflight-workspace.js <容器>:/tmp/preflight.js
+docker exec -e DSH_ZSTD_BIN=/tmp/dsh-zstd <容器> node /tmp/preflight.js --home /data/dsh
+docker exec <容器> rm -f /tmp/dsh-zstd /tmp/preflight.js
+
+# 宿主（需要 root 权限，否则会读不到工作区）
+sudo node nas/preflight-workspace.js --home /volume1/docker/<通道>/dsh-data[/<子路径>]
+# 其他：--json（机器可读） --presets-only --sessions-only --include-test（连隔离测试工作区一起查）
+```
+
+检查项与代码：
+
+| 代号 | 含义 | 为什么重要 |
+|---|---|---|
+| `P1` | preset 的 persona 缺 `prefix`（还在用已废弃的 `text`） | 该 preset 下**所有会话无法 resume** → 切模型/继续对话报错（§9.5） |
+| `P2` | preset 目录缺少 `preset.yml` 或 `agent.cordis.yml` | 同上，直接挂不上 |
+| `S1` | 会话产物只有 **1 个 zstd 帧** | `dsh-workspace` 启动读会话头即抛 `corrupt Zstandard session log` → **整个 DSH 起不来** |
+| `S2` | 轮次不连续（轮次没闭合又开新轮次） | 迁移器拒绝 → 该条历史打不开（§9.4） |
+| `E1` | 读不了工作区目录（权限） | 防止"以普通用户跑 → 假报未发现问题"这种**假阴性**（踩过两次） |
+
+退出码：`0` 干净；`1` 有阻塞项；`2` 用法/环境错误（例如找不到 zstd CLI）。
+
+> 两个实现上的坑，写在这里省得再踩：
+> ① **不能用 `node:zlib.zstdDecompressSync` 读会话** —— 它只解**第一帧**（实测某文件 41035 行只出来 1 行），
+>    于是所有轮次问题都被静默漏掉；
+> ② `zstd -q -l` 输出的是**表格**、`zstd -l -v` 才是 `# Zstandard Frames: N` —— 两种格式都要认。
