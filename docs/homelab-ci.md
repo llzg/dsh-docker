@@ -191,7 +191,17 @@ sh check-image-drift.sh --record     # 把部署事实写入 state/deployed-imag
 
 - 要**彻底**避免漂移，就让容器直接引用 digest（`192.168.5.35:5050/llzg/dsh-docker@sha256:…`）
   而不是 tag；代价是 `docker ps` 里可读性变差。当前采用"tag + 记录 digest + 漂移检查"的折中。
-- 重建容器对齐漂移：`python3 recreate-dsh.py apply <container>`（不加 `NEW_IMAGE` 即可原地重建到当前 tag）。
+- 重建容器对齐漂移：Phase 2（compose 接管）之后**一条命令**即可 —— `nas/realign.sh`：
+
+  ```sh
+  sh realign.sh              # 所有通道：拉最新 tag → compose up -d --wait → 复核漂移与端口
+  sh realign.sh rc           # 只对齐 rc
+  sh realign.sh all --dry-run # 只打印将执行的命令
+  ```
+
+  它会读通道 `.env`（DSH_PROJECT/DSH_IMAGE）与 SSOT（dataDir）自动拼出 compose 调用，
+  override 按存在性追加（alpha 挂 docker.sock、rc 不挂），最后用 `check-image-drift.sh` 复核并探活 3081/3083。
+  实测幂等：没有新构建时 1.8 秒返回、不重建容器。
 
 ### 3.2 轮换私有 registry 密码：一处命令，五处同步
 

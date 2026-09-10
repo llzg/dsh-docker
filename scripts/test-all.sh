@@ -34,6 +34,7 @@ run sh -n nas/resume-auto-update.sh
 run sh -n nas/watchdog.sh
 run sh -n nas/watchdog-container.sh
 run sh -n nas/check-image-drift.sh
+run sh -n nas/realign.sh
 run sh -n nas/rotate-registry-credential.sh
 run python3 -c "import ast;ast.parse(open('nas/recreate-dsh.py').read())"
 run node --check nas/preflight-workspace.js
