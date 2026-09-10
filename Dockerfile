@@ -23,19 +23,32 @@ ARG BASE_IMAGE=node:22-bookworm-slim
 
 FROM ${BASE_IMAGE} AS base
 
-ARG DSH_VERSION
-ARG DSH_CHANNEL=alpha
-ARG GIT_REVISION=unknown
+# ══════════════════════════════════════════════════════════════════════════════
+# 层顺序契约（2026-09-10 实测踩坑后固化，勿随意调整）：
+#
+#   BuildKit 的层缓存键 = 该指令**展开后**的字符串。而且实测（受控实验，见
+#   scripts/test-dockerfile-layers.sh）：
+#     ⚠ **只要 ARG 在 stage 内被"声明"，它的值就进入其后所有指令的缓存键 ——
+#       哪怕这个 ARG 从未被引用。**
+#     ⚠ LABEL/ENV 里引用 ${DSH_VERSION}/${DSH_CHANNEL}/${GIT_REVISION} 同理。
+#   （对照实验：声明在 FROM **之前**的全局 ARG 改值不影响层缓存；声明在 stage
+#     内部的 ARG 改值 → 其后所有 RUN 全部重建，实测 #5/#6 由 CACHED 变 DONE。）
+#
+#   反面教材（本次实测）：DSH_VERSION/DSH_CHANNEL/GIT_REVISION 三个 ARG 与
+#   LABEL version/revision/channel 原先都摆在 apt 之前 →
+#     · 每次 git push（GIT_REVISION 变）→ apt + npm + uv 三层全部重跑；
+#     · alpha 与 rc 通道版本号不同 → 两通道之间也永远互相破缓存。
+#   代价：apt 重下 150MB+（libllvm15/mesa 等）实测卡了 **911s**，rc 通道更卡到 24 分钟。
+#
+#   规矩：**稳定层在前，版本相关层在后；易变 ARG 的"声明"也必须靠后**。
+#     1) apt 工具链     —— 只依赖 base 镜像与包列表
+#     2) uv             —— 只依赖 UV_VERSION（常量）
+#     3) ← 分界线：到这里才声明 DSH_VERSION/DSH_CHANNEL/GIT_REVISION
+#     4) npm install dsh —— 唯一**必须**随版本重建的重层（有 /root/.npm 缓存挂载兜底）
+#     5) LABEL/ENV/其余 —— 廉价层，随 commit 失效无所谓
+# ══════════════════════════════════════════════════════════════════════════════
 
-LABEL org.opencontainers.image.title="DeepSeek Harness Web (dsh)"
-LABEL org.opencontainers.image.description="DeepSeek Harness web UI with LAN patches — auto-built from npm release per channel, promoted via dsh-safe-deploy (no watchtower)"
-LABEL org.opencontainers.image.source="https://github.com/llzg/dsh-docker"
-LABEL org.opencontainers.image.version="${DSH_VERSION}"
-LABEL org.opencontainers.image.revision="${GIT_REVISION}"
-LABEL org.opencontainers.image.licenses="MIT"
-# 双通道契约 §6：镜像所属通道（alpha / rc / stable），供版本页与排障读取
-LABEL org.opencontainers.image.channel="${DSH_CHANNEL}"
-
+# ── 稳定层 1/2：apt 工具链 ────────────────────────────────────────────────────
 # Build toolchain for native modules (e.g. node-pty) if prebuilds are unavailable.
 # Vulkan 依赖：llama.cpp GGML_VULKAN 编译需要 glslc + 头文件（libvulkan-dev 自带）；
 # mesa-vulkan-drivers 提供 Intel Iris Xe 的 Vulkan ICD（运行时，配合 /dev/dri 直通）。
@@ -47,10 +60,38 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libvulkan-dev libvulkan1 mesa-vulkan-drivers glslc glslang-tools spirv-tools spirv-headers \
     && rm -rf /var/lib/apt/lists/*
 
+# ── 稳定层 2/2：uv（Python 包管理器）──────────────────────────────────────────
+# 随镜像持久安装到 /usr/local/bin。此前装在容器可写层，容器重建即丢失；烤进镜像后每次重建都在。
+# 供应链：固定版本安装（Astral 官方按版本路径分发 install.sh），不用 latest；升级改 ARG UV_VERSION。
+# ARG 紧贴使用处声明（常量，不影响上层；也不让 apt 层跟着 UV_VERSION 走）。
+ARG UV_VERSION=0.8.15
+RUN --mount=type=cache,target=/root/.cache/uv \
+    curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && uv --version
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ↓↓↓ 分界线：**从这里开始**才允许声明随版本/通道/commit 变化的 ARG ↓↓↓
+#
+# 声明位置是关键：这些 ARG 一旦出现在稳定层之前，apt/uv 层就会随每次 commit
+# （GIT_REVISION）和每个通道（DSH_VERSION/DSH_CHANNEL）重建 —— 这正是上面
+# "层顺序契约"里的事故根因（受控实验证实：stage 内声明的 ARG 即使从未被引用，
+# 改值也会让其后的 RUN 全部 CACHED→DONE）。
+#
+# 再细分一层：**只把这一层真正用到的 DSH_VERSION 声明在这里**；
+# DSH_CHANNEL / GIT_REVISION 留到 npm 之后（见下方 LABEL 前）——
+# 否则每次 commit 仍会让 npm 层重建（实测：声明在 npm 之前时换 commit，
+# npm 层 DONE 5.4s；挪到后面后全 CACHED，整个构建 12s → 4s 级）。
+# 不写默认值 = 继承 FROM 之前全局 ARG 的默认值（Docker 语义），--build-arg 可覆盖。
+# ══════════════════════════════════════════════════════════════════════════════
+ARG DSH_VERSION
+
 # Official DeepSeek Harness CLI (npm registry, published by DeepSeek).
 # Version is parametric: the CI workflow resolves it from the npm dist-tag.
 # npm 缓存挂载：dsh 依赖树有数百个包，仅版本号变化时靠缓存复用 tarball，
 # 避免每次都从公网重下（这是本地构建从 ~100s 降到十几秒的关键之一）。
+#
+# ⚠ 位置契约：这一层**必须**排在 ${GIT_REVISION} / ${DSH_CHANNEL} 出现或声明之前。
+#   它的缓存键只应随 base 镜像、apt/uv 层、以及 ${DSH_VERSION} 变化 —— 即"换版本才重建"。
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
     npm install -g --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs "@deepseek-ai/dsh@${DSH_VERSION}"
 
@@ -59,18 +100,28 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # Corepack 固化固定版本 11.22.0（已验证），不用 latest，保证 CI/watchtower
 # 重建可复现。shim 落在 /usr/local/bin（镜像层，容器重建不丢）；
 # 包体落在 /root/.cache/node/corepack（运行时被 /root 持久卷继承）。
+# 注意：corepack 必须排在 npm install 之后 —— 它会往 PATH 里装 npm/yarn/pnpm shim。
 RUN corepack enable \
     && corepack prepare pnpm@11.22.0 --activate \
     && pnpm --version
 
-# uv（Python 包管理器）——随镜像持久安装到 /usr/local/bin。
-# 此前装在容器可写层，容器重建即丢失；烤进镜像后每次重建都在。
-# 供应链：固定版本安装（Astral 官方按版本路径分发 install.sh），不用 latest；
-# 升级 uv 改 ARG UV_VERSION 即可。
-ARG UV_VERSION=0.8.15
-RUN --mount=type=cache,target=/root/.cache/uv \
-    curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | env UV_INSTALL_DIR=/usr/local/bin sh \
-    && uv --version
+# ── 元数据标签（纯 metadata，层本身 0.0s，但会让**其后**的层随 commit 失效）──────
+# 故整体放在 npm / corepack 之后：新 commit 只重建这里往下的廉价层（COPY/校验/健康检查）。
+#
+# DSH_CHANNEL / GIT_REVISION 的**声明**也放在这里（而不是分界线上）：这样它们既不进
+# apt/uv 的缓存键，也不进 npm/corepack 的缓存键 —— 换 commit 时前四层全 CACHED。
+# 不写默认值 = 继承全局 ARG 默认值；DSH_CHANNEL 显式给默认值便于单独 docker build。
+ARG DSH_CHANNEL=alpha
+ARG GIT_REVISION=unknown
+
+LABEL org.opencontainers.image.title="DeepSeek Harness Web (dsh)"
+LABEL org.opencontainers.image.description="DeepSeek Harness web UI with LAN patches — auto-built from npm release per channel, promoted via dsh-safe-deploy (no watchtower)"
+LABEL org.opencontainers.image.source="https://github.com/llzg/dsh-docker"
+LABEL org.opencontainers.image.version="${DSH_VERSION}"
+LABEL org.opencontainers.image.revision="${GIT_REVISION}"
+LABEL org.opencontainers.image.licenses="MIT"
+# 双通道契约 §6：镜像所属通道（alpha / rc / stable），供版本页与排障读取
+LABEL org.opencontainers.image.channel="${DSH_CHANNEL}"
 
 ENV DSH_HOME=/data/dsh
 ENV DSH_TELEMETRY_DISABLED=1

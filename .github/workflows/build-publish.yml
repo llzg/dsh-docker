@@ -235,11 +235,25 @@ jobs:
             GIT_REVISION=${{ github.sha }}
             DSH_CHANNEL=${{ matrix.channel }}
             BASE_IMAGE=${{ vars.DSH_BASE_IMAGE || 'node:22-bookworm-slim' }}
+            # 构建内走代理（2026-09-10 宿主实测数据）：
+            #   github.com release 直连**卡死**（25s 超时、0 字节），走代理 0.69s ——
+            #   uv 的 install.sh 正是从 GitHub releases 取二进制，此前直连要 165s；
+            #   deb.debian.org 同样惨：同样 100 秒内，直连只下到 7 个包/9MB，
+            #   走代理下完 111 个包/146MB（34MB/s）—— 实测 apt 层直连曾卡到 911s。
+            # 结论：apt/npm/uv 全部走代理，NO_PROXY 只保留内网段（registry/Gitea 不走代理）。
+            # 预定义代理 ARG 由 BuildKit 自动识别，Dockerfile 里无需 ARG 声明；
+            # 实测**不会**残留进镜像 Config.Env（运行时容器环境不受影响）。
+            HTTP_PROXY=${{ vars.DSH_HTTP_PROXY }}
+            HTTPS_PROXY=${{ vars.DSH_HTTP_PROXY }}
+            NO_PROXY=localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,.local
 
       - name: Smoke test (web UI)
         run: ./scripts/smoke-test.sh "$SMOKE_TAG"
 
-      - name: Push to GHCR
+      # 注意：这个步骤推的是 $IMAGE_TAGS 里的**全部** tag —— 既含 ghcr.io，也含私有 registry
+      # （由 Compute image tags 决定；ghcr 那部分可用 vars.DSH_PUSH_GHCR=0 关掉）。
+      # 名字别再叫 "Push to GHCR"：之前正是因为名字误导，排查时以为失败只影响 GHCR。
+      - name: Push images (GHCR + private registry)
         run: |
           set -euo pipefail
           echo "$IMAGE_TAGS" | while IFS= read -r t; do

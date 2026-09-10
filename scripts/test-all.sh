@@ -45,6 +45,7 @@ run bash scripts/test-dsh-safe-deploy.sh
 run bash scripts/test-nas-deploy.sh
 run bash scripts/test-migration.sh
 run bash scripts/test-patch-dsh.sh
+run bash scripts/test-dockerfile-layers.sh
 
 echo ""
 if [ "$fails" -eq 0 ]; then
