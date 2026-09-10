@@ -21,6 +21,11 @@ on:
         description: '可选：只构建该通道（alpha / rc；留空=全部）'
         required: false
         type: string
+      force:
+        description: '强制重建（忽略"已构建"的收敛判定；用于验证/重发同版本）'
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -99,7 +104,7 @@ jobs:
         env:
           VERSION_OVERRIDE: ${{ github.event.inputs.version }}
           DSH_CHANNELS: ${{ github.event.inputs.channel }}
-          FORCE: ${{ github.event_name == 'push' && '1' || '' }}
+          FORCE: ${{ (github.event_name == 'push' || inputs.force) && '1' || '' }}
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # 收敛判定查询的仓库列表（含内网私有 registry 时需要凭据）
           DSH_REGISTRIES: ${{ vars.DSH_REGISTRIES }}
@@ -121,7 +126,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # GHCR 推送可关（vars.DSH_PUSH_GHCR=0）：镜像改由内网 registry 分发时，
+      # 这 40s/通道 的公网推送（1.4GB）就省掉了。
       - name: Login to GHCR
+        if: vars.DSH_PUSH_GHCR != '0'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -169,25 +177,32 @@ jobs:
         id: tags
         run: |
           set -euo pipefail
+          set -euo pipefail
           GHCR_BASE="ghcr.io/${{ github.repository_owner }}/dsh-docker"
           PRIV_BASE="${{ vars.DSH_PRIVATE_IMAGE }}"
+          PUSH_GHCR="${{ vars.DSH_PUSH_GHCR || '1' }}"
           V="${{ matrix.version }}"
           SHA="${{ github.sha }}"
           PRE="${{ matrix.is_prerelease }}"
+          TAGS=""
+          if [ "$PUSH_GHCR" != "0" ]; then
+            TAGS="${TAGS}${GHCR_BASE}:${V}-${SHA}\n${GHCR_BASE}:${V}\n"
+            [ "$PRE" != "1" ] && TAGS="${TAGS}${GHCR_BASE}:latest\n"
+          fi
+          if [ -n "$PRIV_BASE" ]; then
+            TAGS="${TAGS}${PRIV_BASE}:${V}-${SHA}\n${PRIV_BASE}:${V}\n"
+            [ "$PRE" != "1" ] && TAGS="${TAGS}${PRIV_BASE}:latest\n"
+          fi
+          [ -n "$TAGS" ] || { echo "::error::既没有 GHCR（DSH_PUSH_GHCR=0）也没有内网 registry（DSH_PRIVATE_IMAGE 未设）——没有推送目标"; exit 1; }
           {
             echo "IMAGE_TAGS<<__DSH_TAGS__"
-            echo "${GHCR_BASE}:${V}-${SHA}"
-            echo "${GHCR_BASE}:${V}"
-            if [ "$PRE" != "1" ]; then echo "${GHCR_BASE}:latest"; fi
-            if [ -n "$PRIV_BASE" ]; then
-              echo "${PRIV_BASE}:${V}-${SHA}"
-              echo "${PRIV_BASE}:${V}"
-              if [ "$PRE" != "1" ]; then echo "${PRIV_BASE}:latest"; fi
-            fi
+            printf '%b' "$TAGS" | sed '/^$/d'
             echo "__DSH_TAGS__"
           } >> "$GITHUB_ENV"
-          echo "GHCR_SMOKE_TAG=${GHCR_BASE}:${V}-${SHA}" >> "$GITHUB_ENV"
-          echo "channel=${{ matrix.channel }} version=$V prerelease=$PRE ghcr=$GHCR_BASE private=${PRIV_BASE:-none}"
+          # smoke 用第一个 tag（可能是内网 registry）
+          echo "SMOKE_TAG=$(printf '%b' "$TAGS" | sed '/^$/d' | head -1)" >> "$GITHUB_ENV"
+          echo "channel=${{ matrix.channel }} version=$V prerelease=$PRE push_ghcr=$PUSH_GHCR private=${PRIV_BASE:-none}"
+          printf '%b' "$TAGS" | sed '/^$/d' | sed 's/^/  tag: /'
 
       # 先构建到本地 daemon 做冒烟测试；通过后才推送（坏镜像不进 registry）
       - name: Build image (local, for smoke test)
@@ -207,7 +222,7 @@ jobs:
             BASE_IMAGE=${{ vars.DSH_BASE_IMAGE || 'node:22-bookworm-slim' }}
 
       - name: Smoke test (web UI)
-        run: ./scripts/smoke-test.sh "$GHCR_SMOKE_TAG"
+        run: ./scripts/smoke-test.sh "$SMOKE_TAG"
 
       - name: Push to GHCR
         run: |
