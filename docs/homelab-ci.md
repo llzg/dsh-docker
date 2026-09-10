@@ -165,6 +165,62 @@ apt/uv/npm 之前会**直接测试失败**。
   版本页（旧代码），把 3082 占掉 → 真正的 `dsh-version` 绑不上 3082 而反复重启
   （现象：页面显示的是旧版单通道页面）。现在两个 proxy 容器都显式设 `DSH_VERSION_PORT=0`。
 
+### 3.1 tag 是可变的：部署事实记录 + 漂移检查
+
+DSH 的镜像 tag **不是不可变的** —— CI 用同一个版本号重建时会重推同一个 tag
+（2026-09-10 实测：`:0.1.5-alpha.2` 在容器创建之后又被重推过一次）。
+容器一旦创建就固定在当时的镜像 ID 上，而 tag 会被后来的构建改写 → `docker ps` 里写着
+`0.1.5-alpha.2`，实际跑的却是另一次构建。所以：
+
+```sh
+cd /volume1/docker/dsh-deploy
+sh check-image-drift.sh              # 本地比对：容器运行镜像 vs 它引用的 tag（快，无网络）
+sh check-image-drift.sh --remote     # 先 docker pull 再比（能发现 registry 上的新构建）
+sh check-image-drift.sh --record     # 把部署事实写入 state/deployed-images.json
+```
+
+- 退出码 `0` = 一致；`1` = 漂移或容器缺失；`2` = 用法/环境错误。
+- `state/deployed-images.json` 记录每通道的 `version / imageRef / imageId / repoDigest`，
+  便于事后回答"当时到底跑的哪次构建"。
+- 想定期发现漂移，可以把它挂到 cron（**不建议**直接接看门狗自动重建，重建是有中断的运维动作）：
+
+  ```sh
+  # 每天 06:00 检查一次，有漂移就写日志
+  0 6 * * * cd /volume1/docker/dsh-deploy && sh check-image-drift.sh --remote >> state/drift.log 2>&1
+  ```
+
+- 要**彻底**避免漂移，就让容器直接引用 digest（`192.168.5.35:5050/llzg/dsh-docker@sha256:…`）
+  而不是 tag；代价是 `docker ps` 里可读性变差。当前采用"tag + 记录 digest + 漂移检查"的折中。
+- 重建容器对齐漂移：`python3 recreate-dsh.py apply <container>`（不加 `NEW_IMAGE` 即可原地重建到当前 tag）。
+
+### 3.2 轮换私有 registry 密码：一处命令，五处同步
+
+这套凭据散落在 5 个地方，漏掉任何一处都会在几小时后以 `no basic auth credentials` /
+403 / CI 推送失败的形式炸出来（2026-09-10 逐个踩过）：
+
+| # | 位置 | 谁改 |
+|---|---|---|
+| 1 | registry 主机上的 htpasswd | **你**（在 192.168.5.35 上执行，脚本不碰） |
+| 2 | 宿主 `~/.docker/config.json` | `rotate-registry-credential.sh` |
+| 3 | `/volume1/docker/dsh-deploy/.env` | 同上 |
+| 4 | GitHub secrets `DSH_REGISTRY_USER/PASSWORD` | 同上 |
+| 5 | `dsh-version` 容器 env（版本页查内网 registry） | 同上 |
+
+```sh
+# 1) 先在 registry 主机（192.168.5.35）上换 htpasswd：
+#      docker run --rm --entrypoint htpasswd httpd:2 -Bbn ci-deploy '新密码' > /tmp/htpasswd.new
+#      # 备份后替换原 htpasswd 文件，再 docker restart <registry容器>
+#
+# 2) 回到 UGREEN 宿主，一处同步其余四处：
+cd /volume1/docker/dsh-deploy
+DSH_NEW_PASSWORD='新密码' sh rotate-registry-credential.sh --dry-run   # 先空跑确认
+DSH_NEW_PASSWORD='新密码' sh rotate-registry-credential.sh            # 确认无误再执行
+```
+
+脚本特性：**先 `docker login` 验证新密码真的生效**，验证不过立刻停、绝不把坏密码铺开；
+密码只经环境变量传入（不进 argv）；`--dry-run` 零副作用（连 `docker login` 都写临时
+`DOCKER_CONFIG`，不碰宿主配置）。
+
 ```sh
 # 1) 宿主允许 http registry（若用 192.168.5.35:5050 这种无 TLS 的地址）
 sudo vi /etc/docker/daemon.json

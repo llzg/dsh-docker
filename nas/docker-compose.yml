@@ -24,15 +24,25 @@ services:
     container_name: ${DSH_CONTAINER:-dsh-alpha}
     restart: unless-stopped
     ports:
-      - "${DSH_PORT:-3081}:3080"
+      # 两种对外模式（Phase 2 准备）：
+      #   A) 直接发端口（默认）：DSH_BIND_IP=0.0.0.0 → 宿主 0.0.0.0:3081
+      #   B) proxy 反代模式：DSH_BIND_IP=127.0.0.1 + 起 proxy 服务（profiles: proxy）
+      #      对外只由 host 网络的 proxy 暴露 DSH_PORT，保留 CIDR 白名单/令牌注入等特性。
+      - "${DSH_BIND_IP:-0.0.0.0}:${DSH_PORT:-3081}:3080"
     environment:
-      - DSH_HOME=/data/dsh
+      # ⚠ 不能写死 /data/dsh：alpha 通道的真实 DSH_HOME 是 /data/dsh/test/0.1.2-alpha.5
+      #   （历史 pin 的工作区路径），写死会让 alpha 换了工作区、设置/插件全部"消失"。
+      - DSH_HOME=${DSH_HOME:-/data/dsh}
       - DSH_CHANNEL=${DSH_CHANNEL:-alpha}
       - DSH_TELEMETRY_DISABLED=1
       # --trusted-host 不再硬编码在 Dockerfile CMD（契约 §6）
       - DSH_TRUSTED_HOST=${DSH_TRUSTED_HOST:-192.168.5.17}
-      # 0 = 不启动容器内版本页（rc 由 alpha 容器统一渲染两条通道，契约 §6）
+      # ⚠ 用 host 网络跑 proxy 的容器必须显式设 0：0 之外的取值会让 entrypoint 在
+      #   **宿主机**上另起一个镜像内置的版本页，把 3082 抢掉（实测：真正的 dsh-version
+      #   因此绑不上端口而反复重启，页面显示的是旧代码渲染的单通道页）。
       - DSH_VERSION_PORT=${DSH_VERSION_PORT:-3082}
+      # 启动令牌：proxy 的 BOOTSTRAP_TOKEN 必须与它一致，否则反代回来是 401。
+      - DSH_LAUNCH_TOKEN=${DSH_LAUNCH_TOKEN:-}
       # SSOT 文件绝对路径（优先级最高；空则走容器内默认查找顺序）。
       # ⚠ 填宿主路径时必须额外挂载；推荐 /root/nas_docker/dsh-version.json
       #   （已由 ./dsh-root:/root 挂载，命中宿主实时 SSOT）。
@@ -61,6 +71,44 @@ services:
       # watchtower 仍可管理其他无状态容器；只有此服务被排除。
       - "com.centurylinklabs.watchtower.enable=false"
     # 日志轮转（P2）：json-file 默认无上限，长跑会撑满 NAS 根分区
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # ── 可选：宿主网络反代（只有带 --profile proxy 时才起，默认不参与）────────────
+  # 与当前生产上的 dsh-proxy / dsh-proxy-rc 配置 1:1 对齐（cmd / 挂载 / env / 探活），
+  # 供 Phase 2 把"host 网络 proxy + 固定 IP 反代"这层也纳入 compose 管理：
+  #   docker compose -p dsh-alpha --profile proxy up -d
+  # 只有该服务被起时，dsh 服务才应把端口绑到回环（DSH_BIND_IP=127.0.0.1）。
+  proxy:
+    profiles: ["proxy"]
+    image: "${DSH_IMAGE:?DSH_IMAGE 未设置：请先运行 install.sh 生成 .env}"
+    container_name: ${DSH_PROXY_CONTAINER:-dsh-proxy}
+    restart: unless-stopped
+    network_mode: host
+    # entrypoint 用镜像自带的（补丁自愈 + DSH_VERSION_PORT=0 判断都在里面）
+    command: ["node", "/dsh-root/dsh-proxy-main.js"]
+    environment:
+      - PORT=${DSH_PORT:-3081}
+      - BACKEND=http://127.0.0.1:${DSH_INTERNAL_PORT:-3080}
+      # ⚠ 必须与 dsh 服务的 DSH_LAUNCH_TOKEN 完全一致，否则反代回来 401
+      - BOOTSTRAP_TOKEN=${DSH_LAUNCH_TOKEN:-}
+      - ALLOWED_CIDR=${DSH_ALLOWED_CIDR:-192.168.5.0/24,172.27.0.0/16,127.0.0.0/8}
+      # ⚠ 必须为 0：host 网络容器起版本页会抢宿主机 3082（实测踩过）
+      - DSH_VERSION_PORT=0
+      - DSH_TELEMETRY_DISABLED=1
+    volumes:
+      - ./dsh-root:/dsh-root:ro
+    healthcheck:
+      # ⚠ 探活端口必须跟着 PORT 走：生产上 dsh-proxy 的探活是从 dsh 容器抄来的 3080，
+      #   而它监听 3081/3083 → 永远探不通、长期 unhealthy（状态失真）。
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:'+(process.env.PORT||3081)+'/').then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    labels:
+      - "com.centurylinklabs.watchtower.enable=false"
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }

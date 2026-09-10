@@ -33,6 +33,9 @@ run sh -n nas/rollback.sh
 run sh -n nas/resume-auto-update.sh
 run sh -n nas/watchdog.sh
 run sh -n nas/watchdog-container.sh
+run sh -n nas/check-image-drift.sh
+run sh -n nas/rotate-registry-credential.sh
+run python3 -c "import ast;ast.parse(open('nas/recreate-dsh.py').read())"
 run bash -n scripts/dsh-safe-deploy
 run bash -n patch-dsh.sh
 

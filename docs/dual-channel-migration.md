@@ -239,13 +239,22 @@ NEW_IMAGE=192.168.5.35:5050/llzg/dsh-docker:0.1.5-alpha.2 RESCUE_PATCH=0 \
 
 ## 9. 起点 C 的 Phase 2（需维护窗口，每通道约 1–2 分钟中断）把每通道改造成**独立 compose 项目**（含其 proxy），让 pin/rollback/watchdog 走统一入口：
 
-1. `nas/docker-compose.yml` 增加两处能力（尚未实施）：
-   - `DSH_HOME` 由环境变量注入（alpha 现在是 `/data/dsh/test/0.1.2-alpha.5`，不能写死 `/data/dsh`）；
-   - 可选 `proxy` 服务：`network_mode: host` + `PORT=<通道端口>` + `BACKEND=http://127.0.0.1:<内部端口>`，
-     DSH 服务把 3080 发布到 `127.0.0.1:<内部端口>`，对外仍只暴露 proxy（保留 CIDR 白名单等特性）。
+1. `nas/docker-compose.yml` 增加两处能力（**2026-09-10 已实现并 `docker compose config` 验证**）：
+   - `DSH_HOME` 由环境变量注入（`${DSH_HOME:-/data/dsh}`）—— alpha 现在是 `/data/dsh/test/0.1.2-alpha.5`，写死会让它换掉工作区、设置/插件全部"消失"；
+   - 可选 `proxy` 服务（`profiles: ["proxy"]`，默认不参与）：`network_mode: host` + `PORT=${DSH_PORT}` +
+     `BACKEND=http://127.0.0.1:${DSH_INTERNAL_PORT}` + `BOOTSTRAP_TOKEN=${DSH_LAUNCH_TOKEN}` +
+     `ALLOWED_CIDR=...` + **`DSH_VERSION_PORT=0`**（host 网络容器起版本页会抢宿主 3082，实测踩过），
+     挂载 `./dsh-root:/dsh-root:ro`，探活跟着 `PORT` 走（生产上那台 proxy 的探活误指 3080，长期 unhealthy）；
+     与之配套，`dsh` 服务的端口发布支持 `DSH_BIND_IP`（proxy 模式下沉到 `127.0.0.1`）。
 2. 每通道：`install.sh` → 停旧容器 → `switch.sh`（compose 接管）→ 健康验证。
 3. 安装 watchdog（按通道管理 compose 项目）。
 4. 观察一周后再删除遗留 `deepseek-harness` 容器与旧 `dsh-deploy` 备份。
 
 风险与回滚：容器名/项目名会变（`deepseek-harness-alpha` → `dsh-alpha`），
 旧容器在验证通过前**只停不删**；回滚 = 停新容器、`docker start <旧容器>`。
+
+> 切换前的现实约束（2026-09-10 实测）：compose 里 `ports: ${DSH_PORT}:3080` 与当前
+> "host 网络 proxy 抢同一个宿主端口"的形态**互斥** —— 直接 `compose up` 会因端口被
+> dsh-proxy 占用而起不来。所以切换顺序必须是"先起 proxy profile 并确认回代可用，
+> 再停掉手写的 proxy 容器"，或者先用 `DSH_BIND_IP=127.0.0.1` 让 dsh 容器让出宿主端口。
+
