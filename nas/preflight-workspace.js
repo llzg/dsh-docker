@@ -173,10 +173,17 @@ function analyzeSession(file, home) {
     } else if (e.type === 'turn/end') { open = null; next = e.data.turn + 1; }
   }
   if (bad.length) {
-    add('fail', 'S2', path.relative(home, file),
+    // ⚠ 分级：**v2 及以上**会真被拒（实测报 "refuses the transformed artifact"）；
+    //   旧格式（v0/v1）实测**被容忍** —— 2026-09-10 用真实 RPC resume 验证过 3 条带同样
+    //   形态的 v0 会话，全部 ok:true、容器日志零失败。所以旧格式只提示，不报阻塞。
+    const legacy = ver === 'legacy' || ver === '0' || ver === '1';
+    add(legacy ? 'warn' : 'fail', 'S2', path.relative(home, file),
       `${bad.length} 处轮次不连续：${bad.slice(0, 3).join('; ')}`,
-      '迁移器会拒绝这条会话（"turn/start N does not open expected turn N-1"）→ 历史打不开。' +
-      '可用 nas/repair-session-turns.js 在状态干净处补一条 turn/end（先 dry-run）');
+      legacy
+        ? '旧格式（v0/v1）的这类"未闭合轮次"实测会被迁移链容忍（已用真实 resume 验证），' +
+          '因此只作提示、不阻塞升级；若确实打开报错再按下面的修法处理。'
+        : '迁移器会拒绝这条会话（"turn/start N does not open expected turn N-1"）→ 历史打不开。' +
+          '可用 nas/repair-session-turns.js 在状态干净处补一条 turn/end（先 dry-run）');
   }
 }
 

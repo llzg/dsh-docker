@@ -545,7 +545,7 @@ sudo node nas/preflight-workspace.js --home /volume1/docker/<通道>/dsh-data[/<
 | `P1` | preset 的 persona 缺 `prefix`（还在用已废弃的 `text`） | 该 preset 下**所有会话无法 resume** → 切模型/继续对话报错（§9.5） |
 | `P2` | preset 目录缺少 `preset.yml` 或 `agent.cordis.yml` | 同上，直接挂不上 |
 | `S1` | 会话产物只有 **1 个 zstd 帧** | `dsh-workspace` 启动读会话头即抛 `corrupt Zstandard session log` → **整个 DSH 起不来** |
-| `S2` | 轮次不连续（轮次没闭合又开新轮次） | 迁移器拒绝 → 该条历史打不开（§9.4） |
+| `S2` | 轮次不连续（轮次没闭合又开新轮次） | **v2 及以上**：迁移器拒绝 → 该条历史打不开（§9.4）；**v0/v1 旧格式**：实测被容忍，只报提示 |
 | `E1` | 读不了工作区目录（权限） | 防止"以普通用户跑 → 假报未发现问题"这种**假阴性**（踩过两次） |
 
 退出码：`0` 干净；`1` 有阻塞项；`2` 用法/环境错误（例如找不到 zstd CLI）。
@@ -554,3 +554,11 @@ sudo node nas/preflight-workspace.js --home /volume1/docker/<通道>/dsh-data[/<
 > ① **不能用 `node:zlib.zstdDecompressSync` 读会话** —— 它只解**第一帧**（实测某文件 41035 行只出来 1 行），
 >    于是所有轮次问题都被静默漏掉；
 > ② `zstd -q -l` 输出的是**表格**、`zstd -l -v` 才是 `# Zstandard Frames: N` —— 两种格式都要认。
+
+> **实测校准（2026-09-10）**：S2 这个形态最初被当成"一律会失败"，后来用真实 RPC
+> （`session/selectModel`，它会触发 resume）对 3 条带该形态的 **v0** 会话逐个验证：
+> 三条全部 `ok:true`、容器日志零失败 —— 说明旧格式那条迁移链是容忍它的。
+> 于是体检把 S2 分级：**v2 及以上报阻塞、v0/v1 只报提示**。
+> 结论：**先证明再动手**；否则会为"其实能打开的历史"去做有风险的数据改写。
+> 反过来说，v2 的那条（`session-d3e604c8…`）是**真的**坏了，报错原文就是
+> `Session migration from v2 to v3 refuses the transformed artifact`，已按 §9.4 修好。
