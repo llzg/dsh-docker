@@ -129,11 +129,31 @@ for (let i = 0; i < events.length; i++) {
   for (const e of out) { if (e.type === 'session') continue; e.seq = seq++; }
 }
 
+// ⚠ zstd 分帧是**格式的一部分**，不是实现细节（2026-09-10 血泪教训）：
+//   DSH 读取会话时断言 "first frame is not exactly one header line" —— 首帧必须**只含 header 一行**，
+//   其余内容跟在后续帧里（生产文件实测 2135 帧，每个写入批次一帧）。
+//   若用 `zstd -19` 把整个 JSONL 压成**一帧**，workspace 插件会在启动时直接抛
+//   `corrupt Zstandard session log`，导致整个 DSH 起不来（不是只坏这一条会话！）。
 const tmp = `${file}.repaired`;
-const plain = `${file}.plain.tmp`;
-fs.writeFileSync(plain, out.map((e) => JSON.stringify(e)).join('\n') + '\n');
-execFileSync('zstd', ['-q', '-19', '-f', '-o', tmp, plain]);
-fs.unlinkSync(plain);
+const f1 = `${file}.f1.zst`;
+const f2 = `${file}.f2.zst`;
+const p1 = `${file}.p1.txt`;
+const p2 = `${file}.p2.txt`;
+const lines = out.map((e) => JSON.stringify(e));
+fs.writeFileSync(p1, lines[0] + '\n');                      // 首帧：只有 header 一行
+fs.writeFileSync(p2, lines.slice(1).join('\n') + '\n');     // 其余：一帧装完
+execFileSync('zstd', ['-q', '-19', '-f', '-o', f1, p1]);
+execFileSync('zstd', ['-q', '-19', '-f', '-o', f2, p2]);
+fs.writeFileSync(tmp, Buffer.concat([fs.readFileSync(f1), fs.readFileSync(f2)]));
+for (const f of [f1, f2, p1, p2]) fs.unlinkSync(f);
+// 分帧自检：>=2 帧，且整体解压内容与预期逐行一致
+// 注意 `zstd -l` 是表格输出、`zstd -l -v` 才是 "# Zstandard Frames: N"（踩过）
+const zl = execFileSync('zstd', ['-l', '-v', tmp], { maxBuffer: 32 * 1024 * 1024 }).toString();
+const frames = Number((zl.match(/Zstandard Frames:\s*(\d+)/) || zl.match(/Frames:\s*(\d+)/) || [])[1] || 0);
+if (frames < 2) { fs.unlinkSync(tmp); console.error(`  ✗ 分帧自检失败：只有 ${frames} 帧（首帧必须只含 header）`); process.exit(1); }
+const round = execFileSync('zstd', ['-dc', tmp], { maxBuffer: 512 * 1024 * 1024 }).toString();
+if (round !== lines.join('\n') + '\n') { fs.unlinkSync(tmp); console.error('  ✗ 解压回读与预期内容不一致，已放弃'); process.exit(1); }
+console.log(`  分帧自检：${frames} 帧，首帧=header 一行 ✓`);
 
 // 自检：修完必须自洽
 const check = analyze(readJsonl(tmp));

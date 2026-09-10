@@ -442,5 +442,14 @@ zstd -dc session.v2.jsonl.zstd | docker exec -i <容器> node /tmp/validate-rela
 本次实测：alpha 工作区 17 个 v2 会话里仅 1 个受影响，已修（原文件备份在
 `/volume1/docker/dsh-alpha5/dsh-data/_session-backups/`），修复后工作区全部自洽；rc 工作区无 v2 会话。
 
+> ⚠⚠ **zstd 分帧是格式的一部分，不是实现细节**（2026-09-10 血泪教训）：
+> DSH 读取会话时断言 "first frame is not exactly one header line" —— 会话日志是**多帧**文件
+> （生产文件实测 2135 帧，每个写入批次一帧），**首帧必须只含 header 那一行**。
+> 若用 `zstd -19` 把整个 JSONL 压成**一帧**：`dsh-workspace` 在启动时读会话头就会抛
+> `corrupt Zstandard session log` → **整个 DSH 起不来**（不是只坏这一条会话！）。
+> `repair-session-turns.js` 现在按"首帧=header 一行 + 其余一帧"重建，并自带分帧自检
+> （帧数 ≥2、解压回读逐行一致），自检不过就**不写回**。
+
 > 排查小坑（踩过两次）：用 `sudo cp` 把会话文件拷到 /tmp 后**必须 chmod 644**，
 > 否则以普通用户跑 `zstd -dc` 会 Permission denied，脚本拿到空输入 → 假阴性"全部 OK"。
+> 另外 `execFileSync` 读几十 MB 的解压内容要显式给 `maxBuffer`（默认 1MB 会直接抛错）。
