@@ -83,8 +83,8 @@ async function fetchGitHub() {
   const headers = {};
   if (process.env.GH_API_TOKEN) headers.Authorization = `token ${process.env.GH_API_TOKEN}`;
   const [rel, tag] = await Promise.all([
-    fetchJson(`https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=1`, { headers }),
-    fetchJson(`https://api.github.com/repos/${UPSTREAM_REPO}/tags?per_page=1`, { headers }),
+    fetchJsonRetry(`https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=1`, { headers }),
+    fetchJsonRetry(`https://api.github.com/repos/${UPSTREAM_REPO}/tags?per_page=1`, { headers }),
   ]);
   const out = {};
   if (rel.error) {
@@ -108,8 +108,31 @@ async function fetchGitHub() {
   return out;
 }
 
+// 网络抖动重试：公网查询偶发 ECONNRESET/超时（2026-09-10 实测：一次 ECONNRESET 直接
+// 让 CI 的 Policy tests 判红、整轮构建不跑）。这里退避重试若干次，把"抖动"和"真不可达"
+// 区分开；仍然失败时按原来的错误对象返回，由调用方（测试/收敛判定）决定 SKIP 还是 FAIL。
+const NET_RETRIES = Number(process.env.DSH_NET_RETRIES || 3);      // 总尝试次数
+const NET_BACKOFF_MS = Number(process.env.DSH_NET_BACKOFF_MS || 1500);
+
+function isNetworkError(res) {
+  return !!(res && res.error && !res.httpStatus);   // 有 httpStatus 的是服务端回答，不是链路问题
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function fetchJsonRetry(url, opts = {}) {
+  let last;
+  for (let i = 1; i <= Math.max(1, NET_RETRIES); i++) {
+    last = await fetchJson(url, opts);
+    if (!last.error) return last;
+    if (!isNetworkError(last)) return last;          // 4xx/5xx 不重试（重试也不会变好）
+    if (i < NET_RETRIES) await sleep(NET_BACKOFF_MS * i);
+  }
+  return last;
+}
+
 async function fetchNpm() {
-  const res = await fetchJson(`https://registry.npmjs.org/${NPM_PKG}`, {
+  const res = await fetchJsonRetry(`https://registry.npmjs.org/${NPM_PKG}`, {
     headers: { Accept: 'application/vnd.npm.install-v1+json' },
   });
   if (res.error) return { error: res.error };
@@ -248,4 +271,4 @@ function semver() {
   throw new Error('semver 库不可用（镜像/CI 未安装 semver）');
 }
 
-module.exports = { fetchAllSources, fetchGitHub, fetchNpm, fetchJson, computeTarget, computeTargets, computeChannelTarget, channelOf, CHANNELS, normalizeVersion, semver, UPSTREAM_REPO, NPM_PKG };
+module.exports = { fetchAllSources, fetchGitHub, fetchNpm, fetchJson, fetchJsonRetry, isNetworkError, computeTarget, computeTargets, computeChannelTarget, channelOf, CHANNELS, normalizeVersion, semver, UPSTREAM_REPO, NPM_PKG };

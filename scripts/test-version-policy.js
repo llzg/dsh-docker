@@ -12,10 +12,18 @@ function t(id, name, pass, detail) {
   // T3/T4/T5/T6: npm registry 真实查询
   const npmRes = await policy.fetchNpm();
   const npmOK = npmRes && !npmRes.error && npmRes.latest.value && npmRes.next.value && Array.isArray(npmRes.versions);
+  // npm **链路**失败是环境条件（同 T1/T2 的 GitHub 限流处理）：ECONNRESET/超时/DNS 都是
+  // 公网抖动，不是策略代码缺陷。实测 2026-09-10 一次 ECONNRESET 就让整轮 CI 判红、
+  // 构建完全没跑 —— 所以链路类失败记 SKIP，只有"npm 答了但数据不符合契约"才 FAIL。
+  const npmNetErr = !npmOK && npmRes && npmRes.error && !/HTTP \d/.test(String(npmRes.error));
+  if (npmNetErr) {
+    console.log(`SKIP  T3/T4/T5/T6/T15  npm registry 不可达（${npmRes.error}）—— 链路环境问题，非代码缺陷；已重试 ${process.env.DSH_NET_RETRIES || 3} 次`);
+  } else {
   t('T3', 'npm registry 查询', npmOK, npmOK ? `latest=${npmRes.latest.value} next=${npmRes.next.value} versions=${npmRes.versions.length}` : JSON.stringify(npmRes && npmRes.error));
   t('T4', 'npm latest', npmOK && !!npmRes.latest.value, npmRes.latest && npmRes.latest.value);
   t('T5', 'npm next', npmOK && !!npmRes.next.value, npmRes.next && npmRes.next.value);
   t('T6', 'npm versions（含 0.1.1-rc.1）', npmOK && npmRes.versions.includes('0.1.1-rc.1'), npmRes.versions && npmRes.versions.filter(v => v.startsWith('0.1.1')).join(','));
+  }
 
   // T1/T2: GitHub 真实查询
   // GitHub 匿名限额 60/h；被限流（403）是环境条件而不是代码缺陷 → 记为 SKIP 而非 FAIL，
@@ -71,10 +79,16 @@ function t(id, name, pass, detail) {
   t('T9', '所有来源失败 → 无目标（页面整体失败提示）', c9.target === null, `target=${c9.target}`);
 
   // T15: 真实场景目标可 npm 安装（0.1.1-rc.1 ∈ versions）
-  t('T15', '真实场景目标 0.1.1-rc.1 可安装', npmOK && npmRes.versions.includes('0.1.1-rc.1'), '');
+  if (!npmNetErr) t('T15', '真实场景目标 0.1.1-rc.1 可安装', npmOK && npmRes.versions.includes('0.1.1-rc.1'), '');
 
   // T14: 页面含 viewport（移动端）——version-server html 检查
   const html = require('fs').readFileSync('./scripts/version-server.js', 'utf8');
+  // T16: 网络抖动的重试语义（纯离线断言，锁住"链路失败才重试、HTTP 回答不重试"）
+  const netErr = policy.isNetworkError({ error: '连接失败（ECONNRESET）' });
+  const httpErr = policy.isNetworkError({ error: 'HTTP 403（rate limited / forbidden）', httpStatus: 403 });
+  t('T16', '重试语义：链路失败重试 / HTTP 回答不重试', netErr === true && httpErr === false,
+    `ECONNRESET→${netErr} HTTP403→${httpErr}`);
+
   t('T14', '版本页含移动端 viewport', html.includes('name="viewport"'), '');
 
   const failed = results.filter(r => !r.pass);
