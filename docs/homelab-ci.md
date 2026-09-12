@@ -231,6 +231,8 @@ DSH_NEW_PASSWORD='新密码' sh rotate-registry-credential.sh            # 确�
 密码只经环境变量传入（不进 argv）；`--dry-run` 零副作用（连 `docker login` 都写临时
 `DOCKER_CONFIG`，不碰宿主配置）。
 
+### 3.3 私有 registry 的宿主前提（一次性，已配好则跳过）
+
 ```sh
 # 1) 宿主允许 http registry（若用 192.168.5.35:5050 这种无 TLS 的地址）
 sudo vi /etc/docker/daemon.json
@@ -246,6 +248,10 @@ DSH_IMAGE_BASE=192.168.5.35:5050/llzg/dsh-docker
 
 `nas/lib.sh` 的 registry 访问已泛化（GHCR 匿名 token 流 / 内网 Basic Auth / https→http 探测），
 `prev_version`、回滚候选、`install.sh` 预拉取都会自动适配新的 `DSH_IMAGE_BASE`。
+
+> 现状（2026-09-10）：宿主已配好 `insecure-registries` 且 `~/.docker/config.json` 里有 5050 条目
+> （workflow 的 `logout: false` 保证它不再被 CI 清掉），`/volume1/docker/dsh-deploy/.env` 里已设
+> `DSH_IMAGE_BASE=192.168.5.35:5050/llzg/dsh-docker`。所以本节步骤**不需要重做**，留作重建宿主时的参照。
 
 ## 4. 与 Woodpecker / releasectl 的关系（**待你确认**）
 
