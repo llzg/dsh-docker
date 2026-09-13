@@ -194,6 +194,7 @@ problem (§6.3); 403 on `/api/*` but 200 on `/` = trusted-host fence (§4.3).
 | `docker pull … no basic auth credentials` | `jq -r '.auths|keys[]' /home/lzg/.docker/config.json` | ensure CI login step has `logout: false`; re-login: `printf '%s' "$PW" \| docker login 192.168.5.35:5050 -u ci-deploy --password-stdin`; run `rotate-registry-credential.sh` when rotating |
 | Version page shows the old single-channel page; `dsh-version` restart-looping | `docker ps --format '{{.Names}} {{.Ports}}' \| grep 3082` is empty while `curl 127.0.0.1:3082` answers | a host-net container squats 3082: set `DSH_VERSION_PORT=0` on `dsh-proxy`/`dsh-proxy-rc` and recreate them |
 | `docker ps` runs an older build than the tag | `sh check-image-drift.sh --remote` | `sh realign.sh` |
+| Version page shows stale SSOT values (old candidate/version) although the host `dsh-version.json` is new | `docker exec dsh-version ls -li /ssot/dsh-version.json` inode ≠ host `ls -li <SSOT>` → a **file** bind mount pinned to an inode unlinked by a rename-style write | `docker restart dsh-version` to re-bind; prefer in-place SSOT writes, or restart `dsh-version` after any atomic-replace edit |
 | Registry status shows both registries in the version page but ghcr 403 | `DSH_REGISTRY_USER/PASSWORD` are global and get sent to ghcr.io | `scripts/registry.js` already retries anonymously; if it regresses, keep `authUsed:false` fallback |
 | CI red on `T3/T4/T5/T6/T15` with `ECONNRESET` | transient upstream | rerun the failed jobs |
 
