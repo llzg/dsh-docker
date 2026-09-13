@@ -55,7 +55,9 @@ concurrency:
 #   vars.DSH_HTTP_PROXY      出网代理，如 http://192.168.5.36:7893（仅自建 runner 可用内网地址）
 #   vars.DSH_PRIVATE_IMAGE   私有 registry 镜像前缀，如 192.168.5.35:5050/llzg/dsh-docker
 #   vars.DSH_REGISTRIES      收敛判定/版本页查询的仓库列表（逗号分隔）；默认 GHCR
+#   vars.DSH_CACHE           1（默认）= 构建缓存放群晖 registry；0 = 回退本地 builder 缓存
 #   secrets.DSH_REGISTRY_USER / DSH_REGISTRY_PASSWORD   私有 registry 凭据
+# 构建缓存位置：<vars.DSH_PRIVATE_IMAGE>:buildcache-<channel>（BuildKit type=registry, mode=max）
 env:
   HTTP_PROXY: ${{ vars.DSH_HTTP_PROXY }}
   HTTPS_PROXY: ${{ vars.DSH_HTTP_PROXY }}
@@ -165,40 +167,69 @@ jobs:
           password: ${{ secrets.DSH_REGISTRY_PASSWORD }}
           logout: false
 
-      # 优先复用常驻 BuildKit（自建 runner 上持久层缓存，省掉每次 ~15s 的 bootstrap）：
-      #   homelab-builder（对方的 remote driver@tcp://127.0.0.1:1234）→ dsh-builder → 新建
-      - name: Select Buildx builder
+      # 构建缓存放到群晖 registry（192.168.5.35:5050）：BuildKit 的 type=registry cache。
+      # 目的：compute host（.17）磁盘有限，缓存统一落在 storage host（.35）的 registry，
+      #       且跨 runner 重装/清盘仍可用（缓存不在本地盘）。
+      # 约束：'default' 的 docker driver **不支持 cache 导出**（'Cache export is not supported
+      #       for the docker driver'）→ 启用 registry cache 时必须用 docker-container builder。
+      # 关闭：vars.DSH_CACHE=0 → 回退本地 builder 缓存（不推 registry cache）。
+      - name: Select Buildx builder + registry cache
         run: |
-          # 选择策略（实测 2026-09-10）：
-          #   1) vars.DSH_BUILDER（显式指定优先）
-          #   2) default —— docker driver：镜像直接落在 dockerd 镜像库，**省掉 1.4GB 的 export/load**
-          #   3) homelab-builder —— 常驻 BuildKit（缓存持久，但 remote driver 需要 --load 导出）
-          # 关键：builder 不可用（例如 BuildKit 端点挂了）必须能降级，不能把 job 判失败
-          #      —— 之前就是 `inspect --bootstrap` 非 0 + set -e 直接把构建步骤干掉了。
           set -uo pipefail
-          chosen=""
-          for cand in ${DSH_BUILDER:-} default homelab-builder; do
-            [ -n "$cand" ] || continue
-            if docker buildx inspect "$cand" >/dev/null 2>&1 && docker buildx inspect --bootstrap "$cand" >/dev/null 2>&1; then
-              docker buildx use "$cand" && chosen="$cand" && break
-            fi
-            echo "::warning::builder '$cand' 不可用（inspect/bootstrap 失败），尝试下一个"
-          done
-          if [ -z "$chosen" ]; then
-            echo "::warning::没有可用 builder，新建 dsh-builder（docker-container）"
-            docker buildx create --name dsh-builder --driver docker-container --bootstrap --use >/dev/null 2>&1 || true
-            chosen="dsh-builder"
+          CACHE_REF=""
+          if [ "${DSH_CACHE:-1}" != "0" ] && [ -n "${DSH_PRIVATE_IMAGE:-}" ]; then
+            CACHE_REF="${DSH_PRIVATE_IMAGE}:buildcache-${{ matrix.channel }}"
           fi
-          echo "selected builder: $chosen"
-          echo "DSH_SELECTED_BUILDER=$chosen" >> "$GITHUB_ENV"
-          # 说明：不再传 cache-from/cache-to。自建 runner 上三种 builder 的层缓存本来就是持久的
-          #   default(docker driver)  → dockerd 内部 BuildKit 缓存（持久）
-          #   homelab-builder/buildx_buildkit_* → 各自 volume（持久）
-          # 而 docker driver 明确不支持 cache 导出（'Cache export is not supported for the docker driver'）；
-          # cache-from/to 只在"跨 builder 搬运缓存/临时 CI"场景才需要。
-          docker buildx inspect "$chosen" 2>&1 | grep -E 'Name|Driver|Status|Platforms' | head -6 || true
+
+          if [ -n "$CACHE_REF" ]; then
+            # Synology registry 无 TLS（http）→ buildkitd 必须把它标为 insecure
+            printf '[registry."%s"]\n  http = true\n  insecure = true\n' "${DSH_PRIVATE_REGISTRY}" > /tmp/dsh-buildkitd.toml
+            echo "--- buildkitd.toml ---"; cat /tmp/dsh-buildkitd.toml
+            OPTS=""
+            if [ -n "${DSH_HTTP_PROXY:-}" ]; then
+              OPTS="--driver-opt env.HTTP_PROXY=${DSH_HTTP_PROXY} --driver-opt env.HTTPS_PROXY=${DSH_HTTP_PROXY}"
+            fi
+            OPTS="$OPTS --driver-opt env.NO_PROXY=${NO_PROXY:-localhost,127.0.0.1}"
+            if ! docker buildx inspect dsh-cache >/dev/null 2>&1; then
+              docker buildx create --name dsh-cache --driver docker-container --config /tmp/dsh-buildkitd.toml $OPTS >/dev/null
+            fi
+            if docker buildx inspect --bootstrap dsh-cache >/dev/null 2>&1; then
+              docker buildx use dsh-cache
+              echo "DSH_SELECTED_BUILDER=dsh-cache" >> "$GITHUB_ENV"
+              echo "DSH_CACHE_FROM=type=registry,ref=${CACHE_REF}" >> "$GITHUB_ENV"
+              echo "DSH_CACHE_TO=type=registry,ref=${CACHE_REF},mode=max,ignore-error=true" >> "$GITHUB_ENV"
+              echo "selected builder: dsh-cache；cache=${CACHE_REF}（群晖 registry）"
+              docker buildx inspect dsh-cache 2>&1 | grep -E 'Name|Driver|Status|Platforms' | head -6 || true
+            else
+              echo "::warning::dsh-cache 不可用，回退本地 builder 缓存"
+              CACHE_REF=""
+            fi
+          fi
+
+          if [ -z "$CACHE_REF" ]; then
+            # 回退：原逻辑（vars.DSH_BUILDER → default → homelab-builder → 新建），用本地 builder 缓存
+            chosen=""
+            for cand in ${DSH_BUILDER:-} default homelab-builder; do
+              [ -n "$cand" ] || continue
+              if docker buildx inspect "$cand" >/dev/null 2>&1 && docker buildx inspect --bootstrap "$cand" >/dev/null 2>&1; then
+                docker buildx use "$cand" && chosen="$cand" && break
+              fi
+              echo "::warning::builder '$cand' 不可用（inspect/bootstrap 失败），尝试下一个"
+            done
+            if [ -z "$chosen" ]; then
+              echo "::warning::没有可用 builder，新建 dsh-builder（docker-container）"
+              docker buildx create --name dsh-builder --driver docker-container --bootstrap --use >/dev/null 2>&1 || true
+              chosen="dsh-builder"
+            fi
+            echo "selected builder: $chosen（本地缓存；registry cache 未启用）"
+            echo "DSH_SELECTED_BUILDER=$chosen" >> "$GITHUB_ENV"
+            docker buildx inspect "$chosen" 2>&1 | grep -E 'Name|Driver|Status|Platforms' | head -6 || true
+          fi
         env:
           DSH_BUILDER: ${{ vars.DSH_BUILDER }}
+          DSH_CACHE: ${{ vars.DSH_CACHE }}
+          DSH_PRIVATE_IMAGE: ${{ vars.DSH_PRIVATE_IMAGE }}
+          DSH_PRIVATE_REGISTRY: ${{ vars.DSH_PRIVATE_REGISTRY }}
 
       # prerelease（alpha/beta/rc）不打 latest，防止任何 latest 消费者把预发布版部署到生产；
       # stable 追加 latest。回滚一律用不可变 <version>-<sha> 或 <version>。
@@ -242,7 +273,10 @@ jobs:
           load: true
           push: false
           tags: ${{ env.IMAGE_TAGS }}
-          # 层缓存走 builder 自身的持久缓存（见 Select Buildx builder 的说明），此处不传 cache-from/to
+          # 缓存：启用时走群晖 registry 的 BuildKit registry cache（上一步写入 DSH_CACHE_FROM/TO）；
+          # 未启用时为空 → build-push-action 不追加 --cache-from/--cache-to。
+          cache-from: ${{ env.DSH_CACHE_FROM }}
+          cache-to: ${{ env.DSH_CACHE_TO }}
           build-args: |
             DSH_VERSION=${{ matrix.version }}
             GIT_REVISION=${{ github.sha }}

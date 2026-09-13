@@ -115,8 +115,15 @@ DSH_PRIVATE_IMAGE   192.168.5.35:5050/llzg/dsh-docker
 DSH_PRIVATE_REGISTRY 192.168.5.35:5050
 DSH_PUSH_GHCR       1            # 0 = internal registry only (images only; source push unaffected)
 DSH_REGISTRIES      ghcr.io/llzg/dsh-docker,192.168.5.35:5050/llzg/dsh-docker
+DSH_CACHE           1            # build cache in the Synology registry; 0 = fall back to local builder cache
 ```
 Repo secrets: `DSH_REGISTRY_USER=ci-deploy`, `DSH_REGISTRY_PASSWORD=<rotate; see §7.1>`.
+
+**Build cache lives on Synology (192.168.5.35), not on the compute host.** Each channel exports
+BuildKit cache to `192.168.5.35:5050/llzg/dsh-docker:buildcache-<channel>` (`type=registry,mode=max`,
+`ignore-error=true`) through a `docker-container` builder named `dsh-cache` whose buildkitd.toml marks
+the HTTP registry insecure. The `default` docker driver cannot export cache, so registry cache implies a
+container driver (hence `--load` for smoke/push). Disable with `DSH_CACHE=0`.
 
 Jobs: `resolve` (policy/contract tests + `check-new-version.js`) → `build-publish (alpha|rc)`
 (checkout → logins → builder select → build → smoke → push all tags → write status) → `record-status`
