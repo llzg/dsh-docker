@@ -82,7 +82,7 @@ SSOT / compose values (see §4.3).
 | `/volume1/docker/github-runner-dsh/` | self-hosted runner install (`disableUpdate=true` in `.runner` on purpose) |
 | `/volume1/docker/dsh-docker-push/` | the host-side clone used to push commits to GitHub |
 
-Channels (from the SSOT; container/project/data dir are authoritative):
+Channels (from the single SSOT [`../dsh-version.json`](../dsh-version.json); container/project/data dir are authoritative):
 
 | Channel | container | compose project | data dir | `DSH_HOME` (in container) | host port | loopback publish | `docker.sock` |
 |---|---|---|---|---|---|---|---|

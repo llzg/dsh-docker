@@ -36,14 +36,14 @@
   "schemaVersion": 2,
   "primaryChannel": "alpha",
   "channels": {
-    "alpha": { "port": 3081, "container": "dsh-alpha", "project": "dsh-alpha",
-               "dataDir": "/volume1/docker/dsh-alpha",
-               "production": "0.1.3-alpha.2", "candidate": "0.1.5-alpha.2" },
-    "rc":    { "port": 3083, "container": "dsh-rc", "project": "dsh-rc",
-               "dataDir": "/volume1/docker/dsh-rc",
-               "production": "0.1.2-rc.1", "candidate": "0.1.2-rc.1" }
+    "alpha": { "port": 3081, "container": "deepseek-harness-alpha", "project": "dsh-alpha",
+               "dataDir": "/volume1/docker/dsh-alpha5", "dshHome": "/data/dsh/test/0.1.2-alpha.5",
+               "production": "0.1.5-alpha.2", "candidate": "0.1.5-alpha.2" },
+    "rc":    { "port": 3083, "container": "dsh-rc1", "project": "dsh-rc",
+               "dataDir": "/volume1/docker/deepseek-harness", "dshHome": "/data/dsh",
+               "production": "0.1.5-rc.1", "candidate": "0.1.5-rc.2" }
   },
-  "updatedAt": "…", "source": "manual",
+  "updatedAt": "…", "source": "ssot-consolidation-20260913",
   "requiredPlugins": ["…"], "optionalPlugins": ["…"], "pluginCompat": {}, "pluginState": {}
 }
 ```

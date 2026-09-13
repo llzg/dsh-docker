@@ -25,9 +25,13 @@
 
 | 通道 | 版本段 | 宿主端口 | 容器名 | compose 项目名 | 数据目录（宿主） |
 |---|---|---|---|---|---|
-| `alpha` | `-alpha.N` | 3081 | `dsh-alpha` | `dsh-alpha` | `/volume1/docker/dsh-alpha` |
-| `rc` | `-rc.N` | 3083 | `dsh-rc` | `dsh-rc` | `/volume1/docker/dsh-rc` |
+| `alpha` | `-alpha.N` | 3081 | `deepseek-harness-alpha` | `dsh-alpha` | `/volume1/docker/dsh-alpha5` |
+| `rc` | `-rc.N` | 3083 | `dsh-rc1` | `dsh-rc` | `/volume1/docker/deepseek-harness` |
 | `stable` | 无 prerelease 段 | 3085（预留） | `dsh-stable` | `dsh-stable` | `/volume1/docker/dsh-stable` |
+
+> 上表是**当前 as-built**；唯一 SSOT 是 [`../dsh-version.json`](../dsh-version.json)。脚本读取该文件的
+> `channels[ch].{port,container,project,dataDir,production,candidate}`；`scripts/safe-deploy-policy.js`
+> 的 `CHANNEL_DEFAULTS` 仅作为**未声明通道**的兜底（alpha/rc 已显式声明，不取默认值）。
 
 - 通道由**版本的 semver prerelease 段**判定：`0.1.3-alpha.2 → alpha`、`0.1.2-rc.1 → rc`、
   `0.1.2 → stable`。判定函数唯一实现：`scripts/version-policy.js:channelOf()`。
@@ -44,23 +48,25 @@
   "channels": {
     "alpha": {
       "port": 3081,
-      "container": "dsh-alpha",
+      "container": "deepseek-harness-alpha",
       "project": "dsh-alpha",
-      "dataDir": "/volume1/docker/dsh-alpha",
-      "production": "0.1.3-alpha.2",
+      "dataDir": "/volume1/docker/dsh-alpha5",
+      "dshHome": "/data/dsh/test/0.1.2-alpha.5",
+      "production": "0.1.5-alpha.2",
       "candidate": "0.1.5-alpha.2"
     },
     "rc": {
       "port": 3083,
-      "container": "dsh-rc",
+      "container": "dsh-rc1",
       "project": "dsh-rc",
-      "dataDir": "/volume1/docker/dsh-rc",
-      "production": "0.1.2-rc.1",
-      "candidate": "0.1.2-rc.1"
+      "dataDir": "/volume1/docker/deepseek-harness",
+      "dshHome": "/data/dsh",
+      "production": "0.1.5-rc.1",
+      "candidate": "0.1.5-rc.2"
     }
   },
-  "updatedAt": "2026-09-09T00:00:00.000Z",
-  "source": "manual",
+  "updatedAt": "2026-09-13T08:16:38.000Z",
+  "source": "ssot-consolidation-20260913",
   "requiredPlugins": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-subagent-codex"],
   "optionalPlugins": ["@deepseek-ai/dsh-subagent-claude-code", "@siliconflow-official/dsh-llm-siliconflow"],
   "pluginCompat": { "...": { "status": "FAIL", "reason": "..." } },

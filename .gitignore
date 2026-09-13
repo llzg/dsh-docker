@@ -22,3 +22,16 @@ node_modules/
 nas/.env
 nas/.env.*
 !nas/.env.example
+
+# dsh-mobile 等本地独立仓库 / 诊断脚本 / CI 凭据（绝不可入库）
+dsh-mobile/
+audit-dsh-mobile/
+dsh-test/
+.browser-cache/
+.ci-tokens.env
+.dsh_askpass.sh
+.diag_ssh.sh
+.known_hosts_diag
+
+# 对齐上游前的自动备份目录
+.backup-pre-update-*/

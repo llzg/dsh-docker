@@ -2,13 +2,15 @@
 
 在绿联 NAS 上并行维护两条 DeepSeek Harness（dsh）版本线：
 
-| 通道 | 版本段 | 宿主端口 | 容器 / compose 项目 | 数据目录 |
-|---|---|---|---|---|
-| `alpha` | `-alpha.N` | 3081 | `dsh-alpha` | `/volume1/docker/dsh-alpha` |
-| `rc` | `-rc.N` | 3083 | `dsh-rc` | `/volume1/docker/dsh-rc` |
+| 通道 | 版本段 | 宿主端口 | 容器 | compose 项目 | 数据目录 |
+|---|---|---|---|---|---|
+| `alpha` | `-alpha.N` | 3081 | `deepseek-harness-alpha` | `dsh-alpha` | `/volume1/docker/dsh-alpha5` |
+| `rc` | `-rc.N` | 3083 | `dsh-rc1` | `dsh-rc` | `/volume1/docker/deepseek-harness` |
 
-版本状态页：<http://<NAS-IP>:3082/>（由 alpha 容器统一渲染**两条通道**）。
+版本状态页：<http://<NAS-IP>:3082/>（`dsh-version` 容器统一渲染**两条通道**；只读挂载下面的 SSOT）。
 
+> **唯一 SSOT：[`dsh-version.json`](dsh-version.json)** —— 通道/容器/项目/数据目录/版本一律以它为准；
+> 本文与 `docs/**` 只做引用与解释，不再复制一份会漂移的值。
 > 设计契约（字段、API、环境变量、验收标准）见 [docs/dual-channel.md](docs/dual-channel.md)。
 > 升级流程与安全边界见 [docs/safe-upgrade-architecture.md](docs/safe-upgrade-architecture.md)。
 
@@ -29,7 +31,7 @@ GitHub Actions（本仓库，矩阵：alpha / rc）
 ghcr.io/llzg/dsh-docker:<version>
         │  每通道一个 compose 项目（显式 -p / --project-directory；不依赖 watchtower）
         ▼
-NAS：dsh-alpha(3081) / dsh-rc(3083)   ←── dsh-safe-deploy check/test/promote/rollback
+NAS：deepseek-harness-alpha(3081) / dsh-rc1(3083)   ←── dsh-safe-deploy check/test/promote/rollback
         │
         └─ watchdog（每 5 分钟）：容器不健康且**刚部署** → 自动回滚上一版本并钉住
 ```

@@ -11,7 +11,22 @@ t() { if [ "$3" = "1" ]; then PASS=$((PASS+1)); echo "PASS  $1  $2${4:+ | $4}"; 
 
 mkdir -p "$TMP/bin" "$TMP/repo"
 cp -a "$REPO/nas" "$TMP/repo/nas"
-cp "$REPO/dsh-version.json" "$TMP/repo/dsh-version.json"
+# 固定 fixture SSOT（设计默认值）——不要复制仓库实时 SSOT，否则测试会随
+# 线上 as-built 值（alpha dataDir=/volume1/docker/dsh-alpha5 等）漂移而假失败。
+cat > "$TMP/repo/dsh-version.json" <<'SSOT'
+{
+  "schemaVersion": 2,
+  "primaryChannel": "alpha",
+  "channels": {
+    "alpha": { "port": 3081, "container": "dsh-alpha", "project": "dsh-alpha",
+               "dataDir": "/volume1/docker/dsh-alpha",
+               "production": "0.1.3-alpha.2", "candidate": "0.1.3-alpha.2" },
+    "rc":    { "port": 3083, "container": "dsh-rc", "project": "dsh-rc",
+               "dataDir": "/volume1/docker/dsh-rc",
+               "production": "0.1.2-rc.1", "candidate": "0.1.2-rc.1" }
+  }
+}
+SSOT
 
 # docker 桩：模拟"alpha 跑在旧目录 deepseek-harness(3081)，rc 已符合新布局(3083)"
 cat > "$TMP/bin/docker" <<'STUB'
