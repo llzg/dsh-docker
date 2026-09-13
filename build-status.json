@@ -11,12 +11,12 @@
     },
     "rc": {
       "channel": "rc",
-      "version": "0.1.5-rc.1",
+      "version": "0.1.5-rc.2",
       "conclusion": "success",
-      "headSha": "d87590282d7b42fdf7d611d2810524042405ab82",
-      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/34480489579",
-      "updatedAt": "2026-09-10T13:10:21.161Z"
+      "headSha": "5943c28222dd1928011f085825a08f074088f47b",
+      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/34711728143",
+      "updatedAt": "2026-09-13T08:57:32.079Z"
     }
   },
-  "updatedAt": "2026-09-10T13:15:47.816Z"
+  "updatedAt": "2026-09-13T08:58:51.626Z"
 }
