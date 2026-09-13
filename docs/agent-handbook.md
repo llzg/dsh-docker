@@ -123,7 +123,9 @@ Repo secrets: `DSH_REGISTRY_USER=ci-deploy`, `DSH_REGISTRY_PASSWORD=<rotate; see
 BuildKit cache to `192.168.5.35:5050/llzg/dsh-docker:buildcache-<channel>` (`type=registry,mode=max`,
 `ignore-error=true`) through a `docker-container` builder named `dsh-cache` whose buildkitd.toml marks
 the HTTP registry insecure. The `default` docker driver cannot export cache, so registry cache implies a
-container driver (hence `--load` for smoke/push). Disable with `DSH_CACHE=0`.
+container driver (hence `--load` for smoke/push). The base image is pulled through the Synology
+pull-through cache (`192.168.5.35:5051/library/node:22-bookworm-slim`), so buildkitd needs no proxy env
+(which also sidesteps buildx comma-splitting `--driver-opt`). Disable with `DSH_CACHE=0`.
 
 Jobs: `resolve` (policy/contract tests + `check-new-version.js`) → `build-publish (alpha|rc)`
 (checkout → logins → builder select → build → smoke → push all tags → write status) → `record-status`

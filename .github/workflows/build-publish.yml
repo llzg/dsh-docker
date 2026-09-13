@@ -182,18 +182,16 @@ jobs:
           fi
 
           if [ -n "$CACHE_REF" ]; then
-            # Synology registry 无 TLS（http）→ buildkitd 必须把它标为 insecure
-            printf '[registry."%s"]\n  http = true\n  insecure = true\n' "${DSH_PRIVATE_REGISTRY}" > /tmp/dsh-buildkitd.toml
+            # buildkitd 需把内网 http registry 标为 insecure：
+            #   :5050 = 镜像/缓存推送；:5051 = 基础镜像 pull-through（见 build-args BASE_IMAGE）
+            REG_HOST="${DSH_PRIVATE_REGISTRY%:*}"
+            printf '[registry."%s"]\n  http = true\n  insecure = true\n[registry."%s:5051"]\n  http = true\n  insecure = true\n' "${DSH_PRIVATE_REGISTRY}" "$REG_HOST" > /tmp/dsh-buildkitd.toml
             echo "--- buildkitd.toml ---"; cat /tmp/dsh-buildkitd.toml
-            OPTS=""
-            if [ -n "${DSH_HTTP_PROXY:-}" ]; then
-              OPTS="--driver-opt env.HTTP_PROXY=${DSH_HTTP_PROXY} --driver-opt env.HTTPS_PROXY=${DSH_HTTP_PROXY}"
-            fi
-            OPTS="$OPTS --driver-opt env.NO_PROXY=${NO_PROXY:-localhost,127.0.0.1}"
-            if ! docker buildx inspect dsh-cache >/dev/null 2>&1; then
-              docker buildx create --name dsh-cache --driver docker-container --config /tmp/dsh-buildkitd.toml $OPTS >/dev/null
-            fi
-            if docker buildx inspect --bootstrap dsh-cache >/dev/null 2>&1; then
+            # 每次重建 builder，确保 insecure 配置生效；本地不保留 builder 状态 —— 缓存全部来自群晖
+            # registry；基础镜像走 :5051，所以 buildkitd 不需要代理环境（NO_PROXY 含逗号会被
+            # --driver-opt 的逗号切分搞坏：实测 'ERROR: invalid value "127.0.0.1", expecting k=v'）。
+            docker buildx rm dsh-cache >/dev/null 2>&1 || true
+            if docker buildx create --name dsh-cache --driver docker-container --config /tmp/dsh-buildkitd.toml >/dev/null 2>&1 && docker buildx inspect --bootstrap dsh-cache >/dev/null 2>&1; then
               docker buildx use dsh-cache
               echo "DSH_SELECTED_BUILDER=dsh-cache" >> "$GITHUB_ENV"
               echo "DSH_CACHE_FROM=type=registry,ref=${CACHE_REF}" >> "$GITHUB_ENV"
@@ -281,7 +279,8 @@ jobs:
             DSH_VERSION=${{ matrix.version }}
             GIT_REVISION=${{ github.sha }}
             DSH_CHANNEL=${{ matrix.channel }}
-            BASE_IMAGE=${{ vars.DSH_BASE_IMAGE || 'node:22-bookworm-slim' }}
+            # 基础镜像走群晖 pull-through 缓存（:5051），避免 buildkitd 直连 Docker Hub（无需代理）
+            BASE_IMAGE=${{ vars.DSH_BASE_IMAGE || '192.168.5.35:5051/library/node:22-bookworm-slim' }}
             # 构建内走代理（2026-09-10 宿主实测数据）：
             #   github.com release 直连**卡死**（25s 超时、0 字节），走代理 0.69s ——
             #   uv 的 install.sh 正是从 GitHub releases 取二进制，此前直连要 165s；
