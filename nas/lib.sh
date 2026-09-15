@@ -584,9 +584,27 @@ write_identity_env() { # <path> —— 只写通道身份（不含 DSH_IMAGE/DSH
 
 # 写 .env（不重建容器）：pin 事务 / install 初始化 / resume 回退共用同一格式。
 # 注意：image-tag 可以是 latest 这类非发布标签（install/resume 回退路径）。
+# ⚠ 关键：**保留现有 .env 的运行键**（Phase 2 compose 需要 DSH_BIND_IP / DSH_PUBLISH_PORT /
+#   DSH_INTERNAL_PORT / DSH_PROXY_CONTAINER / DSH_LAUNCH_TOKEN / DSH_ALLOWED_CIDR /
+#   DSH_HTTP_PROXY / DSH_NO_PROXY …），只覆盖 DSH_IMAGE 与 DSH_PIN_*。
+#   历史 P0：本函数只写 env_identity_lines + image/pin，把运行键整段丢掉 → pin 后
+#   compose up 因缺 DSH_PUBLISH_PORT/DSH_BIND_IP 等失败，且回滚后容器起不来（生产掉线）。
 write_env_image() { # <image-tag> <reason> <digest-or-empty> <path>
+  _dst="$4"
+  _tmp="${_dst}.tmp.$$"
+  if [ -n "${DIR:-}" ] && [ -f "$DIR/.env" ] && [ "$DIR/.env" != "$_dst" ]; then
+    _src="$DIR/.env"
+  elif [ -f "$_dst" ]; then
+    _src="$_dst"
+  else
+    _src=""
+  fi
+  if [ -n "$_src" ]; then
+    grep -v -E '^(DSH_IMAGE|DSH_PIN_VERSION|DSH_PIN_REASON|DSH_PIN_AT|DSH_PIN_DIGEST)=' "$_src" > "$_tmp" || true
+  else
+    env_identity_lines > "$_tmp"
+  fi
   {
-    env_identity_lines
     printf 'DSH_IMAGE=%s:%s\n' "$IMG" "$1"
     printf 'DSH_PIN_VERSION=%s\n' "$1"
     printf 'DSH_PIN_REASON=%s\n' "$2"
@@ -595,7 +613,8 @@ write_env_image() { # <image-tag> <reason> <digest-or-empty> <path>
       printf 'DSH_PIN_DIGEST=%s\n' "$3"
     fi
     : # 保证块退出码为 0（无 digest 时上一条 if 不执行）
-  } > "$4"
+  } >> "$_tmp"
+  mv -f "$_tmp" "$_dst"
 }
 
 write_pending_env() { # <version> <reason> <digest> <path>

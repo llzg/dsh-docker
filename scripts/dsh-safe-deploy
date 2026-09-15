@@ -505,6 +505,18 @@ rollback_locked() { # <channel>
   mkdir -p "$SOURCE_HOME"
   tar -C "$snap" -cf - . | tar -C "$SOURCE_HOME" -xf -
   echo "  data restored: $snap -> $SOURCE_HOME (previous: ${moved:-in-place, mv skipped})"
+  # ⚠ snapshot_dsh 刻意排除了 profiles/*/node_modules（体积）：它们随整个旧工作区被 mv 到
+  #   $SOURCE_HOME.pre-rollback-*，而快照里没有 → 不拷回的话新工作区缺 bundle，dsh 启动即
+  #   "cannot resolve profile bundle @deepseek-ai/dsh-subagent-codex" 崩溃（2026-09-16 实测：
+  #   rc 回滚后直接掉线）。必须从 pre-rollback 目录补回 node_modules。
+  if [ -n "$moved" ] && [ -d "$moved" ]; then
+    for _nm in profiles/web/node_modules profiles/headless/node_modules; do
+      if [ -d "$moved/$_nm" ] && [ ! -e "$SOURCE_HOME/$_nm" ]; then
+        mkdir -p "$(dirname "$SOURCE_HOME/$_nm")"
+        if cp -a "$moved/$_nm" "$SOURCE_HOME/$_nm"; then echo "  restored $_nm from pre-rollback"; fi
+      fi
+    done
+  fi
 
   # 2) 事务化 pin 回旧镜像（校验 project/卷源；失败自动还原旧 .env）
   if ! pin_version_locked "$ver" manual; then
