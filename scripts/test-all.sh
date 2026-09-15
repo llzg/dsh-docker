@@ -52,6 +52,7 @@ run bash scripts/test-nas-deploy.sh
 run bash scripts/test-migration.sh
 run bash scripts/test-patch-dsh.sh
 run bash scripts/test-dockerfile-layers.sh
+run bash scripts/test-auto-upgrade.sh
 
 echo ""
 if [ "$fails" -eq 0 ]; then
