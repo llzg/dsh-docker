@@ -125,12 +125,19 @@ resolve_channel() {
   export DSH_CHANNEL="$ch"
   export DSH_SSOT="$SSOT"
   export DSH_DEPLOY_STATE="$STATE_DIR_BASE"
-  export DSH_DEPLOY_DIR="${!ddir:-$ORIG_DEPLOY_DIR}"
-  export DSH_CONTAINER="${!cvar:-$ORIG_CONTAINER}"
-  export DSH_PROJECT="${!pvar:-$ORIG_PROJECT}"
-  export DSH_PORT="${!portvar:-$ORIG_PORT}"
+  # ⚠ docker compose 里 **shell 环境变量优先于 $DIR/.env**。若无条件 export 成空串/单值，
+  #   会把 .env 的 DSH_CONTAINER / DSH_PROJECT / DSH_PUBLISH_PORT / DSH_BIND_IP /
+  #   DSH_TRUSTED_HOST(多地址) 等整段盖掉 → 实测 pin 时 compose 建出名叫 "dsh-alpha" 的
+  #   错容器，rc 生产容器根本没被创建（2026-09-16 事故）。所以：只有显式 per-channel 覆盖才
+  #   export，否则 unset，让 compose 从 .env 读；lib.sh 用 SSOT channels[ch] 兜底解析。
+  _v="${!ddir:-$ORIG_DEPLOY_DIR}"; if [ -n "$_v" ]; then export DSH_DEPLOY_DIR="$_v"; else unset DSH_DEPLOY_DIR 2>/dev/null || true; fi
+  _v="${!cvar:-$ORIG_CONTAINER}"; if [ -n "$_v" ]; then export DSH_CONTAINER="$_v"; else unset DSH_CONTAINER 2>/dev/null || true; fi
+  _v="${!pvar:-$ORIG_PROJECT}";   if [ -n "$_v" ]; then export DSH_PROJECT="$_v"; else unset DSH_PROJECT 2>/dev/null || true; fi
+  _v="${!portvar:-$ORIG_PORT}";   if [ -n "$_v" ]; then export DSH_PORT="$_v"; else unset DSH_PORT 2>/dev/null || true; fi
+  unset _v
   export DSH_LOCK_FILE="$STATE_DIR/deploy.lock"
-  export DSH_TRUSTED_HOST="$TRUSTED_HOST"
+  # DSH_TRUSTED_HOST 交给 .env（支持多地址）；自身用 $TRUSTED_HOST 即可，不要 export 覆盖
+  unset DSH_TRUSTED_HOST 2>/dev/null || true
   export DSH_IMAGE_BASE="$IMAGE_BASE"
 
   # shellcheck disable=SC1090
