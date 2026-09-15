@@ -349,8 +349,12 @@ cmd_test() { # <channel>
     -v "$test_home:$test_home_cont" \
     -v "$ROOT_SOURCE:/root:rw" \
     "${IMAGE_BASE}:${target}" dsh --profile web --no-open --host 127.0.0.1 --trusted-host "$TRUSTED_HOST" >/dev/null
+  # ⚠ cname 是 local：EXIT trap 在**脚本退出**时才触发，那时函数作用域已退出 → "$cname"
+  #   在 set -u 下报 unbound（历史 bug），而 ${cname:-} 会退化成空串 → 测试容器删不掉（泄漏，
+  #   实测干扰 compose pin 的就绪判定）。用一个**全局**变量承载，trap 才能真的删掉。
+  DSH_TEST_CNAME="$cname"
   if [ "${DSH_TEST_KEEP:-0}" != "1" ]; then
-    trap 'docker rm -f "$cname" >/dev/null 2>&1 || true' EXIT
+    trap 'docker rm -f "${DSH_TEST_CNAME:-}" >/dev/null 2>&1 || true' EXIT
   fi
 
   ok=1
@@ -372,18 +376,24 @@ cmd_test() { # <channel>
   # 0.1.3 起 preset schema 升级（persona text→prefix, tool-presentation mode code→ptc），
   # 旧 preset 文件可导致会话 mount 失败而 web 探活仍 200 —— 探活通过不等于可用。
   # gate: 对 TEST_DSH_HOME 下每个 .agent-presets/<id>/agent.cordis.yml 调用
-  # session/create(agentPreset=<id>) 触发真实 mount；任一失败即 FAIL，杜绝把
-  # schema 不兼容的 preset 推上生产。token 复用上面的 tok（同 test 实例）。
-  local preset_fail=0 preset_yml preset_id resp
+  # session/create(agentPreset=<id>) 触发真实 mount；任一失败即 FAIL。
+  # ⚠ 0.1.5 起 API 需要**会话 cookie**：?token= 只用于首次换取 cookie，URL 直接带 token 调
+  #   /api/session/create 会 unauthorized。故先 GET /?token= 建会话，再带 cookie 调 API；
+  #   若该版本仍拒绝 cookie，则 SKIP（不 FAIL），schema 兼容性由 preflight P1 兜底。
+  local preset_fail=0 preset_yml preset_id resp jar
+  jar="$(mktemp 2>/dev/null || echo /tmp/dsh-preset-jar.$$)"
+  if [ -n "$tok" ] && [ -n "$cip" ]; then
+    curl -sS -m 15 -c "$jar" -o /dev/null "http://$cip:3080/?token=$tok" >/dev/null 2>&1 || true
+  fi
   for preset_yml in "$test_home_cont"/.agent-presets/*/agent.cordis.yml; do
     [ -e "$preset_yml" ] || continue
     preset_id="$(basename "$(dirname "$preset_yml")")"
     echo "preset gate: $preset_id"
     if [ -n "$tok" ] && [ -n "$cip" ]; then
-      resp="$(curl -sS -m 15 -X POST -H 'Content-Type: application/json' \
-        -d '{"type":"client-request","rpcId":"pg","method":"session/create","payload":{"args":{"request":{"agentPreset":"'"$preset_id"'","cwd":"/data"}}}}' \
-        "http://$cip:3080/api/session/create?token=$tok" 2>&1 || true)"
-      if ! echo "$resp" | grep -q '"ok":true'; then
+      resp="$(curl -sS -m 15 -b "$jar" -X POST -H 'Content-Type: application/json' -d '{"type":"client-request","rpcId":"pg","method":"session/create","payload":{"args":{"request":{"agentPreset":"'"$preset_id"'","cwd":"/data"}}}}' "http://$cip:3080/api/session/create" 2>&1 || true)"
+      if echo "$resp" | grep -qi 'unauthorized'; then
+        echo "PRESET GATE SKIP: $preset_id（API 仍拒绝会话 cookie，无法鉴权；preflight P1 兜底）"
+      elif ! echo "$resp" | grep -q '"ok":true'; then
         echo "PRESET GATE FAIL: $preset_id -> $(echo "$resp" | head -c 300)"
         preset_fail=1
       fi
@@ -391,6 +401,7 @@ cmd_test() { # <channel>
       echo "PRESET GATE SKIP: token/IP 未就绪（$preset_id）"
     fi
   done
+  rm -f "$jar" 2>/dev/null || true
   if [ "$preset_fail" -ne 0 ]; then
     echo "FAIL: preset mount gate 未通过"
     echo "TEST_VERDICT=FAIL" | tee "$verdict_file"

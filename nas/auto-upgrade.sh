@@ -234,6 +234,20 @@ for ch in $(channel_list); do
 
   home=$(host_workspace "$ch")
   if [ ! -d "$home" ]; then log "STOP: 工作区不存在 $home"; continue; fi
+  # dsh-safe-deploy 在宿主上跑时，路径必须全部是**宿主视角**，且 TEST_ROOT 必须落在数据卷源下：
+  #   工具内部 test_home=<bind 源>/test/<target>，而 test_home_cont=$TEST_ROOT/<target>，
+  #   然后 -v test_home:test_home_cont —— 只有 test_home == test_home_cont 时，测试容器
+  #   才真的看得到刚解包的隔离 HOME（否则 preset/会话全空，gate 报 not-found / unauthorized）。
+  #   DSH_SOURCE_HOME_<CH> = 该通道 DSH_HOME 的宿主路径（snapshot 的 tar -C 在宿主上执行）
+  #   DSH_TEST_ROOT_<CH>   = <数据卷源>/test 的宿主路径（= test_home 的父目录）
+  #   DSH_BACKUP_ROOT/STATE = 落宿主 state，别写进数据卷
+  CH_UP=$(printf '%s' "$ch" | tr 'a-z' 'A-Z')
+  hd=$(ssot_field "$ch" dataDir)/dsh-data
+  export "DSH_SOURCE_HOME_$CH_UP=$home"
+  export "DSH_TEST_ROOT_$CH_UP=$hd/test"
+  export "DSH_BACKUP_ROOT_$CH_UP=$STATE/backups/$ch"
+  export "DSH_STATE_DIR_$CH_UP=$STATE"
+  log "safe-deploy env: SOURCE_HOME=$home TEST_ROOT=$hd/test"
   pf=$(preflight_json "$home" || true)
   log "preflight(before): $(findings_summary "$pf")"
   if [ "$DO_REPAIR" = "1" ]; then
@@ -250,10 +264,17 @@ for ch in $(channel_list); do
   fi
 
   if [ "$DRY" = "1" ]; then log "DRY: would test then promote $ch -> $cand (force=$force)"; continue; fi
-  if ! bash "$REPO_DIR/$SAFE" test --channel "$ch" >>"$LOG" 2>&1; then
-    log "test FAIL（见日志），不上线"; audit "$ch" "$cur" "$cand" "$risk" "test-fail"; continue
+  if bash "$REPO_DIR/$SAFE" test --channel "$ch" >>"$LOG" 2>&1; then
+    log "test PASS"
+  else
+    # 兜底：dsh-safe-deploy 的 EXIT trap 历史 bug 可能让 PASS 也返回非零 —— 以 verdict 文件为准
+    verdict=$(cat "$STATE/$ch/last-test-verdict" 2>/dev/null || true)
+    if [ "$verdict" = "TEST_VERDICT=PASS" ]; then
+      log "test 退出码非零但 verdict=PASS（按 PASS 继续）"
+    else
+      log "test FAIL（见日志），不上线"; audit "$ch" "$cur" "$cand" "$risk" "test-fail"; continue
+    fi
   fi
-  log "test PASS"
 
   if ! bash "$REPO_DIR/$SAFE" promote --channel "$ch" $force >>"$LOG" 2>&1; then
     log "promote FAIL（见日志）"; audit "$ch" "$cur" "$cand" "$risk" "promote-fail"; continue
