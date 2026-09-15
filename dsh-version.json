@@ -9,7 +9,7 @@
       "dataDir": "/volume1/docker/dsh-alpha5",
       "dshHome": "/data/dsh/test/0.1.2-alpha.5",
       "production": "0.1.5-alpha.2",
-      "candidate": "0.1.5-alpha.2"
+      "candidate": "0.1.6-alpha.1"
     },
     "rc": {
       "port": 3083,
@@ -17,12 +17,12 @@
       "project": "dsh-rc",
       "dataDir": "/volume1/docker/deepseek-harness",
       "dshHome": "/data/dsh",
-      "production": "0.1.5-rc.1",
+      "production": "0.1.5-rc.2",
       "candidate": "0.1.5-rc.2"
     }
   },
-  "updatedAt": "2026-09-15T16:52:31.103Z",
-  "source": "manual-rollback",
+  "updatedAt": "2026-09-15T17:23:02.120Z",
+  "source": "ssot-reconcile-20260916",
   "comment": "唯一 SSOT（schemaVersion 2）——本文件是通道/容器/compose 项目/数据目录/生产与候选版本/插件策略的唯一权威来源；README、docs/**、CI 与部署脚本一律引用它，不得各自复制一份。alpha=宿主 3081（容器 deepseek-harness-alpha，compose 项目 dsh-alpha，dataDir /volume1/docker/dsh-alpha5，DSH_HOME /data/dsh/test/0.1.2-alpha.5）；rc=宿主 3083（容器 dsh-rc1，compose 项目 dsh-rc，dataDir /volume1/docker/deepseek-harness，DSH_HOME /data/dsh）。production=实际运行版本（仅由 dsh-safe-deploy promote 提升）；candidate=下一候选（Renovate/人工维护；rc 指向 npm next 的 0.1.5-rc.2）。版本页 dsh-version(3082) 以只读方式挂载本文件为 /ssot/dsh-version.json。旧顶层字段由 parseSSOT 归一化兼容。",
   "requiredPlugins": [
     "@deepseek-ai/dsh-base",

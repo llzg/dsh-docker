@@ -431,9 +431,12 @@ ssot_set_production() { # <channel> <version>
     j.source="promote";
     const primary=j.primaryChannel||"alpha";
     if(ch===primary){ j.version=v; j.productionChannel=v; }
-    const tmp=f+".tmp."+process.pid;
+    // ⚠ SSOT 常是符号链接：rename(tmp, f) 会把**链接本身**换成普通文件 → 出现第二份 SSOT，
+    //   版本页与实际生产漂移（2026-09-16 事故）。写到 realpath，保留链接。
+    const real=fs.realpathSync(f);
+    const tmp=real+".tmp."+process.pid;
     fs.writeFileSync(tmp, JSON.stringify(j,null,2)+"\n");
-    fs.renameSync(tmp,f);
+    fs.renameSync(tmp,real);
     process.stdout.write(JSON.stringify({channel:ch,production:v,primary:primary}));
   ' "$SSOT" "$1" "$2"
 }

@@ -112,9 +112,10 @@ j.channels=j.channels||{};
 j.channels[ch]=Object.assign({},j.channels[ch],{candidate:v});
 j.updatedAt=new Date().toISOString();
 j.source='auto-upgrade';
-const tmp=f+'.tmp.'+process.pid;
+const real=fs.realpathSync(f);
+const tmp=real+'.tmp.'+process.pid;
 fs.writeFileSync(tmp,JSON.stringify(j,null,2)+String.fromCharCode(10));
-fs.renameSync(tmp,f);
+fs.renameSync(tmp,real);
 process.stdout.write('candidate '+ch+'='+v);
 " "$SSOT" "$1" "$2"
 }
