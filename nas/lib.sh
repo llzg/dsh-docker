@@ -544,6 +544,10 @@ validate_compose_context() {
   for _s in $_sources; do
     case "$_s" in
       "$DIR"|"$DIR"/*) : ;;
+      # 允许的系统级挂载（不是项目数据卷）：alpha 需要 docker.sock（容器内 agent 操作 docker）、
+      # igpu override 需要 /dev/dri、时区等。此前无白名单 → alpha pin 被误判
+      # volume_source_outside_project 拒绝（2026-09-16 事故）。
+      /var/run/docker.sock|/run/docker.sock|/dev/dri|/dev/dri/*|/etc/localtime|/etc/timezone) : ;;
       *) echo "volume_source_outside_project: got=$_s expected_under=$DIR"; _errs=1 ;;
     esac
   done
