@@ -20,6 +20,13 @@
 ARG DSH_VERSION=0.1.3-alpha.2
 ARG DSH_CHANNEL=alpha
 ARG BASE_IMAGE=node:22-bookworm-slim
+# Docker CLI 来源镜像（默认走群晖 pull-through :5051，避免自建 buildkitd 无代理拉 Docker Hub）
+ARG DOCKER_CLI_IMAGE=192.168.5.35:5051/library/docker:27-cli
+
+# ── Docker CLI 来源（仅拷 CLI 二进制）─────────────────────────────────────────
+# 目的：容器内 agent 可用 /var/run/docker.sock 直接操作容器（alpha 通道挂了 socket）。
+# 烤进镜像后容器重建不丢（历史：写实层临时装的 docker/ssh 一重建就没）。
+FROM ${DOCKER_CLI_IMAGE} AS dockercli
 
 FROM ${BASE_IMAGE} AS base
 
@@ -56,9 +63,12 @@ FROM ${BASE_IMAGE} AS base
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update \
-    && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates curl \
+    && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates curl openssh-client \
         libvulkan-dev libvulkan1 mesa-vulkan-drivers glslc glslang-tools spirv-tools spirv-headers \
     && rm -rf /var/lib/apt/lists/*
+
+# Docker CLI（静态 Go 二进制；来自 docker:cli）。只含 CLI，不含 daemon；配 /var/run/docker.sock 使用。
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 
 # ── 稳定层 2/2：uv（Python 包管理器）──────────────────────────────────────────
 # 随镜像持久安装到 /usr/local/bin。此前装在容器可写层，容器重建即丢失；烤进镜像后每次重建都在。
