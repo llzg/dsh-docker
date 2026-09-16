@@ -464,6 +464,7 @@ prev_version() { # <current>
 #   docker-compose.docker-sock.yml  宿主 docker.sock 挂载（host root 等价！只有需要的通道才放）
 #   versionpage（DSH_VERSION_PORT!=0）、igpu。
 compose_cmd() {
+  unset DSH_HOME DSH_CHANNEL DSH_TRUSTED_HOST DSH_VERSION_PORT DSH_TELEMETRY_DISABLED
   if [ -f "$DIR/docker-compose.igpu.yml" ]; then
     set -- -f "$DIR/docker-compose.igpu.yml" "$@"
   fi
@@ -569,8 +570,10 @@ image_digest() { # <image-ref>
 }
 
 # 通道身份行（stdout）
-# DSH_HOME 写契约默认值 /data/dsh（与 docker-compose.yml 的容器 env/卷 target 一致）；
-# 不使用调用者 shell 里的 DSH_HOME，避免 pin 时被外部环境意外改写数据目录。
+# DSH_HOME 取 **SSOT channels[<ch>].dshHome**（如 alpha=/data/dsh/test/0.1.2-alpha.5）；
+# SSOT 缺该字段时退回契约默认值 /data/dsh（与 docker-compose.yml 的容器 env/卷 target 一致）。
+# ⚠ 不使用调用者 shell 里的 DSH_HOME —— pin 时绝不能被外部环境改写数据目录
+#   （2026-09-16 P0：镜像 ENV 固化的 DSH_HOME 泄漏进 compose，把 alpha 指到 09-08 的旧 home）。
 env_identity_lines() {
   printf '# 通道身份由 nas/lib.sh 生成（契约 §6 / §9）；钉住信息由 pin_version 追加\n'
   printf 'DSH_CHANNEL=%s\n' "$CHANNEL"
@@ -578,7 +581,9 @@ env_identity_lines() {
   printf 'DSH_CONTAINER=%s\n' "$CONTAINER"
   printf 'DSH_PORT=%s\n' "$PORT"
   printf 'DSH_VERSION_PORT=%s\n' "$VERSION_PORT"
-  printf 'DSH_HOME=/data/dsh\n'
+  _home=$(ssot_channel_field "$CHANNEL" dshHome || true)
+  [ -n "$_home" ] || _home=/data/dsh
+  printf 'DSH_HOME=%s\n' "$_home"
   printf 'DSH_TRUSTED_HOST=%s\n' "$TRUSTED_HOST"
 }
 

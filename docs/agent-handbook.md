@@ -65,6 +65,17 @@ SSOT / compose values (see §4.3).
     after).
 11. **Never touch the registry htpasswd yourself** — that host is not reachable from the agent side
     (§7.1).
+12. **Never bake channel/data-identity `ENV` into the image** (`DSH_HOME`, `DSH_CHANNEL`,
+    `DSH_TRUSTED_HOST`, `DSH_VERSION_PORT`). `docker compose` interpolates the **shell environment
+    before `--project-directory/.env`**, so an image `ENV` leaks into any process started from the
+    image (`docker run <image> sh -c 'sh realign.sh alpha'`) and silently overrides the channel
+    `.env` → container recreated with the wrong data dir (2026-09-16: "conversation records
+    vanished" — data intact, `DSH_HOME` fell back to the stale `/data/dsh`) and/or a single trusted
+    host (`/api/*` + WebSocket 403). The channel `.env` is the only source; `realign.sh` unsets
+    these keys at startup, and `nas/lib.sh env_identity_lines` reads `channels[<ch>].dshHome`.
+13. **After any recreate, assert the container env equals the channel `.env`** for those four keys
+    (`docker inspect <c> --format '{{range .Config.Env}}{{println .}}{{end}}'`). `realign.sh` does
+    this and fails the channel on mismatch — a silent override must never reach production.
 
 ---
 
@@ -205,6 +216,7 @@ problem (§6.3); 403 on `/api/*` but 200 on `/` = trusted-host fence (§4.3).
 | `docker ps` runs an older build than the tag | `sh check-image-drift.sh --remote` | `sh realign.sh` |
 | Version page shows stale SSOT values (old candidate/version) although the host `dsh-version.json` is new | `docker exec dsh-version ls -li /ssot/dsh-version.json` inode ≠ host `ls -li <SSOT>` → a **file** bind mount pinned to an inode unlinked by a rename-style write | `docker restart dsh-version` to re-bind; prefer in-place SSOT writes, or restart `dsh-version` after any atomic-replace edit |
 | Registry status shows both registries in the version page but ghcr 403 | `DSH_REGISTRY_USER/PASSWORD` are global and get sent to ghcr.io | `scripts/registry.js` already retries anonymously; if it regresses, keep `authUsed:false` fallback |
+| UI shows an **older** session list / "conversation records vanished" right after a recreate (other channel fine) | `docker inspect <c> --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -E '^(DSH_HOME|DSH_CHANNEL)='` vs the channel `.env` → mismatch means the value was overridden | make sure the 4 identity keys are unset in the caller (`nas/realign.sh` now does), fix the channel `.env`, `compose up -d`; do **not** run realign from a container built on the image until the image `ENV`s are gone (invariant 12) |
 | CI red on `T3/T4/T5/T6/T15` with `ECONNRESET` | transient upstream | rerun the failed jobs |
 
 ---

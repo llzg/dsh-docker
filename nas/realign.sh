@@ -17,6 +17,8 @@
 #   DSH_SSOT        SSOT 路径（默认同目录 dsh-version.json）
 #   DSH_DEPLOY_DIR  部署目录（默认脚本所在目录）
 #   DSH_PORTS       额外探活的端口（默认 3081 3083）
+#   ⚠ DSH_HOME / DSH_CHANNEL / DSH_TRUSTED_HOST / DSH_VERSION_PORT **不是**本脚本的调优项：
+#     它们一律以各通道 .env 为准，脚本启动即 unset（2026-09-16"对话记录消失"事故，见下）。
 #
 # 退出码：0 = 全部对齐；1 = 有通道未对齐/探活失败；2 = 用法或环境错误。
 set -u
@@ -35,7 +37,7 @@ DRY=0
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
-    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     alpha|rc|stable) CHANNELS="$CHANNELS $a" ;;
     all) CHANNELS="" ;;
     *) echo "未知参数: $a" >&2; exit 2 ;;
@@ -45,6 +47,23 @@ done
 command -v docker >/dev/null 2>&1 || { echo "找不到 docker" >&2; exit 2; }
 [ -f "$SSOT" ] || { echo "找不到 SSOT: $SSOT" >&2; exit 2; }
 command -v node >/dev/null 2>&1 || { echo "需要 node 解析 SSOT" >&2; exit 2; }
+
+# ── 环境隔离：这 4 个键只允许来自各通道的 .env ────────────────────────────────
+# 2026-09-16 事故（P0）：镜像的 ENV 曾固化 DSH_HOME / DSH_CHANNEL / DSH_TRUSTED_HOST /
+# DSH_VERSION_PORT。当本脚本在**基于该镜像的容器**里被执行时（实测：
+#   docker run <dsh 镜像> sh -c 'sh realign.sh alpha'
+# 容器 env 恰好带着这 4 个镜像默认值），它们会随进程环境泄漏给 docker compose；
+# 而 compose 的插值规则是 **shell 环境优先于 --project-directory 下的 .env** ——
+# 于是通道 .env 被静默压掉，容器被重建成了错误的配置：
+#   * DSH_HOME 掉回 /data/dsh（alpha 真实 home 是 /data/dsh/test/0.1.2-alpha.5）
+#     → DSH 去读 2026-09-08 之后就不再写入的旧 home，界面表现为"对话记录全没了"
+#     （数据没丢，只是读错了目录）；
+#   * DSH_TRUSTED_HOST 只剩一个地址 → 用户端 /api/* 与 WebSocket 全 403，
+#     界面空列表 + 一直重连（与 2026-09-10 的受信围栏事故同源）。
+# 结论：realign 支持调优的环境变量只有 DSH_SSOT / DSH_DEPLOY_DIR / DSH_PORTS，
+# 这 4 个通道身份/数据目录键一律以通道 .env 为准，调用者环境里的一律丢弃。
+# 配套：Dockerfile 已移除这些 ENV 固化，重建后还有 env 断言兜底（见下）。
+unset DSH_HOME DSH_CHANNEL DSH_TRUSTED_HOST DSH_VERSION_PORT DSH_TELEMETRY_DISABLED
 
 # 通道（未指定则取 SSOT 里全部；legacy 顶层字段交给 node 归一化）
 if [ -z "$CHANNELS" ]; then
@@ -76,6 +95,14 @@ for ch in $CHANNELS; do
     rc_all=1; continue
   fi
   tag="${img##*:}"
+  cname="$(env_get "$ENVF" DSH_CONTAINER || true)"
+  if [ -z "$cname" ]; then
+    cname="$(node -e '
+      const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+      const c=(j.channels&&j.channels[process.argv[2]])||{};
+      process.stdout.write(c.container||"")' "$SSOT" "$ch" 2>/dev/null)"
+  fi
+  [ -n "$cname" ] || cname="${ch}-container"
 
   # compose 调用与 nas/lib.sh 的约定一致：显式 -p / --project-directory / -f，override 按存在性追加
   set -- -p "$proj" --project-directory "$dir"
@@ -90,7 +117,7 @@ for ch in $CHANNELS; do
     continue
   fi
 
-  before="$(docker inspect "$(env_get "$ENVF" DSH_CONTAINER || echo "${ch}-container")" --format '{{.Image}}' 2>/dev/null || echo '')"
+  before="$(docker inspect "$cname" --format '{{.Image}}' 2>/dev/null || echo '')"
   if ! docker pull -q "$img" >/dev/null 2>&1; then
     echo "    ✗ docker pull 失败（registry 不可达或凭据失效；检查 ~/.docker/config.json 与 .env）" >&2
     rc_all=1; continue
@@ -101,6 +128,26 @@ for ch in $CHANNELS; do
     rc_all=1; continue
   fi
   echo "    镜像: ${before:-无} -> ${after_img:-未知}"
+
+  # ── 重建后断言：容器 env 必须与通道 .env 一致 ──────────────────────────────
+  # 上面 unset 只挡住"本脚本这一层的泄漏"；这里正向校验结果，任何来源（镜像 ENV、
+  # 外层包装、compose override）导致的静默覆盖都会在此暴露为失败，而不是悄悄上线。
+  # 校验失败即判定该通道未对齐（rc_all=1），并打印期望值便于直接比对。
+  _bad=0
+  for _k in DSH_HOME DSH_CHANNEL DSH_TRUSTED_HOST DSH_VERSION_PORT; do
+    _want="$(env_get "$ENVF" "$_k" || true)"
+    [ -n "$_want" ] || continue
+    _got="$(docker inspect "$cname" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n "s/^$_k=//p" | tail -1)"
+    if [ "$_got" != "$_want" ]; then
+      echo "    ✗ env 不一致 $_k: 容器=[$_got] 期望=[$_want]（通道 .env 被覆盖——界面会读错 home/受信围栏失效）" >&2
+      _bad=1
+    fi
+  done
+  if [ "$_bad" != "0" ]; then
+    echo "    ✗ [$ch] 重建后 env 校验失败，该通道视为未对齐；请修 .env 后重跑 realign.sh" >&2
+    rc_all=1; continue
+  fi
+  echo "    env 校验: 与 $ENVF 一致 ✓"
 done
 
 if [ "$DRY" != "1" ]; then

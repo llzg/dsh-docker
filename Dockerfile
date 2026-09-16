@@ -21,11 +21,14 @@ ARG DSH_VERSION=0.1.3-alpha.2
 ARG DSH_CHANNEL=alpha
 ARG BASE_IMAGE=node:22-bookworm-slim
 # Docker CLI 来源镜像（默认走群晖 pull-through :5051，避免自建 buildkitd 无代理拉 Docker Hub）
-ARG DOCKER_CLI_IMAGE=192.168.5.35:5051/library/docker:27-cli
+# 用**完整版** docker:27（不是 -cli）：它同时自带 buildx + compose 两个 CLI 插件，
+# 容器内因此可直接 `docker compose` / `docker buildx`（-cli 镜像只有 docker 本体，缺插件）。
+ARG DOCKER_CLI_IMAGE=192.168.5.35:5051/library/docker:27
 
-# ── Docker CLI 来源（仅拷 CLI 二进制）─────────────────────────────────────────
-# 目的：容器内 agent 可用 /var/run/docker.sock 直接操作容器（alpha 通道挂了 socket）。
-# 烤进镜像后容器重建不丢（历史：写实层临时装的 docker/ssh 一重建就没）。
+# ── Docker CLI 来源（拷 CLI 二进制 + buildx/compose 插件）──────────────────────
+# 目的：容器内 agent 可用 /var/run/docker.sock 直接操作容器 / 用 compose（alpha 通道挂了 socket）。
+# 烤进镜像后容器重建不丢（历史：可写层临时装的 docker/ssh 一重建就没；ssh 现由 apt 的
+# openssh-client 提供）。
 FROM ${DOCKER_CLI_IMAGE} AS dockercli
 
 FROM ${BASE_IMAGE} AS base
@@ -67,8 +70,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libvulkan-dev libvulkan1 mesa-vulkan-drivers glslc glslang-tools spirv-tools spirv-headers \
     && rm -rf /var/lib/apt/lists/*
 
-# Docker CLI（静态 Go 二进制；来自 docker:cli）。只含 CLI，不含 daemon；配 /var/run/docker.sock 使用。
+# Docker CLI（静态 Go 二进制；来自 docker:27）。只含 CLI，不含 daemon；配 /var/run/docker.sock 使用。
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
+# buildx + compose 插件（Debian 下 docker CLI 会搜 /usr/local/libexec/docker/cli-plugins）。
+# 代价约 +139MB；换取容器内可直接 `docker compose` / `docker buildx`（无需从宿主挂载二进制）。
+COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
+COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
 # ── 稳定层 2/2：uv（Python 包管理器）──────────────────────────────────────────
 # 随镜像持久安装到 /usr/local/bin。此前装在容器可写层，容器重建即丢失；烤进镜像后每次重建都在。
@@ -133,16 +140,21 @@ LABEL org.opencontainers.image.licenses="MIT"
 # 双通道契约 §6：镜像所属通道（alpha / rc / stable），供版本页与排障读取
 LABEL org.opencontainers.image.channel="${DSH_CHANNEL}"
 
-ENV DSH_HOME=/data/dsh
+# ── 通道身份 / 数据目录：**故意不在这里固化 ENV**（2026-09-16 P0 事故）──────────
+# 这里曾写：ENV DSH_HOME=/data/dsh、DSH_CHANNEL=${DSH_CHANNEL}、
+#           DSH_TRUSTED_HOST=192.168.5.17、DSH_VERSION_PORT=3082。
+# docker compose 的插值规则是 **shell 环境优先于 --project-directory 下的 .env**，
+# 于是任何「基于本镜像启动的进程」都会把这 4 个值泄漏给 compose，静默压掉通道 .env：
+#   · 实测：docker run <dsh 镜像> sh -c 'sh realign.sh alpha'
+#   · DSH_HOME 掉回 /data/dsh（alpha 真实 home 是 /data/dsh/test/0.1.2-alpha.5）
+#     → DSH 去读 09-08 之后就不再写入的旧 home，界面表现为"对话记录全没了"
+#     （数据没丢，只是读错了目录）；
+#   · DSH_TRUSTED_HOST 只剩一个地址 → /api/* 与 WebSocket 全 403，界面空列表 + 重连。
+# 结论：通道身份与数据目录**只允许来自各通道 .env**，由 compose 的 environment/command
+# 在运行时注入（nas/docker-compose.yml，契约 §6）。禁止在此重新加这几个 ENV。
+# 兜底：nas/realign.sh 启动即 unset 这些键，并在重建后正向断言容器 env == 通道 .env。
+# 唯一保留的是全局行为开关（与通道身份无关）：
 ENV DSH_TELEMETRY_DISABLED=1
-# ── 双通道契约 §6 的容器默认值（运行时均可被 compose/.env 覆盖）──────────────
-# DSH_CHANNEL：镜像所属通道（构建 ARG 决定，默认 alpha）
-ENV DSH_CHANNEL=${DSH_CHANNEL}
-# DSH_TRUSTED_HOST：--trusted-host 取值。宿主机 IP 会变（实测 192.168.5.17），
-# 故不再硬编码进 CMD，改为运行时环境变量（见下方 CMD）。
-ENV DSH_TRUSTED_HOST=192.168.5.17
-# DSH_VERSION_PORT：版本页端口；0 = 不启动（rc 容器默认 0，由 alpha 容器统一渲染）
-ENV DSH_VERSION_PORT=3082
 WORKDIR /data
 
 COPY profiles/web/cordis.patch.yml /opt/dsh-profiles/web/cordis.patch.yml
@@ -153,8 +165,9 @@ RUN chmod +x /usr/local/bin/dsh-entrypoint
 EXPOSE 3080 3082
 ENTRYPOINT ["/usr/local/bin/dsh-entrypoint"]
 # sh -c + exec：让 dsh 成为 PID 1，SIGTERM/SIGINT 可传（entrypoint 用 exec "$@"）。
-# --trusted-host 从环境变量取值（契约 §6，不再硬编码宿主机 IP）。
-CMD ["sh", "-c", "exec dsh --profile web --trusted-host \"$DSH_TRUSTED_HOST\" --no-open"]
+# --trusted-host 由通道 .env / compose 在运行时注入；镜像**不带**默认值（否则又变成"固化身份"）。
+# 裸跑（不经 compose）时退回 127.0.0.1：fail-closed，只信任本机，避免误把任意 Host 放进围栏。
+CMD ["sh", "-c", "exec dsh --profile web --trusted-host \"${DSH_TRUSTED_HOST:-127.0.0.1}\" --no-open"]
 
 # LAN fixes (settings host mode + crypto.randomUUID polyfill + trusted hosts).
 # STRICT=1 turns every patch into a verified invariant: patch-dsh.sh 现在按契约 §10
