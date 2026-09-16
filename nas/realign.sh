@@ -136,6 +136,13 @@ for ch in $CHANNELS; do
   _bad=0
   for _k in DSH_HOME DSH_CHANNEL DSH_TRUSTED_HOST DSH_VERSION_PORT; do
     _want="$(env_get "$ENVF" "$_k" || true)"
+    # .env 里可能给值加引号（如 DSH_TRUSTED_HOST="192.168.5.16 192.168.5.17"）；
+    # compose 的 dotenv 解析会去掉成对引号，容器 env 因此不带引号 —— 比较前统一去引号，
+    # 否则会把「本来就正确」的通道误报成未对齐。
+    case "$_want" in
+      \"*\") _want="${_want#\"}"; _want="${_want%\"}" ;;
+      \'*\') _want="${_want#\'}"; _want="${_want%\'}" ;;
+    esac
     [ -n "$_want" ] || continue
     _got="$(docker inspect "$cname" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n "s/^$_k=//p" | tail -1)"
     if [ "$_got" != "$_want" ]; then
