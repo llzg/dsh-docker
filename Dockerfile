@@ -21,15 +21,20 @@ ARG DSH_VERSION=0.1.3-alpha.2
 ARG DSH_CHANNEL=alpha
 ARG BASE_IMAGE=node:22-bookworm-slim
 # Docker CLI 来源镜像（默认走群晖 pull-through :5051，避免自建 buildkitd 无代理拉 Docker Hub）
-# 用**完整版** docker:27（不是 -cli）：它同时自带 buildx + compose 两个 CLI 插件，
-# 容器内因此可直接 `docker compose` / `docker buildx`（-cli 镜像只有 docker 本体，缺插件）。
-ARG DOCKER_CLI_IMAGE=192.168.5.35:5051/library/docker:27
+ARG DOCKER_CLI_IMAGE=192.168.5.35:5051/library/docker:27-cli
+# CLI 插件（buildx/compose）来源：**完整版** docker:27 自带两者；-cli 镜像只有 docker 本体。
+# 独立 stage，且插件 COPY 放在文件**末尾稳定层之后** —— 不触碰 apt/uv/npm 的缓存键。
+# （2026-09-16 实测：把插件 COPY 放在 uv 之前会让 uv 层失效；恰逢 astral.sh 网络抖动，
+#   整个构建失败。插件与稳定层无关，没理由让它们互相牵连。）
+ARG DOCKER_PLUGINS_IMAGE=192.168.5.35:5051/library/docker:27
 
-# ── Docker CLI 来源（拷 CLI 二进制 + buildx/compose 插件）──────────────────────
-# 目的：容器内 agent 可用 /var/run/docker.sock 直接操作容器 / 用 compose（alpha 通道挂了 socket）。
+# ── Docker CLI 来源（仅拷 CLI 二进制）─────────────────────────────────────────
+# 目的：容器内 agent 可用 /var/run/docker.sock 直接操作容器（alpha 通道挂了 socket）。
 # 烤进镜像后容器重建不丢（历史：可写层临时装的 docker/ssh 一重建就没；ssh 现由 apt 的
 # openssh-client 提供）。
 FROM ${DOCKER_CLI_IMAGE} AS dockercli
+# CLI 插件来源 stage（buildx + compose；实际 COPY 见文件末尾）
+FROM ${DOCKER_PLUGINS_IMAGE} AS dockerplugins
 
 FROM ${BASE_IMAGE} AS base
 
@@ -70,12 +75,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libvulkan-dev libvulkan1 mesa-vulkan-drivers glslc glslang-tools spirv-tools spirv-headers \
     && rm -rf /var/lib/apt/lists/*
 
-# Docker CLI（静态 Go 二进制；来自 docker:27）。只含 CLI，不含 daemon；配 /var/run/docker.sock 使用。
+# Docker CLI（静态 Go 二进制；来自 docker:cli）。只含 CLI，不含 daemon；配 /var/run/docker.sock 使用。
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
-# buildx + compose 插件（Debian 下 docker CLI 会搜 /usr/local/libexec/docker/cli-plugins）。
-# 代价约 +139MB；换取容器内可直接 `docker compose` / `docker buildx`（无需从宿主挂载二进制）。
-COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
-COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
 # ── 稳定层 2/2：uv（Python 包管理器）──────────────────────────────────────────
 # 随镜像持久安装到 /usr/local/bin。此前装在容器可写层，容器重建即丢失；烤进镜像后每次重建都在。
@@ -203,6 +204,13 @@ COPY dsh-version.json /opt/dsh-version-ssot.json
 RUN node --check /opt/version-policy.js && node --check /opt/safe-deploy-policy.js \
     && node --check /opt/registry.js && node --check /opt/version-server.js \
     && chmod +x /opt/version-server.js
+
+# ── Docker CLI 插件（buildx + compose）─────────────────────────────────────────
+# 来自完整版 docker:27（dockerplugins stage）。放在稳定层之后：不动 apt/uv/npm 的缓存键，
+# 只让这一小段尾部重建。Debian 下 docker CLI 搜 /usr/local/libexec/docker/cli-plugins。
+# 代价约 +139MB；换取容器内可直接 `docker compose` / `docker buildx`（无需从宿主挂载）。
+COPY --from=dockerplugins /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
+COPY --from=dockerplugins /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
 # Healthcheck used both by the NAS watchdog (auto-rollback) and docker itself.
 # ⚠ 必须用 **TCP 探活**，不能用 HTTP 200 探活：
