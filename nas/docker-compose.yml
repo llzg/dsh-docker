@@ -25,7 +25,9 @@ services:
     restart: unless-stopped
     # 与镜像默认 CMD 等价，但 **$DSH_TRUSTED_HOST 不加引号** → 支持空格分隔的多个受信地址
     # （DSH 的 --trusted-host 是 <authority...> 变参）。
-    command: ["sh", "-c", "exec dsh --profile web --trusted-host $DSH_TRUSTED_HOST --no-open"]
+    # profile 可切换：默认 web；.env 设 DSH_PROFILE=team 即启用实验性 Agent Teams
+    # （team profile 会 disable 普通 subagent/subagent_fork 工具，换成 Team 工具）。
+    command: ["sh", "-c", "exec dsh --profile ${DSH_PROFILE:-web} --trusted-host $DSH_TRUSTED_HOST --no-open"]
     ports:
       # 两种对外模式（Phase 2）：
       #   A) 直接发端口（默认）：DSH_BIND_IP=0.0.0.0 + DSH_PUBLISH_PORT=3081
