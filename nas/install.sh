@@ -1,7 +1,8 @@
 #!/bin/sh
 # 一次性部署（幂等，可重复执行）—— 每通道独立安装：
 #   1) mkdir -p 部署目录 + 状态目录
-#   2) 同步 SSOT（仓库根 dsh-version.json → 部署目录）+ 每次覆盖前时间戳备份
+#   2) SSOT：live 副本放部署目录的 ssot/（**git 工作区之外**），仓库根 dsh-version.json
+#      只作模板；仅当 live 缺失时播种，绝不覆盖 promote 后的运行时值
 #   3) 安装 compose（base + versionpage override）+ 用该通道 SSOT production 初始化 .env
 #   4) 脚本可执行 + watchdog 守护容器（每 5 分钟，覆盖所有通道）
 #   5) 预拉取该通道 SSOT production 镜像（不再预拉 latest）
@@ -41,24 +42,41 @@ install_main() {
   # 1) 目录（缺失时 mkdir -p；历史缺陷：直接 cp 到不存在的目录会失败）
   mkdir -p "$DIR" "$STATE" "$STATE_ROOT"
 
-  # 1b) SSOT 随部署资产一起落地：仓库根的 dsh-version.json 不会自己跑到部署目录，
-  #     缺失时通道参数会退回内置默认表、resume 也拿不到 production。
+  # 1b) SSOT：**live 副本必须放在 git 工作区之外**（$SRC/ssot/dsh-version.json）。
+  #     历史事故：live 曾经就是工作区里被 git 跟踪的文件 → git autostash/checkout 用 rename
+  #     重写它 → 版本页（文件挂载）与其它消费者读到旧值/被回退的值（2026-09-18）。
+  #     规则：仓库根的 dsh-version.json 只当**模板**；live 只在缺失时播种，**绝不覆盖**。
+  #     部署根 $SRC/dsh-version.json 始终是**指向 live 的符号链接**，兼容所有按此路径
+  #     读取/写入的脚本（写入方都用 realpathSync，会落到 live 实体文件）。
   _src_ssot="$SRC/../dsh-version.json"
+  _live_dir="$SRC/ssot"
+  _live_ssot="$_live_dir/dsh-version.json"
+  mkdir -p "$_live_dir"
   if [ -n "${DSH_SSOT:-}" ] && [ -f "${DSH_SSOT:-}" ]; then
     echo "SSOT: 使用 DSH_SSOT=$DSH_SSOT"
-  elif [ -f "$_src_ssot" ]; then
-    if [ ! -f "$SRC/dsh-version.json" ] || ! cmp -s "$_src_ssot" "$SRC/dsh-version.json"; then
-      backup_if_exists "$SRC/dsh-version.json"
-      cp -p "$_src_ssot" "$SRC/dsh-version.json"
-      echo "已同步 SSOT -> $SRC/dsh-version.json"
-    else
-      echo "SSOT 已是最新：$SRC/dsh-version.json"
-    fi
+  elif [ -f "$_live_ssot" ]; then
+    echo "SSOT: live 已存在，保留（不覆盖）：$_live_ssot"
   elif [ -f "$SRC/dsh-version.json" ]; then
-    echo "SSOT: $SRC/dsh-version.json"
+    # 旧布局迁移：部署根那份（实体文件，或指向工作区的旧符号链接 → -L 取其内容）
+    if cp -Lp "$SRC/dsh-version.json" "$_live_ssot" 2>/dev/null; then
+      echo "已迁移 SSOT -> $_live_ssot"
+    else
+      echo "WARN: SSOT 迁移失败（$SRC/dsh-version.json）" >&2
+    fi
+  elif [ -f "$_src_ssot" ]; then
+    cp -p "$_src_ssot" "$_live_ssot"
+    echo "已播种 live SSOT（模板 -> $_live_ssot）"
   else
-    echo "WARN: 部署目录没有 dsh-version.json，且 $SRC/../dsh-version.json 不存在 —— 请设置 DSH_SSOT=<file>；" >&2
-    echo "      否则通道参数退回内置默认、resume/switch 拿不到 channels.<ch>.production" >&2
+    echo "WARN: 既没有 live SSOT 也没有模板（$_live_ssot / $_src_ssot）——" >&2
+    echo "      请设置 DSH_SSOT=<file>，否则通道参数退回内置默认、resume/switch 取不到 production" >&2
+  fi
+  # 统一入口：部署根 dsh-version.json 始终是指向 live 的符号链接
+  if [ -f "$_live_ssot" ]; then
+    if [ ! -L "$SRC/dsh-version.json" ] || [ "$(readlink "$SRC/dsh-version.json" 2>/dev/null)" != "ssot/dsh-version.json" ]; then
+      backup_if_exists "$SRC/dsh-version.json"
+      ln -sfn ssot/dsh-version.json "$SRC/dsh-version.json"
+      echo "SSOT 链接：$SRC/dsh-version.json -> ssot/dsh-version.json"
+    fi
   fi
   # SSOT 可能刚刚落地 → 重新解析通道配置（DIR/PROJECT/CONTAINER/PORT 等）
   lib_init

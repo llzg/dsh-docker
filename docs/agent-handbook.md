@@ -82,6 +82,8 @@ SSOT / compose values (see §4.3).
     unlinked old inode **forever**, silently showing a stale production/candidate. 2026-09-18: the
     page showed `alpha.1` for over a day while container, SSOT file and npm were all `alpha.2`.
     Verify: `docker exec dsh-version ls -li /ssot-dir/dsh-version.json` inode == host `ls -li <SSOT>`.
+    The live SSOT itself now lives **outside git** at `/volume1/docker/dsh-deploy/ssot/dsh-version.json`;
+    the repo copy is a template and `install.sh` seeds the live file only when absent (never overwrites).
 
 ---
 
@@ -92,8 +94,9 @@ SSOT / compose values (see §4.3).
 | `/volume1/docker/dsh-deploy/` | deploy directory: scripts, `.env`, SSOT symlink |
 | `/volume1/docker/dsh-deploy/scripts/dsh-safe-deploy` | versioned promote/rollback tool (`check`/`test`/`promote`/`rollback`/`status`) |
 | `/volume1/docker/dsh-deploy/.env` | deploy config, **whitelist-parsed** (`DSH_IMAGE_BASE`, `DSH_REGISTRIES`, `DSH_REGISTRY_*`), mode `600` |
-| `/volume1/docker/dsh-deploy/dsh-version.json` | symlink → live SSOT |
-| `/volume1/docker/dsh-alpha5/dsh-root/nas_docker/dsh-version.json` | **live SSOT** (root-owned; read via sudo/container) |
+| `/volume1/docker/dsh-deploy/dsh-version.json` | symlink → `ssot/dsh-version.json` (kept for path-based readers/writers) |
+| `/volume1/docker/dsh-deploy/ssot/dsh-version.json` | **live SSOT** — the ONE authoritative file, **outside the git workspace** (seeded by `install.sh`, never overwritten) |
+| `/volume1/docker/dsh-alpha5/dsh-root/nas_docker/dsh-version.json` | SSOT **template** in the git workspace (no runtime authority) |
 | `/volume1/docker/dsh-deploy/{realign.sh,check-image-drift.sh,preflight-workspace.js,repair-session-turns.js,rotate-registry-credential.sh,validate-relationships.mjs}` | operational tools (see §5); copies also live in `/volume1/docker/dsh-deploy/nas/` and in the repo under `nas/` |
 | `/volume1/docker/dsh-deploy/state/deployed-images.json` | recorded deployment facts (version/imageRef/imageId/repoDigest) |
 | `/volume1/docker/github-runner-dsh/` | self-hosted runner install (`disableUpdate=true` in `.runner` on purpose) |

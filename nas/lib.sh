@@ -844,14 +844,19 @@ igpu_override_write() { # [device]
 
 # ── 初始化 ────────────────────────────────────────────────────────────────
 # SSOT 多路径解析（部署目录常常只拷了 nas/，仓库根的 dsh-version.json 不在旁边）：
-#   $DSH_SSOT → 脚本同目录 → 脚本上级目录（仓库根）→ 容器内 /root/nas_docker
+#   $DSH_SSOT → 脚本同目录 → 脚本上级目录（部署根符号链接）→ live 副本 ssot/
+#   → 容器内 /root/nas_docker（模板，仅容器内兜底）
+# live 副本（部署目录 ssot/dsh-version.json）在 git 工作区之外，是唯一权威；
+# 部署根 dsh-version.json 是指向它的符号链接（install.sh 维护）。
 # 全部不存在时保留默认路径（调用方会退回内置默认表，并在需要时明确告警）。
 lib_ssot_resolve() {
   if [ -n "${DSH_SSOT:-}" ]; then
     SSOT="$DSH_SSOT"
     return 0
   fi
-  for _c in "$LIB_DIR/dsh-version.json" "$LIB_DIR/../dsh-version.json" "/root/nas_docker/dsh-version.json"; do
+  for _c in "$LIB_DIR/dsh-version.json" "$LIB_DIR/../dsh-version.json" \
+            "$LIB_DIR/ssot/dsh-version.json" "$LIB_DIR/../ssot/dsh-version.json" \
+            "/root/nas_docker/dsh-version.json"; do
     if [ -f "$_c" ]; then
       _n=$(readlink -f "$_c" 2>/dev/null) || _n=""
       [ -n "$_n" ] && _c="$_n"

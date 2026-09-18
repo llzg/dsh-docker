@@ -29,7 +29,8 @@
 | `rc` | `-rc.N` | 3083 | `dsh-rc1` | `dsh-rc` | `/volume1/docker/deepseek-harness` |
 | `stable` | 无 prerelease 段 | 3085（预留） | `dsh-stable` | `dsh-stable` | `/volume1/docker/dsh-stable` |
 
-> 上表是**当前 as-built**；唯一 SSOT 是 [`../dsh-version.json`](../dsh-version.json)。脚本读取该文件的
+> 上表是**当前 as-built**；唯一 SSOT 的仓库副本是 [`../dsh-version.json`](../dsh-version.json)（**模板**），
+> **live 副本在部署目录 `ssot/dsh-version.json`（git 工作区之外，运行时值只在那里）**。脚本读取该文件的
 > `channels[ch].{port,container,project,dataDir,production,candidate}`；`scripts/safe-deploy-policy.js`
 > 的 `CHANNEL_DEFAULTS` 仅作为**未声明通道**的兜底（alpha/rc 已显式声明，不取默认值）。
 
@@ -139,6 +140,8 @@ node scripts/safe-deploy-policy.js --json [--ssot FILE] [--channel alpha|rc|all]
 
 容器内 SSOT 查找顺序（`version-server.js`）：
 `$DSH_VERSION_SSOT` → `/root/nas_docker/dsh-version.json` → `/opt/dsh-version-ssot.json`（镜像内置兜底）。
+生产部署里 `$DSH_VERSION_SSOT=/ssot-dir/dsh-version.json`，`/ssot-dir` 是**目录挂载**（`dsh-deploy/ssot`），
+对文件替换透明 —— 不得改成单文件挂载。
 **版本页必须显示实际命中的文件路径**（`ssotFile`），并标明是否为镜像内置兜底（`ssotIsFallback`）。
 
 ---

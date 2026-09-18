@@ -10,6 +10,8 @@
 版本状态页：<http://<NAS-IP>:3082/>（`dsh-version` 容器统一渲染**两条通道**；只读挂载下面的 SSOT）。
 
 > **唯一 SSOT：[`dsh-version.json`](dsh-version.json)** —— 通道/容器/项目/数据目录/版本一律以它为准；
+> 仓库里这份是**模板**，**live 副本在部署目录 `ssot/dsh-version.json`（git 工作区之外），运行时值只在那里**；
+> 部署根 `dsh-version.json` 是指向它的符号链接，`install.sh` 只播种、不覆盖。
 > 本文与 `docs/**` 只做引用与解释，不再复制一份会漂移的值。
 > 设计契约（字段、API、环境变量、验收标准）见 [docs/dual-channel.md](docs/dual-channel.md)。
 > 升级流程与安全边界见 [docs/safe-upgrade-architecture.md](docs/safe-upgrade-architecture.md)。
@@ -50,7 +52,8 @@ NAS：deepseek-harness-alpha(3081) / dsh-rc1(3083)   ←── dsh-safe-deploy c
 ├── Dockerfile                     # 版本/通道参数化 + STRICT 补丁校验 + HEALTHCHECK + OCI 标签
 ├── patch-dsh.sh                   # LAN 补丁（锚点预检 + marker 正向校验，失败即构建失败）
 ├── entrypoint.sh                  # 入口：profile 初始化 + 版本页守护进程
-├── dsh-version.json               # SSOT（schemaVersion 2：channels.alpha / channels.rc）
+├── dsh-version.json               # SSOT **模板**（schemaVersion 2：channels.alpha / channels.rc）
+│                                  #   live 副本 = 部署目录 ssot/dsh-version.json（git 之外）
 ├── build-status.json              # CI 回写的各通道最近一次构建结论（自动生成）
 ├── profiles/web/cordis.patch.yml
 ├── .github/workflows/build-publish.yml
@@ -103,7 +106,7 @@ DSH_CHANNEL=rc sh /volume1/docker/dsh-deploy/resume-auto-update.sh   # 恢复到
 ## 运维要点
 
 - **上游改代码导致补丁失效**：构建会**失败**并给出 `VERIFY FAIL: anchor missing …`；更新 `patch-dsh.sh` 后 push 到 main 即可重发。补丁通过后会写入 `dsh-docker-patch:<name>` marker，STRICT 校验 marker 必须存在（旧版"原始模式已消失"的校验在锚点失配时恒真，会静默放行）。
-- **版本页读的是实时 SSOT**：命中镜像内置快照时页面会显式告警（`ssotIsFallback`）。容器内查找顺序 `$DSH_VERSION_SSOT → /root/nas_docker/dsh-version.json → /opt/dsh-version-ssot.json`。
+- **版本页读的是实时 SSOT**：live 副本在 `/volume1/docker/dsh-deploy/ssot/dsh-version.json`（git 之外），容器以**目录挂载**只读挂它（文件挂载会被 inode 钉死，见 `docs/agent-handbook.md` 不变式 14）。命中镜像内置快照时页面会显式告警（`ssotIsFallback`）。容器内查找顺序 `$DSH_VERSION_SSOT → /root/nas_docker/dsh-version.json → /opt/dsh-version-ssot.json`。
 - **构建状态**：版本页每通道显示「推荐构建目标 / 目标镜像是否已发布 / 最近一次 CI 结论」，可直接看出"npm 有版本但镜像没构建成功"。
 - **数据安全**：容器重建只换镜像；每通道的 `DSH_HOME`（会话、配置、凭据）独立持久化。promote/rollback 前 `dsh-safe-deploy` 会 snapshot，回滚是"镜像 + 数据 + env"三件套一起回。
 - **NAS 侧凭据**：包为 public，匿名可拉；脚本优先复用 `/home/lzg/.docker/config.json`（可用 `DOCKER_CONFIG` 覆盖）。

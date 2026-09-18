@@ -7,7 +7,7 @@
 #   独立容器 + 挂载新脚本 + --no-healthcheck 解决这两点，且与 DSH 主容器解耦。
 #
 # 用法（在 /volume1/docker/dsh-deploy/version-page 下）：
-#   DSH_SSOT_DIR=/volume1/docker/dsh-alpha5/dsh-root/nas_docker \
+#   DSH_SSOT_DIR=/volume1/docker/dsh-deploy/ssot \
 #   DSH_VERSION_DATA=/volume1/docker/dsh-alpha5/dsh-data \
 #   DSH_VERSION_DSH_HOME=/data/dsh/test/0.1.2-alpha.5 \
 #   docker compose -p dsh-version up -d
