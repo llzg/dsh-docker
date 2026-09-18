@@ -76,6 +76,12 @@ SSOT / compose values (see §4.3).
 13. **After any recreate, assert the container env equals the channel `.env`** for those four keys
     (`docker inspect <c> --format '{{range .Config.Env}}{{println .}}{{end}}'`). `realign.sh` does
     this and fails the channel on mismatch — a silent override must never reach production.
+14. **The `dsh-version` page must mount the SSOT's *directory*, never the file.** A file bind mount
+    pins the inode; any rename-style replacement (git `autostash`/`checkout` on the workspace — the
+    live SSOT is a git-tracked file there — or an atomic writer) makes the container read the
+    unlinked old inode **forever**, silently showing a stale production/candidate. 2026-09-18: the
+    page showed `alpha.1` for over a day while container, SSOT file and npm were all `alpha.2`.
+    Verify: `docker exec dsh-version ls -li /ssot-dir/dsh-version.json` inode == host `ls -li <SSOT>`.
 
 ---
 
@@ -214,7 +220,7 @@ problem (§6.3); 403 on `/api/*` but 200 on `/` = trusted-host fence (§4.3).
 | `docker pull … no basic auth credentials` | `jq -r '.auths|keys[]' /home/lzg/.docker/config.json` | ensure CI login step has `logout: false`; re-login: `printf '%s' "$PW" \| docker login 192.168.5.35:5050 -u ci-deploy --password-stdin`; run `rotate-registry-credential.sh` when rotating |
 | Version page shows the old single-channel page; `dsh-version` restart-looping | `docker ps --format '{{.Names}} {{.Ports}}' \| grep 3082` is empty while `curl 127.0.0.1:3082` answers | a host-net container squats 3082: set `DSH_VERSION_PORT=0` on `dsh-proxy`/`dsh-proxy-rc` and recreate them |
 | `docker ps` runs an older build than the tag | `sh check-image-drift.sh --remote` | `sh realign.sh` |
-| Version page shows stale SSOT values (old candidate/version) although the host `dsh-version.json` is new | `docker exec dsh-version ls -li /ssot/dsh-version.json` inode ≠ host `ls -li <SSOT>` → a **file** bind mount pinned to an inode unlinked by a rename-style write | `docker restart dsh-version` to re-bind; prefer in-place SSOT writes, or restart `dsh-version` after any atomic-replace edit |
+| Version page shows stale SSOT values (old production/candidate) although the host `dsh-version.json` is new | `docker exec dsh-version ls -li /ssot-dir/dsh-version.json` inode ≠ host `ls -li <SSOT>` (or its mtime is frozen at container start) → the container **file**-mounts the SSOT and its inode was replaced (git `autostash`/`checkout` on the workspace, or an atomic writer) | **durable**: mount the SSOT *directory* (`DSH_SSOT_DIR`) and read `/ssot-dir/dsh-version.json`; **immediate relief**: `docker restart dsh-version` to re-bind |
 | Registry status shows both registries in the version page but ghcr 403 | `DSH_REGISTRY_USER/PASSWORD` are global and get sent to ghcr.io | `scripts/registry.js` already retries anonymously; if it regresses, keep `authUsed:false` fallback |
 | UI shows an **older** session list / "conversation records vanished" right after a recreate (other channel fine) | `docker inspect <c> --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -E '^(DSH_HOME|DSH_CHANNEL)='` vs the channel `.env` → mismatch means the value was overridden | make sure the 4 identity keys are unset in the caller (`nas/realign.sh` now does), fix the channel `.env`, `compose up -d`; do **not** run realign from a container built on the image until the image `ENV`s are gone (invariant 12) |
 | CI red on `T3/T4/T5/T6/T15` with `ECONNRESET` | transient upstream | rerun the failed jobs |

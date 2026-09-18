@@ -8,8 +8,8 @@
       "project": "dsh-alpha",
       "dataDir": "/volume1/docker/dsh-alpha5",
       "dshHome": "/data/dsh/test/0.1.2-alpha.5",
-      "production": "0.1.6-alpha.1",
-      "candidate": "0.1.6-alpha.1"
+      "production": "0.1.6-alpha.2",
+      "candidate": "0.1.6-alpha.2"
     },
     "rc": {
       "port": 3083,
@@ -21,7 +21,7 @@
       "candidate": "0.1.5-rc.2"
     }
   },
-  "updatedAt": "2026-09-16T04:54:48.374Z",
+  "updatedAt": "2026-09-17T14:46:25.774Z",
   "source": "promote",
   "comment": "唯一 SSOT（schemaVersion 2）——本文件是通道/容器/compose 项目/数据目录/生产与候选版本/插件策略的唯一权威来源；README、docs/**、CI 与部署脚本一律引用它，不得各自复制一份。alpha=宿主 3081（容器 deepseek-harness-alpha，compose 项目 dsh-alpha，dataDir /volume1/docker/dsh-alpha5，DSH_HOME /data/dsh/test/0.1.2-alpha.5）；rc=宿主 3083（容器 dsh-rc1，compose 项目 dsh-rc，dataDir /volume1/docker/deepseek-harness，DSH_HOME /data/dsh）。production=实际运行版本（仅由 dsh-safe-deploy promote 提升）；candidate=下一候选（Renovate/人工维护；rc 指向 npm next 的 0.1.5-rc.2）。版本页 dsh-version(3082) 以只读方式挂载本文件为 /ssot/dsh-version.json。旧顶层字段由 parseSSOT 归一化兼容。",
   "requiredPlugins": [
@@ -48,6 +48,6 @@
       "reason": "active bundle set 已排除（不 autoload）；重新启用需：上游修复 CallId + compatibility gate PASS + enabled=true + 恢复 bundles 条目"
     }
   },
-  "version": "0.1.6-alpha.1",
-  "productionChannel": "0.1.6-alpha.1"
+  "version": "0.1.6-alpha.2",
+  "productionChannel": "0.1.6-alpha.2"
 }

@@ -7,10 +7,14 @@
 #   独立容器 + 挂载新脚本 + --no-healthcheck 解决这两点，且与 DSH 主容器解耦。
 #
 # 用法（在 /volume1/docker/dsh-deploy/version-page 下）：
-#   DSH_SSOT_FILE=/volume1/docker/dsh-alpha5/dsh-root/nas_docker/dsh-version.json \
+#   DSH_SSOT_DIR=/volume1/docker/dsh-alpha5/dsh-root/nas_docker \
 #   DSH_VERSION_DATA=/volume1/docker/dsh-alpha5/dsh-data \
 #   DSH_VERSION_DSH_HOME=/data/dsh/test/0.1.2-alpha.5 \
 #   docker compose -p dsh-version up -d
+#
+# ⚠ SSOT 必须挂**目录**（DSH_SSOT_DIR），不能挂单个文件：文件 bind-mount 会被 inode 钉死，
+#   SSOT 一旦被 rename 式重写（git autostash/checkout、原子写）容器就永远读旧值，
+#   版本页显示过期却毫无报错（2026-09-18 实测：页面挂在 alpha.1，实际已 alpha.2）。
 services:
   dsh-version:
     image: ${DSH_IMAGE:-ghcr.io/llzg/dsh-docker:0.1.3-alpha.2}
@@ -24,7 +28,8 @@ services:
     environment:
       DSH_CHANNEL: ${DSH_CHANNEL:-alpha}
       DSH_VERSION_PORT: "3082"
-      DSH_VERSION_SSOT: /ssot/dsh-version.json
+      # 目录挂载下的实时 SSOT 路径（见下方 volumes 注释）
+      DSH_VERSION_SSOT: /ssot-dir/dsh-version.json
       # 用于读取该通道的测试/回滚状态（$DSH_HOME/.deploy/<ch>、$DSH_HOME/backups/<ch>）
       DSH_HOME: ${DSH_VERSION_DSH_HOME:-/data/dsh}
       HTTP_PROXY: ${HTTP_PROXY:-}
@@ -32,7 +37,8 @@ services:
       NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
     volumes:
       - ./version-server:/opt-vs:ro
-      # 实时 SSOT（必填：不挂它就会退回镜像内置快照）
-      - ${DSH_SSOT_FILE:?DSH_SSOT_FILE 必须指向工作区里的 dsh-version.json}:/ssot/dsh-version.json:ro
+      # 实时 SSOT：挂**所在目录**（必填：不挂就会退回镜像内置快照）。
+      # 目录挂载对文件替换（rename）透明；文件挂载会被 inode 钉死 → 版本页永久过期。
+      - ${DSH_SSOT_DIR:?DSH_SSOT_DIR 必须指向工作区目录（含 dsh-version.json）}:/ssot-dir:ro
       # 只读挂载该通道的数据目录（仅用于读 .deploy/backups 状态）
       - ${DSH_VERSION_DATA:-/data/dsh}:/data/dsh:ro
