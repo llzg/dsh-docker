@@ -315,6 +315,42 @@ snapshot_dsh() { # <ver>
   echo "$dst"
 }
 
+# ── preset 迁移（0.1.7 起 preset 改新机制）─────────────────────────────────────
+# 0.1.7 起 @deepseek-ai/dsh-agent-presets 拆包为 dsh-agent-preset*，**不再扫描**
+# $DSH_HOME/.agent-presets；用户 preset 必须作为 bundle 补丁插入 profile。这里把仓库
+# presets/<id>.patch.yml 幂等注入 <home>/profiles/<prof>/cordis.patch.yml，留 .bak-preset-<id>。
+apply_presets() { # <home>
+  local home="$1" src_dir="$REPO_DIR/presets" f marker prof patch
+  [ -d "$src_dir" ] || return 0
+  [ -n "$home" ] && [ -d "$home" ] || return 0
+  for prof in web team; do
+    [ -d "$home/profiles/$prof" ] || continue
+    patch="$home/profiles/$prof/cordis.patch.yml"
+    for f in "$src_dir"/*.patch.yml; do
+      [ -f "$f" ] || continue
+      marker="$(basename "$f" .patch.yml)"
+      if grep -q "preset-$marker" "$patch" 2>/dev/null; then continue; fi
+      [ -f "$patch" ] && cp -p "$patch" "$patch.bak-preset-$marker" 2>/dev/null || true
+      if [ ! -s "$patch" ] || [ "$(tr -d "[:space:]" < "$patch")" = "[]" ]; then
+        cat "$f" > "$patch"
+      else
+        printf "\n" >> "$patch"; cat "$f" >> "$patch"
+      fi
+      echo "preset 注入: $marker -> $patch"
+    done
+  done
+}
+
+restore_presets() { # <home>
+  local home="$1" b t
+  [ -n "$home" ] && [ -d "$home" ] || return 0
+  for b in "$home"/profiles/*/cordis.patch.yml.bak-preset-*; do
+    [ -f "$b" ] || continue
+    t="${b%.bak-preset-*}"
+    mv -f "$b" "$t" && echo "preset 回滚: $t"
+  done
+}
+
 cmd_test() { # <channel>
   require_docker
   local verdict_file="$STATE_DIR/last-test-verdict"
@@ -341,6 +377,7 @@ cmd_test() { # <channel>
   elif [ -d /root/.codex ]; then
     cp -a /root/.codex "$test_home_cont/.codex" && echo "CODEX_HOME 副本(/root): $test_home_cont/.codex"
   fi
+  apply_presets "$test_home_cont"
   echo "TEST_DSH_HOME=$test_home_cont (host: $test_home)"
 
   port="${DSH_TEST_PORT:-$(( ( RANDOM % 1000 ) + 12000 ))}"
@@ -466,6 +503,8 @@ promote_locked() { # <target> [force]
     exit 1
   fi
   digest="$(image_digest "$IMAGE_BASE:$target")"
+  # 0.1.7 起 preset 新机制：把仓库用户 preset 注入 live profile，否则新版本会丢 preset
+  apply_presets "$SOURCE_HOME"
   pin_version_locked "$target" manual "$digest" || { echo "ERROR: pin 失败（已还原旧 .env）" >&2; exit 1; }
   echo "pin: $DIR/.env -> $IMAGE_BASE:$target (digest=${digest:-unknown})"
 
@@ -538,6 +577,8 @@ rollback_locked() { # <channel>
 
 cmd_rollback() { # <channel>
   require_docker
+  # 回滚到旧版本前先撤掉为 0.1.7+ 注入的 preset（旧版本无 dsh-agent-preset 会挂）
+  restore_presets "$SOURCE_HOME"
   rollback_locked
 }
 
