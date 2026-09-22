@@ -167,7 +167,9 @@ function materializeImages(content) {
 	}
 	return out;
 }'''
-need(old_fn in src, "assertTextOnly pattern not found (upstream changed?)")
+if old_fn not in src:
+    print("SKIP vision-materialize: 上游已原生处理文本模型图片（无 assertTextOnly 锚点），路径改由 4c) vision-materialize-text 补回")
+    sys.exit(0)
 src = src.replace(old_fn, new_fn)
 old_loop = '''	for (const message of messages) {
 		assertTextOnly(message.content);
@@ -207,6 +209,42 @@ need(old_tool in src, "tool-result pattern not found (upstream changed?)")
 src = src.replace(old_tool, new_tool)
 open(f, "w", encoding="utf-8").write(src)
 print("vision-materialize: patched dsh-llm-deepseek")
+PY
+
+# 4c) vision-materialize-text（新上游 ≥0.1.7）：上游把「文本模型遇到图片」从**整轮报错**
+#     改成 textOnlyImageText() 占位符，但只给 8 位 sha、**不给路径** → 智能体无法用
+#     scripts/see.sh 看图。这里把落盘路径补回占位符，等价于 4) 在旧上游的效果。
+LLM_LLM="$BASE/dsh-llm/lib/index.js"
+python3 - "$LLM_LLM" <<'PY' || fail "vision-materialize-text: python 补丁未完成（见上，上游结构已变）"
+import os, sys
+f = sys.argv[1]
+if not os.path.exists(f):
+    print("SKIP vision-materialize-text: 目标不存在（上游无 dsh-llm）:", f)
+    sys.exit(0)
+
+def need(cond, what):
+    if not cond:
+        print("VERIFY FAIL: anchor missing vision-materialize-text:", what, file=sys.stderr)
+        sys.exit(3)
+
+src = open(f, encoding="utf-8").read()
+if "dsh-docker-patch:vision-materialize-text" in src:
+    print("vision-materialize-text: already patched (marker present)")
+    sys.exit(0)
+old = '''function textOnlyImageText(ref) {
+	return `[image omitted because this model accepts text only; attachment sha256:${String(ref.attachmentId).slice(7, 15)}]`;
+}'''
+new = '''// dsh-docker-patch:vision-materialize-text
+function textOnlyImageText(ref) {
+	const _sha = String(ref.attachmentId).replace(/^sha256:/, "");
+	const _root = process.env.DSH_HOME ?? "/data/dsh";
+	const _path = [_root, "attachments", "v1", "objects", _sha.slice(0, 2), _sha].join("/");
+	return `[image omitted because this model accepts text only; attachment sha256:${_sha.slice(0, 8)}; 已保存到 ${_path}（用户粘贴的图片，请用 scripts/see.sh 查看）]`;
+}'''
+need(old in src, "textOnlyImageText pattern not found (upstream changed?)")
+src = src.replace(old, new)
+open(f, "w", encoding="utf-8").write(src)
+print("vision-materialize-text: patched dsh-llm")
 PY
 
 # 4b) vision-gate: session.prompt 入口有一道"模型不支持图片"的闸门
@@ -353,7 +391,14 @@ if [ "$STRICT" = "1" ]; then
   done
   # marker 前缀匹配：privileged-loopback 或 privileged-loopback:upstream-satisfied 都算通过
   verify_marker "$CONN_INDEX" privileged-loopback "dsh-client-connection"
-  verify_marker "$LLM_DS" vision-materialize "dsh-llm-deepseek"
+  # vision-materialize：旧上游(dsh-llm-deepseek) 或新上游(dsh-llm.textOnlyImageText) 任一命中即可
+  if has_marker "$LLM_DS" vision-materialize || has_marker "$BASE/dsh-llm/lib/index.js" vision-materialize-text; then
+    echo "verify: vision-materialize OK (dsh-llm-deepseek|dsh-llm)"
+  elif [ ! -f "$LLM_DS" ] && [ ! -f "$BASE/dsh-llm/lib/index.js" ]; then
+    echo "verify: vision-materialize SKIP（目标不存在，patch 不适用）"
+  else
+    fail "marker missing for vision-materialize（dsh-llm-deepseek 与 dsh-llm 均无 marker）: $LLM_DS"
+  fi
   verify_marker "$APIPROXY" vision-gate "dsh-host-apiproxy"
   # token-pinning 与图标无关，必须在条件块之外
   verify_marker "$TOKEN_FILE" token-pinning "dsh-client-connection"
