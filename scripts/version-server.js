@@ -30,6 +30,7 @@ const FORCE_MIN_INTERVAL_MS = 120 * 1000;
 // 镜像仓库（可多个，逗号分隔）：GHCR 公开包 + 内网私有 registry（需凭据，见 registry.js）
 const REGISTRY_REFS = registry.registriesFromEnv();
 const DOCKER_REPO = process.env.DOCKER_REPO || 'llzg/dsh-docker';
+const NPM_PKG = '@deepseek-ai/dsh';
 const UPSTREAM_REPO_URL = 'https://github.com/deepseek-ai/deepseek-harness';
 
 // ── SSOT ────────────────────────────────────────────────────────────────────
@@ -183,6 +184,61 @@ async function loadLastRun() {
   };
 }
 
+// ── 目标依赖完整性：npm 上「已发布但依赖残缺」→ 必然装不起来、CI 必失败 ─────────
+// 2026-09-22 实测：@deepseek-ai/dsh@0.1.5-rc.3 已发布，但 dsh-web-app@rc.3 依赖的
+// dsh-client-ui-sidebar-documentpreview@^rc.3 从未发布 → npm install ETARGET → GHCR
+// 永远没有镜像 → auto-upgrade built=false 死等（版本页却写「npm 上可安装」，误导）。
+// 只在 targetBuilt=false 时做两层探测（target 的直接依赖 + 其直接依赖），结果缓存。
+const targetDepsCache = new Map();
+function depsReferencing(deps, version) {
+  return Object.entries(deps || {}).filter(([, spec]) => String(spec).includes(version));
+}
+async function probePkgAt(pkg, version) {
+  const url = 'https://registry.npmjs.org/' + pkg.replace('/', '%2f') + '/' + version;
+  const res = await policy.fetchJson(url, { headers: { Accept: 'application/json' }, timeoutMs: 8000 }).catch(() => null);
+  if (res && res.data && !res.data.error && res.data.version) return res.data;
+  return null;
+}
+async function checkTargetDeps(target) {
+  if (!target) return { ok: null, missing: [], checked: 0, error: 'no target' };
+  const hit = targetDepsCache.get(target);
+  if (hit && Date.now() - hit.at < CACHE_MS) return hit.data;
+  const missing = new Set();
+  let checked = 0;
+  const runPool = async (items, fn, conc) => {
+    let i = 0;
+    const n = Math.min(conc || 8, items.length);
+    await Promise.all(Array.from({ length: n }, async () => {
+      while (i < items.length) { const it = items[i++]; await fn(it); }
+    }));
+  };
+  const root = await probePkgAt(NPM_PKG, target);
+  checked++;
+  let data;
+  if (!root) {
+    data = { ok: null, missing: [], checked, error: 'target manifest 不可读' };
+  } else {
+    const l1 = depsReferencing(root.dependencies, target);
+    const l2 = new Map();
+    await runPool(l1, async ([p]) => {
+      const m = await probePkgAt(p, target);
+      checked++;
+      if (!m) { missing.add(p + '@' + target); return; }
+      for (const [q, spec] of depsReferencing(m.dependencies, target)) if (!l2.has(q)) l2.set(q, spec);
+    });
+    const l1names = new Set(l1.map(([p]) => p));
+    const l2only = [...l2.keys()].filter((q) => !l1names.has(q));
+    await runPool(l2only, async (q) => {
+      const m = await probePkgAt(q, target);
+      checked++;
+      if (!m) missing.add(q + '@' + target);
+    });
+    data = { ok: missing.size === 0, missing: [...missing], checked, error: null };
+  }
+  targetDepsCache.set(target, { at: Date.now(), data });
+  return data;
+}
+
 function buildStatus(target, reg, runs) {
   if (!target) return { target: null, status: 'na', targetBuilt: null, builtTags: [], registries: [], lastRun: null, error: null };
   const tags = (reg && reg.tags) || [];
@@ -219,6 +275,10 @@ async function buildInfo({ force }) {
       }
       const target = (targets.channels[name] && targets.channels[name].target) || null;
       const state = readDeployState(name, isPrimary);
+      const build = buildStatus(target, reg, runs);
+      if (target && build.targetBuilt === false) {
+        build.depsCheck = await checkTargetDeps(target).catch((e) => ({ ok: null, missing: [], checked: 0, error: e.message }));
+      }
       channelViews[name] = {
         ...view,
         currentRunning: view.currentVersion || null,
@@ -229,7 +289,7 @@ async function buildInfo({ force }) {
         newestUpstream: (targets.channels[name] && targets.channels[name].newestUpstream) || null,
         waitingForNpm: !!(targets.channels[name] && targets.channels[name].waitingForNpm),
         currentIsTarget: target ? view.currentVersion === target : null,
-        build: buildStatus(target, reg, runs),
+        build,
       };
     }
   }
@@ -335,7 +395,13 @@ function channelCard(name, v, isPrimary) {
   if (v.waitingForNpm && v.newestUpstream) {
     statusLine = `<div class="status warn">⚠️ 上游最新为 <b>${esc(v.newestUpstream)}</b>，但 npm 尚未发布该版本，自动构建暂不可用。</div>`;
   } else if (target && v.build && v.build.targetBuilt === false) {
-    statusLine = `<div class="status warn">⚠️ 目标 <b>${esc(target)}</b> 在 npm 上可安装，但 GHCR 上<b>尚无对应镜像</b>（构建未成功或未触发）。</div>`;
+    const dc = v.build && v.build.depsCheck;
+    if (dc && dc.ok === false && dc.missing.length) {
+      const shown = dc.missing.slice(0, 6).join(', ');
+      statusLine = `<div class="status err">⛔ 目标 <b>${esc(target)}</b> 已发布但<b>依赖残缺</b>，npm 无法安装 → CI 构建必失败（缺 ${esc(shown)}${dc.missing.length > 6 ? ' …' : ''}）。这是上游发布不完整，流水线已正确拒绝推进；需上游补齐该版本后重试。</div>`;
+    } else {
+      statusLine = `<div class="status warn">⚠️ 目标 <b>${esc(target)}</b> 在 npm 上已发布，但 GHCR 上<b>尚无对应镜像</b>（构建未成功或未触发；依赖完整性探测未发现缺失）。</div>`;
+    }
   } else if (target) {
     statusLine = `<div class="status ok">✅ 构建目标 <b>${esc(target)}</b> 可安装，镜像已发布。</div>`;
   } else {
