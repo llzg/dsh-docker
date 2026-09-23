@@ -358,6 +358,67 @@ open(f, "w", encoding="utf-8").write(src)
 print("token-pinning: patched dsh-client-connection")
 PY
 
+# 7) dsh-scope: 同 scope key 的重复 bind 必须幂等，而不是抛错。
+#    现象：Web UI 切换 Agent 预设时报
+#      "dsh-scope: scope key is already bound to a parent; re-linking requires
+#       the binding returned by the original bind"，前端 toast「无法切换到…」。
+#    机制：dsh-agent-preset-registry（0.1.7，旧名 dsh-agent-presets）把 bind() 返回的
+#      binding 存在 **服务实例级** WeakMap（this.bindings）；dsh-scope 的 key→parent
+#      关系存在 **模块级** WeakMap（scopeParents）。join() 注册的 ctx.effect 清理器会
+#      bindings.delete(key)，两份状态生命周期不一致时，bind() 回退到 join() 用同一
+#      key 再 bind 一次 → 撞不变量抛错。
+#    修法：bindScopeParent 幂等——已绑定则复用原 binding；目标父不同时经
+#      linkScopeParent 改挂。环检测与 rebind 能力保留。
+SCOPE_INDEX="$BASE/dsh-scope/lib/index.js"
+python3 - "$SCOPE_INDEX" <<'PY' || fail "scope-rebind-idempotent: python 补丁未完成（见上，上游结构已变）"
+import os, sys
+f = sys.argv[1]
+if not os.path.exists(f):
+    print("SKIP scope-rebind-idempotent: 目标不存在（上游移除 dsh-scope，patch 不适用）:", f)
+    sys.exit(0)
+
+def need(cond, what):
+    """锚点预检：失败即打印 VERIFY FAIL 并以 exit 3 结束。"""
+    if not cond:
+        print("VERIFY FAIL: anchor missing scope-rebind-idempotent:", what, file=sys.stderr)
+        sys.exit(3)
+
+src = open(f, encoding="utf-8").read()
+if "dsh-docker-patch:scope-rebind-idempotent" in src:
+    print("scope-rebind-idempotent: already patched (marker present)")
+    sys.exit(0)
+old_fn = '''function bindScopeParent(key, parent) {
+	if (scopeParents.has(key)) throw new Error("dsh-scope: scope key is already bound to a parent; re-linking requires the binding returned by the original bind");
+	linkScopeParent(key, parent);
+	return { rebind(next) {
+		linkScopeParent(key, next);
+	} };
+}'''
+new_fn = '''// dsh-docker-patch:scope-rebind-idempotent
+// Re-binding an already-linked key is idempotent: return the SAME capability and,
+// when the target parent differs, move the link. Without this, any caller whose
+// per-instance binding map lost the entry (ctx.effect disposer, or a second
+// module copy) throws on the second bind and kills Agent-preset switching.
+const scopeBindings = /* @__PURE__ */ new WeakMap();
+function bindScopeParent(key, parent) {
+	const existing = scopeBindings.get(key);
+	if (existing !== void 0) {
+		if (scopeParents.get(key) !== parent) linkScopeParent(key, parent);
+		return existing;
+	}
+	linkScopeParent(key, parent);
+	const binding = { rebind(next) {
+		linkScopeParent(key, next);
+	} };
+	scopeBindings.set(key, binding);
+	return binding;
+}'''
+need(old_fn in src, "bindScopeParent pattern not found (upstream changed?)")
+src = src.replace(old_fn, new_fn)
+open(f, "w", encoding="utf-8").write(src)
+print("scope-rebind-idempotent: patched dsh-scope")
+PY
+
 # ── STRICT verification（构建期正向校验：marker 必须存在）──────────────────
 # 契约 §10：正向校验 marker，替代旧的“原始模式必须消失”（锚点失配时恒真）。
 verify_marker() { # file marker-name label
@@ -402,6 +463,8 @@ if [ "$STRICT" = "1" ]; then
   verify_marker "$APIPROXY" vision-gate "dsh-host-apiproxy"
   # token-pinning 与图标无关，必须在条件块之外
   verify_marker "$TOKEN_FILE" token-pinning "dsh-client-connection"
+  # scope-rebind-idempotent：dsh-scope 幂等 bind（修复预设切换 "already bound to a parent"）
+  verify_marker "$SCOPE_INDEX" scope-rebind-idempotent "dsh-scope"
   if [ -f "$ICON" ] && [ -f "$MAKE_FAVICON" ]; then
     verify_marker "$FAVICON" favicon-custom "dsh-web-frontend"
     if [ -f "$FAVICON" ] && ! grep -qF 'data:image/jpeg;base64' "$FAVICON"; then
