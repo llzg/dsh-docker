@@ -68,11 +68,16 @@ FROM ${BASE_IMAGE} AS base
 # Vulkan 依赖：llama.cpp GGML_VULKAN 编译需要 glslc + 头文件（libvulkan-dev 自带）；
 # mesa-vulkan-drivers 提供 Intel Iris Xe 的 Vulkan ICD（运行时，配合 /dev/dri 直通）。
 # cache mount：apt 的包缓存与索引跨构建保留。sharing=locked 避免并行矩阵构建互踩。
+# ⚠ 2026-09-29：同一 commit 下 alpha 构建成功、rc 在这一步 exit 100（镜像源偶发）。
+# 加 3 次重试 + Acquire::Retries，源抖动不再让某个通道静默落后。
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update \
-    && apt-get install -y --no-install-recommends python3 make g++ git ca-certificates curl openssh-client \
-        libvulkan-dev libvulkan1 mesa-vulkan-drivers glslc glslang-tools spirv-tools spirv-headers \
+    ok=0; for i in 1 2 3; do \
+      apt-get -o Acquire::Retries=5 update \
+      && apt-get -o Acquire::Retries=5 install -y --no-install-recommends python3 make g++ git ca-certificates curl openssh-client \
+           libvulkan-dev libvulkan1 mesa-vulkan-drivers glslc glslang-tools spirv-tools spirv-headers \
+      && { ok=1; break; } || { echo "apt attempt $i failed (exit $?), retrying in 5s"; sleep 5; }; \
+    done; [ "$ok" = 1 ] \
     && rm -rf /var/lib/apt/lists/*
 
 # Docker CLI（静态 Go 二进制；来自 docker:cli）。只含 CLI，不含 daemon；配 /var/run/docker.sock 使用。
