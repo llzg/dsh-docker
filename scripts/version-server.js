@@ -189,13 +189,19 @@ async function loadLastRun() {
 // dsh-client-ui-sidebar-documentpreview@^rc.3 从未发布 → npm install ETARGET → GHCR
 // 永远没有镜像 → auto-upgrade built=false 死等（版本页却写「npm 上可安装」，误导）。
 // 只在 targetBuilt=false 时做两层探测（target 的直接依赖 + 其直接依赖），结果缓存。
+// ⚠ 必须**有界**：本检查在渲染通道页时同步执行，最坏情况要探 ~200 个包。
+// 2026-09-29 教训：无界版本让 CI 的 Policy tests（test-version-server）在 node18 runner 上
+// 挂死 → resolve job 失败 → 整条流水线不构建。总预算 + 探测上限是硬要求。
+const DEPS_CHECK_BUDGET_MS = Number(process.env.DSH_DEPS_CHECK_MS || 8000);
+const DEPS_CHECK_MAX_PROBES = Number(process.env.DSH_DEPS_CHECK_MAX || 160);
 const targetDepsCache = new Map();
 function depsReferencing(deps, version) {
   return Object.entries(deps || {}).filter(([, spec]) => String(spec).includes(version));
 }
-async function probePkgAt(pkg, version) {
+async function probePkgAt(pkg, version, deadline) {
+  const budget = deadline === undefined ? 4000 : Math.max(1200, Math.min(4000, deadline - Date.now()));
   const url = 'https://registry.npmjs.org/' + pkg.replace('/', '%2f') + '/' + version;
-  const res = await policy.fetchJson(url, { headers: { Accept: 'application/json' }, timeoutMs: 8000 }).catch(() => null);
+  const res = await policy.fetchJson(url, { headers: { Accept: 'application/json' }, timeoutMs: budget }).catch(() => null);
   if (res && res.data && !res.data.error && res.data.version) return res.data;
   return null;
 }
@@ -205,14 +211,16 @@ async function checkTargetDeps(target) {
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.data;
   const missing = new Set();
   let checked = 0;
+  const deadline = Date.now() + DEPS_CHECK_BUDGET_MS;
+  const expired = () => Date.now() > deadline || checked >= DEPS_CHECK_MAX_PROBES;
   const runPool = async (items, fn, conc) => {
     let i = 0;
     const n = Math.min(conc || 8, items.length);
     await Promise.all(Array.from({ length: n }, async () => {
-      while (i < items.length) { const it = items[i++]; await fn(it); }
+      while (i < items.length) { if (expired()) return; const it = items[i++]; await fn(it); }
     }));
   };
-  const root = await probePkgAt(NPM_PKG, target);
+  const root = await probePkgAt(NPM_PKG, target, deadline);
   checked++;
   let data;
   if (!root) {
@@ -221,7 +229,7 @@ async function checkTargetDeps(target) {
     const l1 = depsReferencing(root.dependencies, target);
     const l2 = new Map();
     await runPool(l1, async ([p]) => {
-      const m = await probePkgAt(p, target);
+      const m = await probePkgAt(p, target, deadline);
       checked++;
       if (!m) { missing.add(p + '@' + target); return; }
       for (const [q, spec] of depsReferencing(m.dependencies, target)) if (!l2.has(q)) l2.set(q, spec);
@@ -229,10 +237,15 @@ async function checkTargetDeps(target) {
     const l1names = new Set(l1.map(([p]) => p));
     const l2only = [...l2.keys()].filter((q) => !l1names.has(q));
     await runPool(l2only, async (q) => {
-      const m = await probePkgAt(q, target);
+      const m = await probePkgAt(q, target, deadline);
       checked++;
       if (!m) missing.add(q + '@' + target);
     });
+    if (expired()) {
+      // 超预算 → 结论不可信：按「未知」上报，且不写缓存（下次请求重试）。
+      data = { ok: null, missing: [...missing], checked, error: '探测超预算 ' + DEPS_CHECK_BUDGET_MS + 'ms（结论未知）', timedOut: true };
+      return data;
+    }
     data = { ok: missing.size === 0, missing: [...missing], checked, error: null };
   }
   targetDepsCache.set(target, { at: Date.now(), data });
