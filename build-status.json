@@ -5,9 +5,9 @@
       "channel": "alpha",
       "version": "0.2.1-alpha.2",
       "conclusion": "failure",
-      "headSha": "da0da13c9baff0226a79a87d6071468b162b8564",
-      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/38066678217",
-      "updatedAt": "2026-10-10T16:27:20.934Z"
+      "headSha": "f7cc202fba81f047b126c73c26e04cbc05f5cc9e",
+      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/38082928545",
+      "updatedAt": "2026-10-10T20:17:52.300Z"
     },
     "rc": {
       "channel": "rc",
@@ -18,5 +18,5 @@
       "updatedAt": "2026-09-29T15:41:28.841Z"
     }
   },
-  "updatedAt": "2026-10-10T16:31:35.658Z"
+  "updatedAt": "2026-10-10T20:18:22.257Z"
 }
