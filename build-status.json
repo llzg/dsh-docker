@@ -5,18 +5,18 @@
       "channel": "alpha",
       "version": "0.2.1-alpha.5",
       "conclusion": "failure",
-      "headSha": "5ec50da41c4e129df0669c1b9c442ae819179ea2",
-      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/39350545134",
-      "updatedAt": "2026-10-20T01:23:21.842Z"
+      "headSha": "c2897fec65d5d3f3223d9e14ee7accc46c3bdcbe",
+      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/39376554227",
+      "updatedAt": "2026-10-20T06:15:25.019Z"
     },
     "rc": {
       "channel": "rc",
       "version": "0.2.1-rc.2",
       "conclusion": "failure",
-      "headSha": "5ec50da41c4e129df0669c1b9c442ae819179ea2",
-      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/39350545134",
-      "updatedAt": "2026-10-20T01:02:19.187Z"
+      "headSha": "c2897fec65d5d3f3223d9e14ee7accc46c3bdcbe",
+      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/39376554227",
+      "updatedAt": "2026-10-20T06:39:00.129Z"
     }
   },
-  "updatedAt": "2026-10-20T01:24:35.437Z"
+  "updatedAt": "2026-10-20T06:53:49.464Z"
 }
