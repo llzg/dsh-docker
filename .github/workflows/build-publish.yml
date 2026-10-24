@@ -332,8 +332,11 @@ jobs:
           ' "$C" "$V" "$JOB" "$SHA" "$RUN_URL"
           ls -la build-status-*.json
 
+      # 自建 runner 到 artifact blob storage 偶发 ECONNRESET（2026-10-24 实测）；
+      # 构建/推送已完成时不能因为“状态上传”把整个 job 判红。
       - name: Upload build status
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: build-status-${{ matrix.channel }}
@@ -359,7 +362,10 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
+      # 上传可能因网络失败（见上）→ 没有 artifacts 是正常降级，不能判红；
+      # Merge 步骤已经对“无产物”做了 warning + exit 0。
       - name: Download build status artifacts
+        continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: build-status-*

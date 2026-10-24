@@ -42,7 +42,7 @@ if grep -qE '^[[:space:]]*-[[:space:]]*id:[[:space:]]*webserver[[:space:]]*$' "$
   awk -v h="$LISTEN_HOST" '
     /^[[:space:]]*-[[:space:]]*id:[[:space:]]*webserver[[:space:]]*$/ { inweb=1 }
     inweb && /^[[:space:]]*-[[:space:]]*id:/ && $0 !~ /id:[[:space:]]*webserver/ { inweb=0 }
-    inweb && /^[[:space:]]*host:/ { sub(/host:.*/, "host: '" h "'") }
+    inweb && /^[[:space:]]*host:/ { sub(/host:.*/, "host: " h) }
     { print }
   ' "$PROFILE_PATCH" > "$PROFILE_PATCH.tmp" && mv "$PROFILE_PATCH.tmp" "$PROFILE_PATCH"
 else
