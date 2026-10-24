@@ -307,12 +307,25 @@ jobs:
       # 名字别再叫 "Push to GHCR"：之前正是因为名字误导，排查时以为失败只影响 GHCR。
       - name: Push images (GHCR + private registry)
         run: |
-          set -euo pipefail
-          echo "$IMAGE_TAGS" | while IFS= read -r t; do
+          # 2026-10-24 实测：ghcr.io 偶发 `Get "https://ghcr.io/v2/": EOF`；
+          # 层已推完后 manifest/tag 重试几乎零成本，不能因此把已构建好的镜像判废。
+          set -uo pipefail
+          FAILED=0
+          while IFS= read -r t; do
             [ -n "$t" ] || continue
-            echo "push $t"
-            docker push "$t"
-          done
+            ok=0
+            for attempt in 1 2 3 4 5; do
+              echo "push $t (attempt $attempt)"
+              if docker push "$t"; then ok=1; break; fi
+              echo "::warning::push $t failed (attempt $attempt); retrying"
+              sleep $((attempt * 5))
+            done
+            if [ "$ok" != "1" ]; then
+              echo "::error::push $t failed after 5 attempts"
+              FAILED=1
+            fi
+          done <<< "$IMAGE_TAGS"
+          exit "$FAILED"
 
       - name: Write build status
         if: always()
