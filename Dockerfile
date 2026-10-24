@@ -224,5 +224,7 @@ COPY --from=dockerplugins /usr/local/libexec/docker/cli-plugins/docker-compose /
 #   （2026-09-10 在 UGREEN 生产上实测：旧容器正是因为被改成了 TCP 探活才 healthy；
 #     按镜像自带的 HTTP 探活重建后立刻变 unhealthy）。
 # 版本页 3082 的存活由 entrypoint 的守护循环负责（契约 §6）。
+# 0.2.1-alpha.5 起 webserver 拒绝 wildcard，只绑具体 IPv4（entrypoint 取 eth0 地址）；
+# 探活必须连同一个地址，不能固定 127.0.0.1（DSH_LISTEN_HOST 显式设置时优先）。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD node -e "const s=require('net').connect(3080,'127.0.0.1');s.on('connect',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1))"
+    CMD node -e "const os=require('os'),net=require('net');let ip=process.env.DSH_LISTEN_HOST||'';if(!ip||ip==='0.0.0.0'||ip==='::'){ip='127.0.0.1';const n=os.networkInterfaces();outer:for(const k of Object.keys(n)){for(const a of n[k]||[]){if(a.family==='IPv4'&&!a.internal){ip=a.address;break outer}}}}const s=net.connect(3080,ip);s.on('connect',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1))"

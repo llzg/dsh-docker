@@ -36,6 +36,9 @@ services:
       #      回代 BACKEND=http://127.0.0.1:3080，保留 CIDR 白名单/令牌注入等特性。
       # ⚠ 两个端口必须分开写：proxy 模式如果 dsh 服务也发 DSH_PORT，会和 proxy 抢同一个
       #   宿主端口，compose up 直接失败（bind: address already in use）。
+      # ⚠ DSH_BIND_IP 只控制**宿主** publish 地址；容器内 webserver 从 0.2.1-alpha.5 起
+      #   拒绝 0.0.0.0，由 entrypoint 改写 cordis.patch.yml 绑定容器 eth0 的具体 IPv4
+      #   （DSH_LISTEN_HOST 可显式覆盖；Docker DNAT 目标就是这个地址）。
       - "${DSH_BIND_IP:-0.0.0.0}:${DSH_PUBLISH_PORT:?DSH_PUBLISH_PORT 未设置：直发模式填 DSH_PORT(如 3081)，proxy 模式填 3080（回环）}:3080"
     environment:
       # ⚠ 不能写死 /data/dsh：alpha 通道的真实 DSH_HOME 是 /data/dsh/test/0.1.2-alpha.5

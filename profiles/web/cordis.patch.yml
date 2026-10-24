@@ -1,7 +1,10 @@
-# LAN deployment: bind the web UI to all interfaces so devices on the LAN
-# can reach it. The CLI itself refuses --host 0.0.0.0; this patch is the
-# supported override.
+# LAN deployment: bind the web UI to a concrete IPv4 of this container/host.
+# Upstream 0.2.1-alpha.5+ rejects wildcard (0.0.0.0/::) at config validation
+# ("binding every interface would expose RCE to the network").
+# entrypoint.sh rewrites this value on every start to the first non-loopback
+# IPv4 (Docker port publishing DNATs to that address); DSH_LISTEN_HOST overrides.
+# 127.0.0.1 is the fail-closed fallback when no interface can be resolved.
 - id: webserver
   config:
-    host: '0.0.0.0'
+    host: '127.0.0.1'
     port: 3080

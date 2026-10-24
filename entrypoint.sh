@@ -15,10 +15,40 @@ export DSH_HOME DSH_CHANNEL DSH_VERSION_PORT DSH_VERSION_SSOT
 VERSION_PORT="$DSH_VERSION_PORT"
 export VERSION_PORT
 
-mkdir -p "$DSH_HOME/profiles/web" "$DSH_HOME/logs"
-if [ ! -f "$DSH_HOME/profiles/web/cordis.patch.yml" ]; then
-  cp /opt/dsh-profiles/web/cordis.patch.yml "$DSH_HOME/profiles/web/cordis.patch.yml"
+PROFILE_DIR="$DSH_HOME/profiles/web"
+mkdir -p "$PROFILE_DIR" "$DSH_HOME/logs"
+
+# ── webserver 绑定地址（0.2.1-alpha.5+ 上游拒绝 wildcard）────────────────────
+# 上游 0.2.1-alpha.5 起在配置校验阶段拒绝 0.0.0.0/::：
+#   "binding every interface would expose remote code execution to the network;
+#    bind one concrete IPv4 or IPv6 address of a local interface instead"
+# 容器仍必须让 Docker 端口映射可达：Docker DNAT 的目标就是容器自己的 IPv4，
+# 所以绑定 eth0 的具体地址即可（bridge 与 host 网络都成立）。
+# 显式 DSH_LISTEN_HOST 优先；否则取第一个非 loopback IPv4，再退 127.0.0.1（fail-closed）。
+LISTEN_HOST="${DSH_LISTEN_HOST:-}"
+case "$LISTEN_HOST" in
+  ''|0.0.0.0|::|'[::]')
+    LISTEN_HOST=$(node -e 'const os=require("os");const n=os.networkInterfaces();for(const k of Object.keys(n)){for(const a of n[k]||[]){if(a.family==="IPv4"&&!a.internal){process.stdout.write(a.address);process.exit(0)}}}process.stdout.write("127.0.0.1")')
+    ;;
+esac
+export DSH_LISTEN_HOST="$LISTEN_HOST"
+PROFILE_PATCH="$PROFILE_DIR/cordis.patch.yml"
+if [ ! -f "$PROFILE_PATCH" ]; then
+  cp /opt/dsh-profiles/web/cordis.patch.yml "$PROFILE_PATCH"
 fi
+# 每次启动都改写：容器重建后 IP 会变，旧镜像/旧文件里的 0.0.0.0 也必须纠正。
+# 只改 `- id: webserver` 块内的 host，保留用户其余 profile 补丁。
+if grep -qE '^[[:space:]]*-[[:space:]]*id:[[:space:]]*webserver[[:space:]]*$' "$PROFILE_PATCH"; then
+  awk -v h="$LISTEN_HOST" '
+    /^[[:space:]]*-[[:space:]]*id:[[:space:]]*webserver[[:space:]]*$/ { inweb=1 }
+    inweb && /^[[:space:]]*-[[:space:]]*id:/ && $0 !~ /id:[[:space:]]*webserver/ { inweb=0 }
+    inweb && /^[[:space:]]*host:/ { sub(/host:.*/, "host: '" h "'") }
+    { print }
+  ' "$PROFILE_PATCH" > "$PROFILE_PATCH.tmp" && mv "$PROFILE_PATCH.tmp" "$PROFILE_PATCH"
+else
+  printf "\n- id: webserver\n  config:\n    host: '%s'\n    port: 3080\n" "$LISTEN_HOST" >> "$PROFILE_PATCH"
+fi
+echo "[entrypoint] webserver bind host: $LISTEN_HOST"
 # 自愈：容器每次启动都重跑 LAN/vision 补丁（幂等，失败不阻塞启动）。
 # 镜像里 patch-dsh.sh 已随构建烤入 /opt；工作区副本兜底（本地修改未重建镜像时）。
 if [ -x /opt/patch-dsh.sh ]; then
