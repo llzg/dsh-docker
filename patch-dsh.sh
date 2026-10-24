@@ -65,7 +65,17 @@ for pkg in dsh-client-ui-settings dsh-client-ui-settings-models dsh-client-ui-se
   SETTINGS_PATCHED=1
 done
 if [ "$SETTINGS_PATCHED" != "1" ]; then
-  fail "settings-host-mode: 三个 settings 包都没有锚点也没有 marker —— 上游已重写该逻辑，必须更新 patch-dsh.sh（防静默失效）"
+  # 0.2.1-alpha.5+：设置写入改为 Host-backed config forms（ConfigForm → scope.set →
+  # /api），不再有 off-loopback 的 "host"/"memory" 降级 —— 即上游已原生满足
+  # "LAN 打开设置页也能持久化" 这一补丁目的。识别该新实现并记 upstream-satisfied。
+  SETTINGS_MAIN="$BASE/dsh-client-ui-settings/lib/client.js"
+  if [ -f "$SETTINGS_MAIN" ] && grep -qF 'Host configuration mirror' "$SETTINGS_MAIN"; then
+    write_marker "$SETTINGS_MAIN" settings-host-mode:upstream-satisfied
+    SETTINGS_PATCHED=1
+    echo "settings-host-mode: upstream-satisfied（Host-backed config forms，无 host/memory 判定）"
+  else
+    fail "settings-host-mode: 三个 settings 包都没有锚点也没有 marker —— 上游已重写该逻辑，必须更新 patch-dsh.sh（防静默失效）"
+  fi
 fi
 
 # 2) crypto.randomUUID polyfill: in a non-secure context (plain HTTP over a LAN IP)
@@ -112,7 +122,9 @@ elif grep -qF 'PRIVILEGED_METHODS.has(method) && !isTrustedApiRequest(request, [
   sed -i 's/PRIVILEGED_METHODS.has(method) && !isTrustedApiRequest(request, \[\])/PRIVILEGED_METHODS.has(method) \&\& !isTrustedApiRequest(request, trustedHosts)/' "$CONN_INDEX"
   write_marker "$CONN_INDEX" privileged-loopback
   echo "privileged-loopback: patched (legacy anchor)"
-elif grep -qF 'isTrustedApiRequest(request, this.trustedHosts)' "$CONN_INDEX"; then
+elif grep -qE 'isTrustedApiRequest\(request, this\.trustedHosts[,)]' "$CONN_INDEX"; then
+  # 0.1.2-alpha.5..0.2.1-alpha.4: isTrustedApiRequest(request, this.trustedHosts)
+  # 0.2.1-alpha.5+:                isTrustedApiRequest(request, this.trustedHosts, carrier?.host, protocol)
   write_marker "$CONN_INDEX" privileged-loopback:upstream-satisfied
   echo "privileged-loopback: upstream-satisfied (no sed needed)"
 else
@@ -252,13 +264,16 @@ PY
 #     前直接拒绝（客户端 toast "当前模型不支持图片"）。去掉这道闸门，
 #     让图片流进消息；是否能用交给适配器层（vision-materialize 会物化成
 #     附件路径文本），而不是在入口一刀切。
-APIPROXY="$BASE/dsh-host-apiproxy/lib/index.js"
-python3 - "$APIPROXY" <<'PY' || fail "vision-gate: python 补丁未完成（见上，上游结构已变）"
+#    目标随上游迁移（2026-10-24 实测 0.2.1-alpha.5）：
+#      <= 0.2.1-alpha.4: $BASE/dsh-host-apiproxy/lib/index.js
+#                        err(request, { code: "attachment-error", details: {...} })
+#      >= 0.2.1-alpha.5: $BASE/dsh-api-session-controller/lib/index.js
+#                        throw new RemoteError("session/attachment-invalid", ..., { reason })
+#    两个目标都尝试；命中哪个改哪个；都不存在 → SKIP；存在但锚点不匹配 → FAIL。
+VISION_GATE_OLD="$BASE/dsh-host-apiproxy/lib/index.js"
+VISION_GATE_NEW="$BASE/dsh-api-session-controller/lib/index.js"
+python3 - "$VISION_GATE_OLD" "$VISION_GATE_NEW" <<'PY' || fail "vision-gate: python 补丁未完成（见上，上游结构已变）"
 import os, sys
-f = sys.argv[1]
-if not os.path.exists(f):
-    print("SKIP vision-gate: 目标不存在（上游移除 dsh-host-apiproxy，patch 不适用）:", f)
-    sys.exit(0)
 
 def need(cond, what):
     """锚点预检：保留 assert 语义，但打印契约要求的 VERIFY FAIL 并以 exit 3 结束。"""
@@ -266,11 +281,7 @@ def need(cond, what):
         print("VERIFY FAIL: anchor missing vision-gate:", what, file=sys.stderr)
         sys.exit(3)
 
-src = open(f, encoding="utf-8").read()
 marker = "dsh-docker-patch:vision-gate"
-if marker in src:
-    print("vision-gate: already patched (marker present)")
-    sys.exit(0)
 old_gate = '''						if (hasImage) {
 							const current = selectionFor(agent).current;
 							const modelInfo = await ctx.llm.resolveModelInfo(current.provider, current.model);
@@ -284,10 +295,34 @@ new_gate = '''						// dsh-docker-patch:vision-gate
 						// LAN patch (llzg/dsh-docker) vision-gate: pasted images pass through even
 						// for text-only models; the DeepSeek adapter materializes them into
 						// attachment-path text (vision-materialize) instead of erroring.'''
-need(old_gate in src, "MODEL_DOES_NOT_SUPPORT_IMAGES pattern not found (upstream changed?)")
-src = src.replace(old_gate, new_gate)
-open(f, "w", encoding="utf-8").write(src)
-print("vision-gate: patched dsh-host-apiproxy")
+new_gate_new = '''if (model.inputModalities !== void 0 && !model.inputModalities.includes("image")) throw new RemoteError("session/attachment-invalid", `Model "${current.model}" does not support image input.`, { reason: "MODEL_DOES_NOT_SUPPORT_IMAGES" });'''
+patched = 0
+seen = 0
+for f in sys.argv[1:]:
+    if not os.path.exists(f):
+        print("SKIP vision-gate: 目标不存在（该上游版本无此包，patch 不适用）:", f)
+        continue
+    seen += 1
+    src = open(f, encoding="utf-8").read()
+    if marker in src:
+        print("vision-gate: already patched (marker present):", f)
+        patched = 1
+        continue
+    if old_gate in src:
+        src = src.replace(old_gate, new_gate)
+        open(f, "w", encoding="utf-8").write(src)
+        print("vision-gate: patched legacy dsh-host-apiproxy")
+        patched = 1
+    elif new_gate_new in src:
+        # 0.2.1-alpha.5：闸门变成单行 throw；去掉即可让图片进入消息
+        src = src.replace(new_gate_new, "/* dsh-docker-patch:vision-gate */")
+        open(f, "w", encoding="utf-8").write(src)
+        print("vision-gate: patched dsh-api-session-controller")
+        patched = 1
+    else:
+        print("SKIP vision-gate: 目标存在但无已知闸门锚点（该版本可能已无此闸门）:", f)
+if not patched and seen:
+    need(False, "MODEL_DOES_NOT_SUPPORT_IMAGES pattern not found in existing targets (upstream changed?)")
 PY
 
 # 5) 自定义图标：将 dsh-icon.jpg 嵌入前端 favicon.svg
@@ -460,7 +495,14 @@ if [ "$STRICT" = "1" ]; then
   else
     fail "marker missing for vision-materialize（dsh-llm-deepseek 与 dsh-llm 均无 marker）: $LLM_DS"
   fi
-  verify_marker "$APIPROXY" vision-gate "dsh-host-apiproxy"
+  # vision-gate：旧目标(dsh-host-apiproxy) 或新目标(dsh-api-session-controller) 任一命中即可
+  if has_marker "$VISION_GATE_OLD" vision-gate || has_marker "$VISION_GATE_NEW" vision-gate; then
+    echo "verify: vision-gate OK (dsh-host-apiproxy|dsh-api-session-controller)"
+  elif [ ! -f "$VISION_GATE_OLD" ] && [ ! -f "$VISION_GATE_NEW" ]; then
+    echo "verify: vision-gate SKIP（目标不存在，patch 不适用）"
+  else
+    fail "marker missing for vision-gate in both targets: $VISION_GATE_OLD | $VISION_GATE_NEW"
+  fi
   # token-pinning 与图标无关，必须在条件块之外
   verify_marker "$TOKEN_FILE" token-pinning "dsh-client-connection"
   # scope-rebind-idempotent：dsh-scope 幂等 bind（修复预设切换 "already bound to a parent"）
