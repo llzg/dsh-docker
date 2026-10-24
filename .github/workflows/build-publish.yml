@@ -136,13 +136,18 @@ jobs:
 
       # GHCR 推送可关（vars.DSH_PUSH_GHCR=0）：镜像改由内网 registry 分发时，
       # 这 40s/通道 的公网推送（1.4GB）就省掉了。
-      - name: Login to GHCR
+      #
+      # ⚠ 不用 docker/login-action（2026-10-24）：自建 runner 从 codeload.github.com
+      #   下载 action 反复 100s 超时（3 次重试全失败），build job 在 Set up job 就死了，
+      #   镜像根本没开始构建。docker CLI 登录等价且不依赖 action 下载。
+      - name: Login to GHCR (docker CLI)
         if: vars.DSH_PUSH_GHCR != '0'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "${GHCR_TOKEN:-}" ] || { echo "::error::GITHUB_TOKEN 为空，无法登录 GHCR"; exit 1; }
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       # 私有 registry（可选）：vars.DSH_PRIVATE_IMAGE 形如 192.168.5.35:5050/llzg/dsh-docker。
       # 注意：http(无 TLS) 的 registry 需要 runner 的 daemon 配 insecure-registries。
@@ -156,16 +161,18 @@ jobs:
       #   192.168.5.35:5050/...` 就报 "no basic auth credentials"（版本页查询同样受影响）。
       #   生产拉取路径依赖这份凭据，所以这里不清除；GHCR 的登录仍在 post 步骤登出（临时 token
       #   不该留在宿主上）。
-      - name: Login to private registry
-        # secrets 不能直接写在 if 里 → 先落到 job 级 env 再判断；宿主已 docker login 时无需本步
+      - name: Login to private registry (docker CLI, no logout)
+        # secrets 不能直接写在 if 里 → 先落到 job 级 env 再判断；宿主已 docker login 时无需本步。
+        # 不 logout：生产拉取 192.168.5.35:5050 依赖宿主 ~/.docker/config.json 的凭据。
         if: vars.DSH_PRIVATE_REGISTRY != '' && env.DSH_REGISTRY_USER != ''
         continue-on-error: true
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ${{ vars.DSH_PRIVATE_REGISTRY }}
-          username: ${{ secrets.DSH_REGISTRY_USER }}
-          password: ${{ secrets.DSH_REGISTRY_PASSWORD }}
-          logout: false
+        env:
+          REGISTRY: ${{ vars.DSH_PRIVATE_REGISTRY }}
+          DSH_REGISTRY_PASSWORD: ${{ secrets.DSH_REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "${DSH_REGISTRY_PASSWORD:-}" ] || { echo "::warning::DSH_REGISTRY_PASSWORD 为空，跳过私有 registry 登录"; exit 0; }
+          printf '%s' "$DSH_REGISTRY_PASSWORD" | docker login "$REGISTRY" -u "$DSH_REGISTRY_USER" --password-stdin
 
       # 构建缓存放到群晖 registry（192.168.5.35:5050）：BuildKit 的 type=registry cache。
       # 目的：compute host（.17）磁盘有限，缓存统一落在 storage host（.35）的 registry，
@@ -263,35 +270,34 @@ jobs:
           echo "channel=${{ matrix.channel }} version=$V prerelease=$PRE push_ghcr=$PUSH_GHCR private=${PRIV_BASE:-none}"
           printf '%b' "$TAGS" | sed '/^$/d' | sed 's/^/  tag: /'
 
-      # 先构建到本地 daemon 做冒烟测试；通过后才推送（坏镜像不进 registry）
+      # 先构建到本地 daemon 做冒烟测试；通过后才推送（坏镜像不进 registry）。
+      # ⚠ 不用 docker/build-push-action（2026-10-24 实测）：自建 runner 从 codeload
+      #   下载 action 反复超时，job 在 Set up job 就失败；改用上一步已选好的 buildx
+      #   builder 直接 CLI 构建，参数与原 action 等价。
       - name: Build image (local, for smoke test)
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          load: true
-          push: false
-          tags: ${{ env.IMAGE_TAGS }}
-          # 缓存：启用时走群晖 registry 的 BuildKit registry cache（上一步写入 DSH_CACHE_FROM/TO）；
-          # 未启用时为空 → build-push-action 不追加 --cache-from/--cache-to。
-          cache-from: ${{ env.DSH_CACHE_FROM }}
-          cache-to: ${{ env.DSH_CACHE_TO }}
-          build-args: |
-            DSH_VERSION=${{ matrix.version }}
-            GIT_REVISION=${{ github.sha }}
-            DSH_CHANNEL=${{ matrix.channel }}
-            # 基础镜像走群晖 pull-through 缓存（:5051），避免 buildkitd 直连 Docker Hub（无需代理）
-            BASE_IMAGE=${{ vars.DSH_BASE_IMAGE || '192.168.5.35:5051/library/node:22-bookworm-slim' }}
-            # 构建内走代理（2026-09-10 宿主实测数据）：
-            #   github.com release 直连**卡死**（25s 超时、0 字节），走代理 0.69s ——
-            #   uv 的 install.sh 正是从 GitHub releases 取二进制，此前直连要 165s；
-            #   deb.debian.org 同样惨：同样 100 秒内，直连只下到 7 个包/9MB，
-            #   走代理下完 111 个包/146MB（34MB/s）—— 实测 apt 层直连曾卡到 911s。
-            # 结论：apt/npm/uv 全部走代理，NO_PROXY 只保留内网段（registry/Gitea 不走代理）。
-            # 预定义代理 ARG 由 BuildKit 自动识别，Dockerfile 里无需 ARG 声明；
-            # 实测**不会**残留进镜像 Config.Env（运行时容器环境不受影响）。
-            HTTP_PROXY=${{ vars.DSH_HTTP_PROXY }}
-            HTTPS_PROXY=${{ vars.DSH_HTTP_PROXY }}
-            NO_PROXY=localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,.local
+        run: |
+          set -euo pipefail
+          TAG_ARGS=""
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            TAG_ARGS="$TAG_ARGS -t $t"
+          done <<< "$IMAGE_TAGS"
+          CACHE_ARGS=""
+          [ -n "${DSH_CACHE_FROM:-}" ] && CACHE_ARGS="$CACHE_ARGS --cache-from $DSH_CACHE_FROM"
+          [ -n "${DSH_CACHE_TO:-}" ] && CACHE_ARGS="$CACHE_ARGS --cache-to $DSH_CACHE_TO"
+          set -x
+          docker buildx build \
+            --load \
+            $TAG_ARGS \
+            $CACHE_ARGS \
+            --build-arg DSH_VERSION=${{ matrix.version }} \
+            --build-arg GIT_REVISION=${{ github.sha }} \
+            --build-arg DSH_CHANNEL=${{ matrix.channel }} \
+            --build-arg BASE_IMAGE=${{ vars.DSH_BASE_IMAGE || '192.168.5.35:5051/library/node:22-bookworm-slim' }} \
+            --build-arg HTTP_PROXY=${{ vars.DSH_HTTP_PROXY }} \
+            --build-arg HTTPS_PROXY=${{ vars.DSH_HTTP_PROXY }} \
+            --build-arg NO_PROXY=localhost,127.0.0.1,::1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,.local \
+            .
 
       - name: Smoke test (web UI)
         run: ./scripts/smoke-test.sh "$SMOKE_TAG"
@@ -334,6 +340,13 @@ jobs:
           path: build-status-*.json
           retention-days: 14
           if-no-files-found: error
+
+      # docker/login-action 原本在 post 步骤登出 GHCR；改用 CLI 登录后自行清理临时凭据。
+      # 私有 registry 的凭据**不能**清（生产拉取依赖它），所以只登出 ghcr.io。
+      - name: Logout GHCR (docker CLI, best effort)
+        if: always() && vars.DSH_PUSH_GHCR != '0'
+        continue-on-error: true
+        run: docker logout ghcr.io
 
   record-status:
     needs: [resolve, build-publish]
