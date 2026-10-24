@@ -189,12 +189,17 @@ async function loadLastRun() {
 // dsh-client-ui-sidebar-documentpreview@^rc.3 从未发布 → npm install ETARGET → GHCR
 // 永远没有镜像 → auto-upgrade built=false 死等（版本页却写「npm 上可安装」，误导）。
 // 只在 targetBuilt=false 时做两层探测（target 的直接依赖 + 其直接依赖），结果缓存。
-// ⚠ 必须**有界**：本检查在渲染通道页时同步执行，最坏情况要探 ~200 个包。
+// ⚠ 必须**有界**：最坏情况要探 ~200 个包。
 // 2026-09-29 教训：无界版本让 CI 的 Policy tests（test-version-server）在 node18 runner 上
 // 挂死 → resolve job 失败 → 整条流水线不构建。总预算 + 探测上限是硬要求。
+// 2026-10-24 教训（本次）：有界仍是 **8s/通道**，alpha/rc 两个目标都未构建时串行 16s；
+// 叠加 sources ~10s 后 /version.json?refresh=1 在 CI 超过 30s → test-version-server V15/V16
+// 客户端超时 → resolve job 失败 → GHCR 一直没有 0.2.1-alpha.5/rc.3（版本页永远"可升级但镜像未构建"）。
+// 因此：**渲染路径只读缓存，探测一律后台执行**，绝不 await 网络。
 const DEPS_CHECK_BUDGET_MS = Number(process.env.DSH_DEPS_CHECK_MS || 8000);
 const DEPS_CHECK_MAX_PROBES = Number(process.env.DSH_DEPS_CHECK_MAX || 160);
 const targetDepsCache = new Map();
+const targetDepsInflight = new Map();
 function depsReferencing(deps, version) {
   return Object.entries(deps || {}).filter(([, spec]) => String(spec).includes(version));
 }
@@ -252,6 +257,42 @@ async function checkTargetDeps(target) {
   return data;
 }
 
+// 渲染路径的依赖完整性视图：命中缓存直接返回；未命中/过期则后台探测。
+// 返回 pending 而不是阻塞 —— 版本页必须在秒级响应，CI 契约测试有 30s 硬超时。
+const targetDepsCooldown = new Map();   // target -> 下次允许探测的时间（避免超预算后每个请求都重试）
+function startTargetDeps(target) {
+  if (!target) return null;
+  if (targetDepsInflight.has(target)) return targetDepsInflight.get(target);
+  if ((targetDepsCooldown.get(target) || 0) > Date.now()) return null;
+  const p = checkTargetDeps(target)
+    .then((data) => {
+      // 超预算/不可读 = 结论不可信 → 冷却 60s 再试，期间页面显示「检测中」而不是反复打 npm
+      if (!data || data.ok === null) targetDepsCooldown.set(target, Date.now() + 60 * 1000);
+      return data;
+    })
+    .catch((e) => {
+      targetDepsCooldown.set(target, Date.now() + 60 * 1000);
+      return { ok: null, missing: [], checked: 0, error: e && e.message ? e.message : String(e) };
+    })
+    .finally(() => { targetDepsInflight.delete(target); });
+  targetDepsInflight.set(target, p);
+  return p;
+}
+
+function depsView(target) {
+  if (!target) return { ok: null, missing: [], checked: 0, error: 'no target' };
+  const hit = targetDepsCache.get(target);
+  if (hit && Date.now() - hit.at < CACHE_MS) return hit.data;
+  startTargetDeps(target);
+  if (hit) return { ...hit.data, stale: true };   // 有过期结论：先展示，后台刷新
+  return {
+    ok: null, missing: [], checked: 0, pending: true,
+    error: (targetDepsCooldown.get(target) || 0) > Date.now()
+      ? '依赖完整性探测上次超预算，60s 后自动重试'
+      : '依赖完整性检测中（后台执行，刷新页面查看结果）',
+  };
+}
+
 function buildStatus(target, reg, runs) {
   if (!target) return { target: null, status: 'na', targetBuilt: null, builtTags: [], registries: [], lastRun: null, error: null };
   const tags = (reg && reg.tags) || [];
@@ -290,7 +331,8 @@ async function buildInfo({ force }) {
       const state = readDeployState(name, isPrimary);
       const build = buildStatus(target, reg, runs);
       if (target && build.targetBuilt === false) {
-        build.depsCheck = await checkTargetDeps(target).catch((e) => ({ ok: null, missing: [], checked: 0, error: e.message }));
+        // 不 await：探测在后台跑，渲染立即返回（见 depsView 注释）
+        build.depsCheck = depsView(target);
       }
       channelViews[name] = {
         ...view,
@@ -581,4 +623,9 @@ server.on('error', (e) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[version-server] listening on http://0.0.0.0:${PORT} (channel=${CHANNEL})`);
+  // 预热：后台拉一次上游/registry 并启动目标依赖探测（不阻塞请求、不 await）。
+  // 否则首个页面访问要等 sources+registry 冷查询，且依赖结论要等用户手动刷新。
+  buildInfo({ force: false }).catch((e) => {
+    console.error(`[version-server] 预热失败: ${e && e.stack ? e.stack : e}`);
+  });
 });
