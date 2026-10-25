@@ -173,7 +173,7 @@ ENTRYPOINT ["/usr/local/bin/dsh-entrypoint"]
 # sh -c + exec：让 dsh 成为 PID 1，SIGTERM/SIGINT 可传（entrypoint 用 exec "$@"）。
 # --trusted-host 由通道 .env / compose 在运行时注入；镜像**不带**默认值（否则又变成"固化身份"）。
 # 裸跑（不经 compose）时退回 127.0.0.1：fail-closed，只信任本机，避免误把任意 Host 放进围栏。
-CMD ["sh", "-c", "exec dsh --profile web --trusted-host \"${DSH_TRUSTED_HOST:-127.0.0.1}\" --no-open"]
+CMD ["sh", "-c", "exec dsh --profile ${DSH_PROFILE:-web} --trusted-host \"${DSH_TRUSTED_HOST:-127.0.0.1}\" --no-open"]
 
 # LAN fixes (settings host mode + crypto.randomUUID polyfill + trusted hosts).
 # STRICT=1 turns every patch into a verified invariant: patch-dsh.sh 现在按契约 §10

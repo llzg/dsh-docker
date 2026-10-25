@@ -15,7 +15,9 @@ export DSH_HOME DSH_CHANNEL DSH_VERSION_PORT DSH_VERSION_SSOT
 VERSION_PORT="$DSH_VERSION_PORT"
 export VERSION_PORT
 
-PROFILE_DIR="$DSH_HOME/profiles/web"
+# profile 目录跟随 --profile（DSH_PROFILE；默认 web）。0.2.1 起 team profile 也有自己的
+# cordis.patch.yml，目录修错则 wildcard 绑定永远不会被纠正（2026-10-25 3081 崩溃循环事故）。
+PROFILE_DIR="$DSH_HOME/profiles/${DSH_PROFILE:-web}"
 mkdir -p "$PROFILE_DIR" "$DSH_HOME/logs"
 
 # ── webserver 绑定地址（0.2.1-alpha.5+ 上游拒绝 wildcard）────────────────────
@@ -33,7 +35,7 @@ case "$LISTEN_HOST" in
 esac
 export DSH_LISTEN_HOST="$LISTEN_HOST"
 PROFILE_PATCH="$PROFILE_DIR/cordis.patch.yml"
-if [ ! -f "$PROFILE_PATCH" ]; then
+if [ ! -f "$PROFILE_PATCH" ] && [ "${PROFILE_DIR##*/}" = "web" ]; then
   cp /opt/dsh-profiles/web/cordis.patch.yml "$PROFILE_PATCH"
 fi
 # 每次启动都改写：容器重建后 IP 会变，旧镜像/旧文件里的 0.0.0.0 也必须纠正。

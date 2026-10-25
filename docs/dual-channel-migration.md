@@ -562,3 +562,27 @@ sudo node nas/preflight-workspace.js --home /volume1/docker/<通道>/dsh-data[/<
 > 结论：**先证明再动手**；否则会为"其实能打开的历史"去做有风险的数据改写。
 > 反过来说，v2 的那条（`session-d3e604c8…`）是**真的**坏了，报错原文就是
 > `Session migration from v2 to v3 refuses the transformed artifact`，已按 §9.4 修好。
+
+### 9.7 DSH 0.2.1+ 拒绝 wildcard 绑定：alpha(team profile) 崩溃循环与 PROFILE_DIR 硬编码（2026-10-25 实测）
+
+**现象**：alpha 通道 3081 打开 502；`deepseek-harness-alpha` 崩溃循环（restarts=10，exit=1）；
+日志原文 `webserver: host "0.0.0.0" is an unspecified (wildcard) address, which is not supported`。
+alpha 的 compose command 是 `dsh --profile team`，而 `profiles/team/cordis.patch.yml` 首段就是
+`- id: webserver` / `host: '0.0.0.0'`（历史 LAN 绑定补丁，0.2.1 之前一直可用）。
+
+**根因**：0.2.1-alpha.5+ 在配置校验阶段拒绝 wildcard（`0.0.0.0`/`::`）；rc 通道（`--profile web`）
+不受影响，因为镜像 entrypoint 每次启动会把 web profile 补丁里的 host 改写成容器 eth0 IPv4——
+但 entrypoint 的 `PROFILE_DIR` **硬编码** `$DSH_HOME/profiles/web`，对 `--profile team` 不生效；
+alpha 还停在更旧的 0.2.1-alpha.1（entrypoint 甚至没有改写逻辑）。
+
+**修复（两层）**：
+1. 立即：alpha compose 的 command 在 `exec dsh` 前把
+   `$DSH_HOME/profiles/<profile>/cordis.patch.yml` 里 webserver 的 `host:` 换成容器 eth0 IPv4。
+   ⚠ 内联脚本只能用 `$(...)` 命令替换：compose 会把 `$VAR` 插值成空串（用 `docker compose config`
+   可提前看到）。然后 `sh realign.sh alpha` 重建，3081 恢复 200、容器 Healthy。
+2. 根治（镜像）：`entrypoint.sh` 的 `PROFILE_DIR` 改为 `$DSH_HOME/profiles/${DSH_PROFILE:-web}`，
+   模板复制只在 `web` profile 下做；`Dockerfile` CMD 与 compose command 同步用 `${DSH_PROFILE:-web}`，
+   compose `environment` 补 `DSH_PROFILE`，重建镜像上线后可删掉第 1 步的内联补丁。
+
+**教训**：绑定地址必须取容器具体 IPv4——`0.0.0.0` 被 0.2.1+ 拒绝，`127.0.0.1` 不可达（Docker DNAT
+的目标是容器 IPv4）；改完用 `realign` + 页面/API/WS(101) 三验，`docker compose config` 先看插值结果。

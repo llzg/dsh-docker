@@ -44,6 +44,8 @@ services:
       # ⚠ 不能写死 /data/dsh：alpha 通道的真实 DSH_HOME 是 /data/dsh/test/0.1.2-alpha.5
       #   （历史 pin 的工作区路径），写死会让 alpha 换了工作区、设置/插件全部"消失"。
       - DSH_HOME=${DSH_HOME:-/data/dsh}
+      # entrypoint 用（PROFILE_DIR 跟随 --profile）；不写则 entrypoint 默认 web。
+      - DSH_PROFILE=${DSH_PROFILE:-web}
       - DSH_CHANNEL=${DSH_CHANNEL:-alpha}
       - DSH_TELEMETRY_DISABLED=1
       # --trusted-host 不再硬编码在 Dockerfile CMD（契约 §6）
