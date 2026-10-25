@@ -133,7 +133,7 @@ function checkPresets() {
     add('fail', 'P1', name,
       r.textLine ? 'persona 用的是已废弃的 config.text，新版要求 config.prefix（必填）'
                  : 'persona 的 config 里没有 prefix（新版 dsh-persona 必填）',
-      `改 ${agentYml}：persona 的 config 写成 prefix:（必填，可用 {{model}}/{{cwd}}）` +
+      `改 ${agentYml}：persona 的 config 写成 prefix:（必填，可用 {{model}}）` +
       (r.textLine ? ' + suffix:，即把原 text 拆成 prefix/suffix' : '') +
       '。不改的话该 preset 下所有会话都无法 resume（切模型/继续对话都会报错）');
   }
