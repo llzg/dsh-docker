@@ -13,10 +13,10 @@
       "channel": "rc",
       "version": "0.2.2-rc.2",
       "conclusion": "failure",
-      "headSha": "9015996ed7c68eba0cb7478c7633b0d0fb12f837",
-      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/43216493947",
-      "updatedAt": "2026-11-12T12:35:24.378Z"
+      "headSha": "d53e1edd9a7699a6268a9109c8d152cf1bcc96d9",
+      "runUrl": "https://github.com/llzg/dsh-docker/actions/runs/43298583553",
+      "updatedAt": "2026-11-12T20:19:34.397Z"
     }
   },
-  "updatedAt": "2026-11-12T12:36:58.125Z"
+  "updatedAt": "2026-11-12T20:20:09.574Z"
 }
