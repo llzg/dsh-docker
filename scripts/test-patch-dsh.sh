@@ -112,6 +112,16 @@ DSH_PATCH_BASE="$TMP/noanchor" STRICT=1 DSH_ICON=/nonexistent bash "$PATCH" > "$
 grep -q '三个 settings 包都没有锚点' "$TMP/na.log" && P=1 || P=0
 t P13 "全部 settings 包无锚点 → FAIL（防上游静默重写）" "$P" "rc=$RC"
 
+# ── 9) 语义：0.2.2-rc.2 去掉 "Host configuration mirror" 注释但保留
+#       ConfigFormController（Host-backed config forms）→ 合法 upstream-satisfied
+mkdir -p "$TMP/upstream/dsh-client-ui-settings/lib"
+cp -a "$TMP/base/dsh-client-connection" "$TMP/upstream/"
+printf 'var ConfigFormController = class {}; // Host-backed config forms (0.2.2-rc.2)\n' > "$TMP/upstream/dsh-client-ui-settings/lib/client.js"
+DSH_PATCH_BASE="$TMP/upstream" STRICT=1 DSH_ICON=/nonexistent bash "$PATCH" > "$TMP/up.log" 2>&1; RC=$?
+grep -q 'settings-host-mode: upstream-satisfied' "$TMP/up.log" && P=1 || P=0
+[ "$RC" -eq 0 ] || P=0
+t P14 "ConfigFormController 识别为 upstream-satisfied 且 STRICT 通过（0.2.2-rc.2）" "$P" "rc=$RC"
+
 echo
 echo "----------------------------------------"
 echo "RESULT: PASS=$PASS FAIL=$FAIL"

@@ -68,8 +68,11 @@ if [ "$SETTINGS_PATCHED" != "1" ]; then
   # 0.2.1-alpha.5+：设置写入改为 Host-backed config forms（ConfigForm → scope.set →
   # /api），不再有 off-loopback 的 "host"/"memory" 降级 —— 即上游已原生满足
   # "LAN 打开设置页也能持久化" 这一补丁目的。识别该新实现并记 upstream-satisfied。
+  #   0.2.1-alpha.5..0.2.2-alpha.3：客户端 bundle 保留注释 "Host configuration mirror"
+  #   0.2.2-rc.2+：                bundle 去掉了该注释（压缩变化），但 ConfigFormController
+  #                                 类仍在（Host 配置镜像 + scope.set 写回）→ 用类名识别。
   SETTINGS_MAIN="$BASE/dsh-client-ui-settings/lib/client.js"
-  if [ -f "$SETTINGS_MAIN" ] && grep -qF 'Host configuration mirror' "$SETTINGS_MAIN"; then
+  if [ -f "$SETTINGS_MAIN" ] && { grep -qF 'Host configuration mirror' "$SETTINGS_MAIN" || grep -qF 'ConfigFormController' "$SETTINGS_MAIN"; }; then
     write_marker "$SETTINGS_MAIN" settings-host-mode:upstream-satisfied
     SETTINGS_PATCHED=1
     echo "settings-host-mode: upstream-satisfied（Host-backed config forms，无 host/memory 判定）"
